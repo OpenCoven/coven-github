@@ -10,10 +10,13 @@ use axum::{
 use serde_json::json;
 use tracing::{info, warn};
 
-use coven_github_api::{GitHubEvent, Task, TaskKind};
+use coven_github_api::{tasks::TaskStore, GitHubEvent, Task, TaskKind};
 use coven_github_config::Config;
 
-use crate::{events::{parse_event, WebhookPayload}, verify_signature};
+use crate::{
+    events::{parse_event, WebhookPayload},
+    verify_signature,
+};
 
 /// Shared application state passed to route handlers.
 #[derive(Clone)]
@@ -21,6 +24,13 @@ pub struct AppState {
     pub config: std::sync::Arc<Config>,
     /// Channel for dispatching tasks to the worker pool.
     pub task_tx: tokio::sync::mpsc::Sender<Task>,
+    pub task_store: TaskStore,
+}
+
+/// GET /api/github/tasks — current task state for CovenCave polling.
+pub async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
+    let tasks = state.task_store.list().await;
+    Json(json!({ "ok": true, "tasks": tasks })).into_response()
 }
 
 /// POST /webhook — GitHub webhook receiver.
@@ -30,17 +40,28 @@ pub async fn handle_webhook(
     body: Bytes,
 ) -> impl IntoResponse {
     // 1. Validate HMAC signature.
-    let sig = match headers.get("x-hub-signature-256").and_then(|v| v.to_str().ok()) {
+    let sig = match headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(s) => s.to_string(),
         None => {
             warn!("webhook missing x-hub-signature-256");
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "missing signature"}))).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing signature"})),
+            )
+                .into_response();
         }
     };
 
     if let Err(e) = verify_signature(&state.config.github.webhook_secret, &body, &sig) {
         warn!("webhook signature invalid: {e}");
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid signature"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid signature"})),
+        )
+            .into_response();
     }
 
     // 2. Parse event type header.
@@ -48,7 +69,11 @@ pub async fn handle_webhook(
         Some(e) => e.to_string(),
         None => {
             warn!("webhook missing x-github-event");
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing event type"}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing event type"})),
+            )
+                .into_response();
         }
     };
 
@@ -57,7 +82,11 @@ pub async fn handle_webhook(
         Ok(p) => p,
         Err(e) => {
             warn!("webhook payload parse error: {e}");
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "parse error"}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "parse error"})),
+            )
+                .into_response();
         }
     };
 
@@ -82,7 +111,10 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
     match event {
         GitHubEvent::IssueAssigned(e) => {
             // Find a familiar whose bot_username matches the assignee.
-            let familiar = state.config.familiars.iter()
+            let familiar = state
+                .config
+                .familiars
+                .iter()
                 .find(|f| f.bot_username == e.assignee_login)?;
 
             Some(Task {
@@ -102,7 +134,8 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         GitHubEvent::IssueComment(e) => {
             // Find a familiar mentioned in the comment body.
             let familiar = state.config.familiars.iter().find(|f| {
-                e.comment_body.contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
+                e.comment_body
+                    .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
             })?;
 
             Some(Task {
@@ -120,7 +153,8 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
 
         GitHubEvent::PullRequestReviewComment(e) => {
             let familiar = state.config.familiars.iter().find(|f| {
-                e.comment_body.contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
+                e.comment_body
+                    .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
             })?;
 
             Some(Task {

@@ -20,6 +20,7 @@ anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["tokio"] }
 clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
 hmac = "0.12"
 jsonwebtoken = "9"
 octocrab = "0.41"

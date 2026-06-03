@@ -1,11 +1,57 @@
 //! GitHub API client: installation tokens, Check Runs, PRs, issue comments.
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub mod check_run;
 pub mod installation;
 pub mod pr;
+pub mod tasks;
+
+pub const DEFAULT_API_BASE_URL: &str = "https://api.github.com";
+const GITHUB_API_VERSION: &str = "2026-03-10";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubRequest {
+    method: &'static str,
+    path: String,
+    body: serde_json::Value,
+}
+
+fn api_url(base_url: &str, path: &str) -> String {
+    format!("{}{}", base_url.trim_end_matches('/'), path)
+}
+
+fn client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("coven-github/0.1")
+        .build()
+        .map_err(Into::into)
+}
+
+async fn send_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    request: GitHubRequest,
+) -> anyhow::Result<reqwest::Response> {
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
+    let response = client
+        .request(method, api_url(base_url, &request.path))
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .json(&request.body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub API request failed with {status}: {body}");
+    }
+
+    Ok(response)
+}
 
 /// Minimal GitHub event types parsed from webhooks.
 #[derive(Debug, Clone, Deserialize, Serialize)]
