@@ -1,0 +1,39 @@
+# coven-github example configuration
+# Copy to config/local.toml and fill in your values.
+
+[server]
+bind = "0.0.0.0:3000"
+# Public URL for CovenCave deep links in Check Runs and PR comments.
+# cave_base_url = "https://cave.opencoven.ai"
+
+[github]
+app_id = 123456                        # Your GitHub App's numeric ID
+private_key_path = "keys/private.pem"  # Path to GitHub App private key PEM
+webhook_secret = "CHANGE_ME"           # Webhook secret set in GitHub App settings
+# api_base_url = "https://api.github.com"  # Override for GitHub Enterprise Server
+
+[worker]
+concurrency = 4
+coven_code_bin = "/usr/local/bin/coven-code"  # Path to coven-code binary
+workspace_root = "/tmp/coven-github-tasks"    # Ephemeral workspace root
+timeout_secs = 600  # 10 minutes per task
+max_retries = 2     # Retries for infra errors (exit code 2)
+
+# ── Familiar configuration ──────────────────────────────────────────────────
+# Add one [[familiars]] block per familiar you want to expose as a GitHub bot.
+
+[[familiars]]
+id = "cody"
+display_name = "Cody"
+bot_username = "coven-cody[bot]"         # GitHub bot username for this familiar
+model = "anthropic/claude-sonnet-4-6"    # Model override (BYOM)
+skills = ["systematic-debugging", "test-driven-development"]
+trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this familiar
+
+# [[familiars]]
+# id = "nova"
+# display_name = "Nova"
+# bot_username = "coven-nova[bot]"
+# model = "openai/gpt-5.5"
+# skills = ["requesting-code-review"]
+# trigger_labels = ["coven:review"]

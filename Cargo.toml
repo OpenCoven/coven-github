@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/config",
+    "crates/github",
+    "crates/webhook",
+    "crates/worker",
+    "crates/server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["OpenCoven <hello@opencoven.ai>"]
+license = "GPL-3.0"
+repository = "https://github.com/OpenCoven/coven-github"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["tokio"] }
+clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
+jsonwebtoken = "9"
+octocrab = "0.41"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+toml = "0.8"
