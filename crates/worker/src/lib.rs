@@ -255,6 +255,7 @@ async fn run_coven_code(
         Ok(status) => status?,
         Err(_) => {
             let _ = child.kill().await;
+            let _ = child.wait().await;
             anyhow::bail!(
                 "coven-code timed out after {} seconds",
                 config.worker.timeout_secs
