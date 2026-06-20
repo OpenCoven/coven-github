@@ -76,23 +76,31 @@ pub fn build(
     };
 
     let task_brief = match &task.kind {
-        TaskKind::FixIssue { issue_number, issue_title, issue_body } =>
-            TaskBrief::FixIssue {
-                issue_number: *issue_number,
-                issue_title: issue_title.clone(),
-                issue_body: issue_body.clone(),
-            },
-        TaskKind::AddressReviewComment { pr_number, comment_body, diff_hunk } =>
-            TaskBrief::AddressReviewComment {
-                pr_number: *pr_number,
-                comment_body: comment_body.clone(),
-                diff_hunk: diff_hunk.clone(),
-            },
-        TaskKind::RespondToMention { issue_number, comment_body } =>
-            TaskBrief::RespondToMention {
-                issue_number: *issue_number,
-                comment_body: comment_body.clone(),
-            },
+        TaskKind::FixIssue {
+            issue_number,
+            issue_title,
+            issue_body,
+        } => TaskBrief::FixIssue {
+            issue_number: *issue_number,
+            issue_title: issue_title.clone(),
+            issue_body: issue_body.clone(),
+        },
+        TaskKind::AddressReviewComment {
+            pr_number,
+            comment_body,
+            diff_hunk,
+        } => TaskBrief::AddressReviewComment {
+            pr_number: *pr_number,
+            comment_body: comment_body.clone(),
+            diff_hunk: diff_hunk.clone(),
+        },
+        TaskKind::RespondToMention {
+            issue_number,
+            comment_body,
+        } => TaskBrief::RespondToMention {
+            issue_number: *issue_number,
+            comment_body: comment_body.clone(),
+        },
     };
 
     SessionBrief {

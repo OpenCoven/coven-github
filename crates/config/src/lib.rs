@@ -45,8 +45,12 @@ pub struct WorkerConfig {
     pub max_retries: u32,
 }
 
-fn default_timeout() -> u64 { 600 }
-fn default_retries() -> u32 { 2 }
+fn default_timeout() -> u64 {
+    600
+}
+fn default_retries() -> u32 {
+    2
+}
 
 /// Per-familiar configuration for task routing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
