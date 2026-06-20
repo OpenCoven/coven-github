@@ -99,6 +99,7 @@ pub async fn update(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_with_base_url(
     api_base_url: &str,
     installation_token: &str,
@@ -144,6 +145,7 @@ pub async fn complete(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_with_base_url(
     api_base_url: &str,
     installation_token: &str,

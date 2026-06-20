@@ -15,8 +15,7 @@ pub fn verify_signature(secret: &str, payload: &[u8], signature_header: &str) ->
         .strip_prefix("sha256=")
         .ok_or_else(|| anyhow::anyhow!("missing sha256= prefix on signature"))?;
 
-    let sig_bytes = hex::decode(sig)
-        .map_err(|_| anyhow::anyhow!("invalid hex in signature"))?;
+    let sig_bytes = hex::decode(sig).map_err(|_| anyhow::anyhow!("invalid hex in signature"))?;
 
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|_| anyhow::anyhow!("HMAC key error"))?;

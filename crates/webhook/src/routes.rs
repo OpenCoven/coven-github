@@ -131,11 +131,33 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
             })
         }
 
+        GitHubEvent::IssueLabeled(e) => {
+            let familiar = state
+                .config
+                .familiars
+                .iter()
+                .find(|f| f.trigger_labels.iter().any(|label| label == &e.label_name))?;
+
+            Some(Task {
+                id: uuid::Uuid::new_v4().to_string(),
+                installation_id: e.installation_id,
+                repo_owner: e.repo_owner,
+                repo_name: e.repo_name,
+                familiar_id: familiar.id.clone(),
+                kind: TaskKind::FixIssue {
+                    issue_number: e.issue_number,
+                    issue_title: e.issue_title,
+                    issue_body: e.issue_body,
+                },
+            })
+        }
+
         GitHubEvent::IssueComment(e) => {
             // Find a familiar mentioned in the comment body.
             let familiar = state.config.familiars.iter().find(|f| {
-                e.comment_body
-                    .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
+                e.commenter_login != f.bot_username
+                    && e.comment_body
+                        .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
             })?;
 
             Some(Task {
@@ -153,8 +175,9 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
 
         GitHubEvent::PullRequestReviewComment(e) => {
             let familiar = state.config.familiars.iter().find(|f| {
-                e.comment_body
-                    .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
+                e.commenter_login != f.bot_username
+                    && e.comment_body
+                        .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
             })?;
 
             Some(Task {
@@ -172,5 +195,138 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         }
 
         GitHubEvent::Unsupported { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coven_github_api::{IssueCommentEvent, IssueLabeledEvent, TaskKind};
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::{path::PathBuf, sync::Arc};
+
+    fn app_state() -> AppState {
+        let (task_tx, _task_rx) = tokio::sync::mpsc::channel(1);
+        AppState {
+            config: Arc::new(Config {
+                server: ServerConfig {
+                    bind: "127.0.0.1:0".to_string(),
+                    cave_base_url: None,
+                },
+                github: GitHubAppConfig {
+                    app_id: 1,
+                    private_key_path: PathBuf::from("private.pem"),
+                    webhook_secret: "secret".to_string(),
+                    api_base_url: None,
+                },
+                worker: WorkerConfig {
+                    concurrency: 1,
+                    coven_code_bin: PathBuf::from("coven-code"),
+                    workspace_root: PathBuf::from("/tmp/coven-github-test"),
+                    timeout_secs: 60,
+                    max_retries: 0,
+                },
+                familiars: vec![FamiliarConfig {
+                    id: "cody".to_string(),
+                    display_name: "Cody".to_string(),
+                    bot_username: "coven-cody[bot]".to_string(),
+                    model: None,
+                    skills: vec![],
+                    trigger_labels: vec!["coven:fix".to_string()],
+                }],
+            }),
+            task_tx,
+            task_store: TaskStore::default(),
+        }
+    }
+
+    #[test]
+    fn labeled_issue_routes_to_familiar_trigger_label() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueLabeled(IssueLabeledEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Token refresh is broken.".to_string(),
+                label_name: "coven:fix".to_string(),
+            }),
+        )
+        .expect("matching trigger label should create a task");
+
+        assert_eq!(task.installation_id, 123);
+        assert_eq!(task.repo_owner, "OpenCoven");
+        assert_eq!(task.repo_name, "coven-code");
+        assert_eq!(task.familiar_id, "cody");
+        match task.kind {
+            TaskKind::FixIssue {
+                issue_number,
+                issue_title,
+                issue_body,
+            } => {
+                assert_eq!(issue_number, 42);
+                assert_eq!(issue_title, "Fix auth");
+                assert_eq!(issue_body, "Token refresh is broken.");
+            }
+            other => panic!("expected FixIssue task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn labeled_issue_ignores_unknown_labels() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueLabeled(IssueLabeledEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Token refresh is broken.".to_string(),
+                label_name: "help wanted".to_string(),
+            }),
+        );
+
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn issue_comment_ignores_bot_self_mentions() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                comment_body: "@coven-cody thanks, I opened a PR.".to_string(),
+                commenter_login: "coven-cody[bot]".to_string(),
+            }),
+        );
+
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn pr_review_comment_ignores_bot_self_mentions() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::PullRequestReviewComment(coven_github_api::PrReviewCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                pr_number: 7,
+                comment_body: "@coven-cody please fix.".to_string(),
+                commenter_login: "coven-cody[bot]".to_string(),
+            }),
+        );
+
+        assert!(task.is_none());
     }
 }

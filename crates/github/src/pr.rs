@@ -11,6 +11,7 @@ struct PullRequestResponse {
 }
 
 /// Opens a draft pull request. Returns the PR number.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_pull_request(
     installation_token: &str,
     repo_owner: &str,
@@ -41,6 +42,7 @@ pub async fn open_pull_request(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn open_pull_request_with_base_url(
     api_base_url: &str,
     installation_token: &str,
