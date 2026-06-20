@@ -22,6 +22,10 @@ Every existing GitHub coding agent is a black box: GitHub's model, GitHub's cont
 
 `coven-github` flips that. Your familiar is yours: your model, your skills, your memory, your voice in the PR body. The GitHub App is just the ingress layer.
 
+That is the product wedge: assign it like a teammate, get a PR back, and keep Cave oversight in the loop. A familiar should know the difference between "technically works" and "good enough for this repo, this team, and this moment."
+
+See [Design](DESIGN.md), [Hosted OpenCoven](HOSTED.md), [Familiar Contract](FAMILIAR-CONTRACT.md), [Roadmap](ROADMAP.md), and [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md) for the operational plan.
+
 ---
 
 ## Architecture
@@ -72,7 +76,22 @@ CovenCave oversight UI   ← watch session live, intervene, steer
 
 ## Status
 
-🚧 **In development.** See [COVEN-GITHUB.md](COVEN-GITHUB.md) for the full product spec.
+🚧 **In development.** The repo has the first GitHub App adapter path wired, but hosted production readiness is still being built. See [COVEN-GITHUB.md](COVEN-GITHUB.md) for the roadmap-level product spec.
+
+| Capability | Status | Notes |
+|---|---|---|
+| Webhook HMAC validation | Implemented | Rejects unsigned or invalid GitHub webhook payloads. |
+| Issue assignment trigger | Implemented | Routes matching bot assignees to configured familiars. |
+| Label trigger | Implemented | Routes configured `trigger_labels` such as `coven:fix`. |
+| Issue / PR mention trigger | Implemented | Ignores familiar bot self-comments to avoid loops. |
+| GitHub App installation tokens | Implemented | Mints installation access tokens from the App private key. |
+| Check Run creation and completion | Partial | Creates and updates Check Runs; branch/SHA resolution still needs production hardening. |
+| `coven-code --headless` execution | Partial | Worker spawns headless sessions and enforces task timeouts; result quality depends on the runtime. |
+| Pull request creation | Partial | Opens draft PRs from session results; base branch is still hardcoded to `main`. |
+| CovenCave task polling | Partial | In-memory task API exists for local oversight; hosted control-plane auth and persistence are planned. |
+| Durable queue / task store | Planned | Required for hosted reliability and restarts. |
+| Hosted tier | Planned | See [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md). |
+| Familiar trust contract | Planned | See [Familiar Contract](FAMILIAR-CONTRACT.md). |
 
 ---
 
@@ -91,7 +110,7 @@ cp config/example.toml config/local.toml\n# Set: github_app_id, private_key_path
 ./target/release/coven-github serve --config config/local.toml
 ```
 
-See [docs/self-hosting.md](docs/self-hosting.md) for full setup including GitHub App registration.
+See [docs/self-hosting.md](docs/self-hosting.md) for full setup including GitHub App registration. For a minimal familiar route, start from [`examples/familiar-github-starter`](examples/familiar-github-starter/).
 
 ---
 
@@ -99,7 +118,7 @@ See [docs/self-hosting.md](docs/self-hosting.md) for full setup including GitHub
 
 `coven-github` is open source and self-hostable. OpenCoven offers a **hosted tier** for organizations that want managed infra, cloud familiar memory, and multi-familiar routing without running their own workers.
 
-See [opencoven.ai/github](https://opencoven.ai/github) for hosted tier details.
+See [Hosted OpenCoven](HOSTED.md) and [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md) for the service shape, security boundaries, and buyer packaging.
 
 ---
 

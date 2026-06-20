@@ -7,6 +7,10 @@ This guide walks you through registering a GitHub App and running `coven-github`
 - Rust toolchain (`rustup`)
 - `coven-code` binary installed and in PATH (or set `coven_code_bin` in config)
 - A public HTTPS endpoint for the webhook receiver (ngrok works for local dev)
+- A GitHub account with permission to create and install GitHub Apps
+- Model provider credentials available to the `coven-code` runtime you plan to use
+
+This guide targets macOS and Linux operators. Windows should work through WSL2 or a containerized worker, but the production isolation path is still being hardened.
 
 ## 1. Register a GitHub App
 
@@ -56,6 +60,21 @@ Edit `config/local.toml`:
 - Set `worker.coven_code_bin` to your `coven-code` binary path
 - Configure `[[familiars]]` with your bot username and model
 
+Important config fields:
+
+| Field | Purpose |
+|---|---|
+| `server.bind` | Local address the webhook server listens on. |
+| `server.cave_base_url` | Optional CovenCave URL used in Check Runs and comments. |
+| `github.app_id` | Numeric GitHub App ID from the App settings page. |
+| `github.private_key_path` | Path to the downloaded PEM private key. Do not commit it. |
+| `github.webhook_secret` | Secret GitHub uses to sign webhook deliveries. |
+| `worker.coven_code_bin` | Path to the `coven-code` binary with headless mode support. |
+| `worker.workspace_root` | Temporary task workspace root. Keep it outside the repo. |
+| `worker.timeout_secs` | Wall-clock limit for each familiar run. |
+| `familiars[].bot_username` | GitHub App bot username that assignment and mentions match. |
+| `familiars[].trigger_labels` | Labels such as `coven:fix` that create familiar tasks. |
+
 ## 5. Run
 
 ```bash
@@ -64,12 +83,33 @@ Edit `config/local.toml`:
 
 The server starts on the configured bind address. Point your GitHub App webhook at `https://your-host/webhook`.
 
-## 6. Test it
+Expected startup log:
+
+```txt
+coven-github listening on 0.0.0.0:3000
+```
+
+## 6. Local smoke test
+
+Before connecting a real GitHub App delivery, verify the server rejects unsigned payloads:
+
+```bash
+curl -i \
+  -H 'X-GitHub-Event: issues' \
+  -d '{"action":"labeled"}' \
+  http://localhost:3000/webhook
+```
+
+Expected result: `401 Unauthorized` with `{"error":"missing signature"}`. That confirms the webhook route is reachable and signature enforcement is active.
+
+## 7. End-to-end test
 
 On a repo where the App is installed:
 1. Create an issue
 2. Assign it to your bot user (`@coven-cody`)
 3. Watch the Check Run appear and the familiar start working
+
+You can also apply a configured label such as `coven:fix` to route the issue through `familiars[].trigger_labels`.
 
 ## Local development with ngrok
 
@@ -99,3 +139,17 @@ CMD ["coven-github", "serve", "--config", "/config/local.toml"]
 - Installation tokens expire every hour — coven-github refreshes them automatically
 - Never commit your private key PEM to the repository
 - Run workers in isolated containers per task in production (see `docs/container-isolation.md`)
+
+See [Security Model](security.md) and [Container Isolation](container-isolation.md) for the production security target.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `401 missing signature` | Local curl or GitHub did not send `X-Hub-Signature-256`. | Expected for unsigned smoke tests; check GitHub App webhook secret for real deliveries. |
+| `401 invalid signature` | `github.webhook_secret` does not match the GitHub App secret. | Rotate/copy the secret into `config/local.toml` and restart. |
+| No task appears after assignment | Bot username or installed repository does not match config. | Confirm `familiars[].bot_username` equals the App bot login and the App is installed on the repo. |
+| Label does nothing | Label is not in `familiars[].trigger_labels`. | Add the exact label name and restart. |
+| Check Run fails immediately | GitHub App permissions are incomplete or the head SHA/base branch path needs hardening. | Confirm Contents, Issues, Pull requests, Checks, and Metadata permissions. |
+| Familiar never exits | Runtime process hung. | Lower `worker.timeout_secs`; current workers enforce this timeout. |
+| No PR opens | `coven-code` did not write commits or a successful `result.json`. | Inspect worker logs and the task workspace before cleanup in a development run. |

@@ -58,6 +58,7 @@ async fn send_json(
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum GitHubEvent {
     IssueAssigned(IssueAssignedEvent),
+    IssueLabeled(IssueLabeledEvent),
     IssueComment(IssueCommentEvent),
     PullRequestReviewComment(PrReviewCommentEvent),
     Unsupported { name: String },
@@ -72,6 +73,17 @@ pub struct IssueAssignedEvent {
     pub issue_title: String,
     pub issue_body: String,
     pub assignee_login: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IssueLabeledEvent {
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub issue_number: u64,
+    pub issue_title: String,
+    pub issue_body: String,
+    pub label_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -238,14 +238,29 @@ async fn run_coven_code(
     brief_path: &PathBuf,
     result_path: &PathBuf,
 ) -> Result<SessionResult> {
-    let status = Command::new(&config.worker.coven_code_bin)
+    let mut child = Command::new(&config.worker.coven_code_bin)
         .arg("--headless")
         .arg("--context")
         .arg(brief_path)
         .arg("--output")
         .arg(result_path)
-        .status()
-        .await?;
+        .spawn()?;
+
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(config.worker.timeout_secs),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "coven-code timed out after {} seconds",
+                config.worker.timeout_secs
+            );
+        }
+    };
 
     match status.code() {
         Some(0) => {}
@@ -285,5 +300,71 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
         TaskKind::FixIssue { issue_number, .. } => Some(*issue_number),
         TaskKind::RespondToMention { issue_number, .. } => Some(*issue_number),
         TaskKind::AddressReviewComment { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+
+    fn test_config(coven_code_bin: PathBuf, workspace_root: PathBuf) -> Config {
+        Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("private.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: None,
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin,
+                workspace_root,
+                timeout_secs: 1,
+                max_retries: 0,
+            },
+            familiars: vec![FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec![],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn coven_code_process_is_stopped_after_configured_timeout() {
+        let root = std::env::temp_dir().join(format!(
+            "coven-github-timeout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("test dir should be created");
+        let script = root.join("slow-coven-code.sh");
+        fs::write(&script, "#!/usr/bin/env bash\nsleep 5\n").expect("script should be written");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("script should be executable");
+
+        let config = test_config(script, root.clone());
+        let brief_path = root.join("session-brief.json");
+        let result_path = root.join("result.json");
+        fs::write(&brief_path, "{}").expect("brief should be written");
+
+        let started = Instant::now();
+        let result = run_coven_code(&config, &brief_path, &result_path).await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed().as_secs() < 3,
+            "process should stop close to the configured timeout"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
