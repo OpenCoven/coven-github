@@ -33,6 +33,8 @@ Goal: support real hosted installations without losing task state or leaking ten
 - Installation-scoped familiar routing.
 - Tenant-scoped task API auth for Cave.
 - Task audit log and terminal states.
+- Marker-backed GitHub status comments that are edited in place per task.
+- Maintainer command router for status, stop, retry, explain, and approve.
 
 ## Milestone 3: GitHub Correctness
 
@@ -65,6 +67,7 @@ Goal: make the value legible and buyable.
 - Pricing: Community, Hosted Starter, Hosted Team, Hosted Dedicated.
 - Cave dashboard for task history, familiar routing, usage, and audit events.
 - Demo assets: issue assignment to Check Run, draft PR back to issue, Cave oversight intervention.
+- A reference demo showing the ClawSweeper-style operating loop: one visible status, explicit steering commands, durable audit trail, and familiar-specific PR output.
 
 ## Current Focus
 
@@ -72,3 +75,4 @@ Goal: make the value legible and buyable.
 2. Build persistent task state and idempotency.
 3. Move familiar routing from global TOML toward installation-scoped config.
 4. Make Cave oversight central in the public story and product loop.
+5. Borrow ClawSweeper's conservative GitHub bot ergonomics: edited status comments, maintainer steering commands, and live-state rechecks before mutation.

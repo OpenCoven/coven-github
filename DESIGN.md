@@ -62,6 +62,21 @@ Cave oversight is the control plane. It should show:
 
 Draft PRs are the default. The team should promote more autonomy only after the familiar earns trust through repeated visible work.
 
+## Operational Pattern
+
+ClawSweeper is the reference pattern for conservative GitHub automation inside the OpenClaw ecosystem: narrow promises, durable state, marker-backed comments edited in place, explicit maintainer commands, and deterministic gates before repair or merge work.
+
+`coven-github` should borrow the operating style without becoming the same product:
+
+- Keep one visible status surface per task instead of noisy repeated comments.
+- Treat maintainer commands as clear steering inputs, not casual chat.
+- Store durable task records before worker execution starts.
+- Re-check live GitHub state immediately before every mutation.
+- Prefer proposal, draft PR, and Cave approval loops before any higher-autonomy behavior.
+- Make status, evidence, and next action obvious to reviewers who never open Cave.
+
+The familiar layer adds the moat: a known teammate with repo and team context. The ClawSweeper pattern supplies the operational discipline that makes that familiar safe to trust.
+
 ## Trust Boundaries
 
 | Boundary | Rule |
