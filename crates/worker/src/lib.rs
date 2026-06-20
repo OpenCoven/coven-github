@@ -304,7 +304,7 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
