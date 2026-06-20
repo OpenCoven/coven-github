@@ -4,6 +4,23 @@ Hosted OpenCoven is the managed version of `coven-github`: install the GitHub Ap
 
 The hosted tier should monetize managed reliability and familiar continuity, while the open-source adapter remains self-hostable for trust and inspection.
 
+See [Architecture Diagrams](docs/architecture.md) for the hosted vs self-hosted deployment diagram and trust-boundary map.
+
+## Hosted Flow
+
+```mermaid
+flowchart LR
+    install[Install hosted GitHub App]
+    route[Configure familiar routing]
+    trigger[Assign issue or add trigger label]
+    queue[Managed queue and task history]
+    worker[Managed isolated worker]
+    pr[Draft PR with Check Run evidence]
+    cave[Cave oversight link]
+
+    install --> route --> trigger --> queue --> worker --> pr --> cave
+```
+
 ## What Hosted Adds
 
 | Capability | Self-hosted adapter | Hosted OpenCoven |

@@ -4,14 +4,25 @@
 
 `coven-github` is the GitHub App adapter for [OpenCoven](https://opencoven.ai). It bridges GitHub's issue and pull-request workflow with the Coven harness — turning any Coven-configured familiar into a first-class GitHub coding agent, without black-box model lock-in.
 
-```
-GitHub issue assigned to @cody
-  → coven-github webhook receiver
-  → spawns coven-code session with issue context
-  → Check Run shows live progress in GitHub UI
-  → familiar opens branch, commits, pushes
-  → PR opened and linked to original issue
-  → Cave session available for live oversight
+```mermaid
+flowchart LR
+    issue[GitHub issue, label, mention, or review comment]
+    app[coven-github GitHub App]
+    worker[coven-github worker]
+    familiar[coven-code familiar session]
+    check[GitHub Check Run]
+    pr[Draft pull request]
+    cave[CovenCave oversight]
+
+    issue --> app
+    app --> worker
+    worker --> familiar
+    worker --> check
+    familiar --> pr
+    worker --> cave
+    check --> reviewer[Maintainer]
+    pr --> reviewer
+    cave --> reviewer
 ```
 
 ---
@@ -24,31 +35,47 @@ Every existing GitHub coding agent is a black box: GitHub's model, GitHub's cont
 
 That is the product wedge: assign it like a teammate, get a PR back, and keep Cave oversight in the loop. A familiar should know the difference between "technically works" and "good enough for this repo, this team, and this moment."
 
-See [Design](DESIGN.md), [Hosted OpenCoven](HOSTED.md), [Familiar Contract](FAMILIAR-CONTRACT.md), [Roadmap](ROADMAP.md), and [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md) for the operational plan.
+See [Architecture Diagrams](docs/architecture.md), [Design](DESIGN.md), [Hosted OpenCoven](HOSTED.md), [Familiar Contract](FAMILIAR-CONTRACT.md), [Roadmap](ROADMAP.md), and [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md) for the operational plan.
 
 ---
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph github[GitHub]
+        trigger[Issue assignment<br/>trigger label<br/>@mention<br/>review comment]
+        checks[Check Run]
+        pull[Draft PR]
+    end
+
+    subgraph adapter[coven-github]
+        webhook[Webhook receiver<br/>HMAC validation<br/>event parsing]
+        routing[Familiar routing<br/>bot username<br/>trigger labels]
+        tasks[Task queue/store<br/>status and audit]
+        runner[Worker<br/>session brief<br/>timeout enforcement]
+    end
+
+    subgraph runtime[OpenCoven runtime]
+        session[coven-code --headless]
+        result[Result envelope<br/>summary, branch, evidence]
+    end
+
+    cave[CovenCave oversight<br/>live session and intervention]
+
+    trigger --> webhook
+    webhook --> routing
+    routing --> tasks
+    tasks --> runner
+    runner --> session
+    session --> result
+    result --> runner
+    runner --> checks
+    runner --> pull
+    runner --> cave
 ```
-GitHub
-  │ webhook (issue assigned / @mention / label)
-  ▼
-coven-github (this repo)
-  │ validates HMAC · enqueues task · creates Check Run
-  ▼
-coven-code --headless --context session-brief.json
-  │ agent loop: reads code · edits · runs tests
-  │ emits structured progress events
-  ▼
-GitHub Check Run API     ← live status: "Cody: running tests…"
-  │
-  ▼
-git push → GitHub PR     ← opened by coven-code's git tool
-  │
-  ▼
-CovenCave oversight UI   ← watch session live, intervene, steer
-```
+
+For deeper system, sequence, state, security-boundary, and hosted deployment diagrams, read [docs/architecture.md](docs/architecture.md).
 
 ### Components
 

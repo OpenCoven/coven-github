@@ -2,6 +2,8 @@
 
 This document describes the security boundaries `coven-github` needs for self-hosted operators and the hosted OpenCoven service.
 
+For the companion visual map of the installation, secret, worker, and task-history boundaries, see [Architecture Diagrams](architecture.md#trust-and-data-boundaries).
+
 ## GitHub App Credentials
 
 `coven-github` authenticates as a GitHub App:
@@ -26,6 +28,22 @@ Production hosted ingress should also add:
 ## Worker Boundaries
 
 Workers execute `coven-code --headless` using a per-task workspace. Current development workers use local directories and enforce task timeouts. Production hosted workers should run each task in an isolated container or sandbox.
+
+```mermaid
+flowchart LR
+    install[GitHub installation]
+    token[Short-lived installation token]
+    workspace[Per-task workspace]
+    runtime[coven-code process]
+    logs[Redacted logs and evidence]
+    checks[GitHub Check Run and PR]
+
+    install --> token
+    token --> workspace
+    workspace --> runtime
+    runtime --> logs
+    logs --> checks
+```
 
 Worker rules:
 

@@ -2,6 +2,8 @@
 
 `coven-github` is a thin GitHub ingress layer for trusted familiar work. It should not become a generic agent platform inside the GitHub App. The GitHub App accepts repository events, routes them to the right familiar, records task state, and keeps humans in control through Cave oversight.
 
+For a visual system map, webhook sequence, task lifecycle, and trust-boundary diagrams, see [Architecture Diagrams](docs/architecture.md).
+
 ## Design Goal
 
 Assign GitHub work to a known familiar and get a draft PR back with visible context, evidence, and an oversight path.
@@ -15,16 +17,19 @@ The core design constraint is trust continuity:
 
 ## Task Flow
 
-```text
-GitHub event
-  -> webhook HMAC validation
-  -> event parsing and familiar routing
-  -> task record and queue
-  -> worker starts isolated session
-  -> coven-code --headless receives session brief
-  -> familiar drafts changes and result envelope
-  -> GitHub Check Run and PR are updated
-  -> Cave Board and session link expose oversight
+```mermaid
+flowchart LR
+    event[GitHub event]
+    hmac[Webhook HMAC validation]
+    route[Event parsing and familiar routing]
+    task[Task record and queue]
+    worker[Worker starts isolated session]
+    brief[coven-code receives session brief]
+    result[Familiar drafts changes and result envelope]
+    github[GitHub Check Run and PR updated]
+    cave[Cave Board and session link expose oversight]
+
+    event --> hmac --> route --> task --> worker --> brief --> result --> github --> cave
 ```
 
 ## Routing Model

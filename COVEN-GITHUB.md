@@ -9,6 +9,8 @@
 
 A GitHub App that turns any Coven-configured familiar into a first-class GitHub coding agent. Assign an issue to `@cody` (or any familiar bot user), and the familiar plans, edits, commits, and opens a pull request — with live oversight in CovenCave and no black-box model lock-in.
 
+For the GitHub-rendered system diagrams that explain this repo at a glance, see [docs/architecture.md](docs/architecture.md).
+
 ---
 
 ## Problem
@@ -43,7 +45,29 @@ Mixing these creates a monolith that is hard to test, deploy, and reason about.
 
 ### Session Lifecycle
 
+```mermaid
+sequenceDiagram
+    participant GitHub
+    participant Webhook as coven-github webhook
+    participant Worker as coven-github worker
+    participant Runtime as coven-code headless
+    participant Cave as CovenCave
+
+    GitHub->>Webhook: Signed webhook for issue, label, mention, or review
+    Webhook->>Webhook: Validate HMAC and route familiar
+    Webhook->>GitHub: Create Check Run
+    Webhook->>Worker: Enqueue task
+    Worker->>Runtime: Start session with session-brief.json
+    Worker->>Cave: Publish live status link
+    Runtime-->>Worker: Structured progress and result.json
+    Worker->>GitHub: Update Check Run
+    Runtime->>GitHub: Push branch
+    Worker->>GitHub: Open draft PR and link issue
 ```
+
+The same lifecycle in operational prose:
+
+```text
 1. Webhook arrives
    → validate HMAC signature (reject invalid)
    → parse event: repo, ref, issue body/diff, assignee/label/mention
