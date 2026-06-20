@@ -311,4 +311,22 @@ mod tests {
 
         assert!(task.is_none());
     }
+
+    #[test]
+    fn pr_review_comment_ignores_bot_self_mentions() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::PullRequestReviewComment(coven_github_api::PrReviewCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                pr_number: 7,
+                comment_body: "@coven-cody please fix.".to_string(),
+                commenter_login: "coven-cody[bot]".to_string(),
+            }),
+        );
+
+        assert!(task.is_none());
+    }
 }
