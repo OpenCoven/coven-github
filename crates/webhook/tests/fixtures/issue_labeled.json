@@ -1,0 +1,18 @@
+{
+  "action": "labeled",
+  "issue": {
+    "number": 42,
+    "title": "Fix the spell compiler",
+    "body": "It loses sigils on nested casts.",
+    "state": "open",
+    "user": { "login": "octocat" }
+  },
+  "label": { "name": "coven:fix", "color": "5319e7" },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" },
+    "default_branch": "main"
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

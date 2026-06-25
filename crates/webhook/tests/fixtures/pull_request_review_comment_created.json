@@ -1,0 +1,22 @@
+{
+  "action": "created",
+  "comment": {
+    "id": 6677889900,
+    "body": "@coven-cody this off-by-one looks wrong — should it be `<=`?",
+    "user": { "login": "octocat" },
+    "path": "src/auth/refresh.rs",
+    "diff_hunk": "@@ -10,3 +10,5 @@\n-    if now > expiry {\n+    if now >= expiry {"
+  },
+  "pull_request": {
+    "number": 73,
+    "title": "Add clock-skew buffer to token refresh",
+    "state": "open"
+  },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" },
+    "default_branch": "main"
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

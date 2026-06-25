@@ -1,0 +1,18 @@
+{
+  "action": "assigned",
+  "issue": {
+    "number": 42,
+    "title": "Fix OAuth token refresh",
+    "body": "The refresh path drops clock skew between client and auth server.",
+    "state": "open",
+    "user": { "login": "octocat" }
+  },
+  "assignee": { "login": "coven-cody[bot]" },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" },
+    "default_branch": "main"
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

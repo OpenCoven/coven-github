@@ -1,0 +1,26 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 73,
+    "title": "Add clock-skew buffer to token refresh",
+    "body": "Implements the fix for #42.",
+    "state": "open",
+    "user": { "login": "coven-cody[bot]" },
+    "pull_request": {
+      "url": "https://api.github.com/repos/OpenCoven/coven-code/pulls/73",
+      "html_url": "https://github.com/OpenCoven/coven-code/pull/73"
+    }
+  },
+  "comment": {
+    "id": 2233445566,
+    "body": "@coven-cody the lint is still failing on this PR, mind fixing it?",
+    "user": { "login": "octocat" }
+  },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" },
+    "default_branch": "main"
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

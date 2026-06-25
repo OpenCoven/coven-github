@@ -1,0 +1,21 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 5566778899,
+    "body": "@coven-cody two of these branches still need test coverage — please address before merge.",
+    "state": "changes_requested",
+    "user": { "login": "octocat" }
+  },
+  "pull_request": {
+    "number": 73,
+    "title": "Add clock-skew buffer to token refresh",
+    "state": "open"
+  },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" },
+    "default_branch": "main"
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

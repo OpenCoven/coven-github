@@ -112,9 +112,10 @@ For deeper system, sequence, state, security-boundary, and hosted deployment dia
 | Label trigger | Implemented | Routes configured `trigger_labels` such as `coven:fix`. |
 | Issue / PR mention trigger | Implemented | Ignores familiar bot self-comments to avoid loops. |
 | GitHub App installation tokens | Implemented | Mints installation access tokens from the App private key. |
-| Check Run creation and completion | Partial | Creates and updates Check Runs; branch/SHA resolution still needs production hardening. |
-| `coven-code --headless` execution | Partial | Worker spawns headless sessions and enforces task timeouts; result quality depends on the runtime. |
-| Pull request creation | Partial | Opens draft PRs from session results; base branch is still hardcoded to `main`. |
+| Check Run creation and completion | Partial | Creates and updates Check Runs against the resolved target head SHA; stale-ref revalidation before publish is still planned. |
+| Headless execution contract | Locked (v1) | Brief, result envelope, exit codes, and git-auth channel are pinned in [`docs/headless-contract.md`](docs/headless-contract.md) with JSON Schemas, golden fixtures, and a conformance test. |
+| `coven-code --headless` execution | Partial | Worker spawns headless sessions with a tokenless session brief and enforces task timeouts; result quality depends on the runtime. |
+| Pull request creation | Partial | Opens draft PRs from session results against the repository's resolved default/base branch. |
 | CovenCave task polling | Partial | In-memory task API exists for local oversight; hosted control-plane auth and persistence are planned. |
 | Durable queue / task store | Planned | Required for hosted reliability and restarts. |
 | Hosted tier | Planned | See [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md). |

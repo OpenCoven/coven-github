@@ -2,6 +2,7 @@
 
 use coven_github_api::{
     GitHubEvent, IssueAssignedEvent, IssueCommentEvent, IssueLabeledEvent, PrReviewCommentEvent,
+    PrReviewEvent,
 };
 use serde::Deserialize;
 
@@ -13,6 +14,7 @@ pub struct WebhookPayload {
     pub repository: Option<Repository>,
     pub issue: Option<Issue>,
     pub comment: Option<Comment>,
+    pub review: Option<Review>,
     pub label: Option<Label>,
     pub assignee: Option<User>,
     pub pull_request: Option<PullRequest>,
@@ -39,6 +41,9 @@ pub struct Issue {
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
+    /// Present (non-null) only when the "issue" is actually a pull request.
+    /// GitHub delivers PR conversation comments via the `issue_comment` event.
+    pub pull_request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +55,15 @@ pub struct Label {
 pub struct Comment {
     pub body: String,
     pub user: User,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Review {
+    /// A review can be submitted with no summary body (e.g. a bare approval).
+    pub body: Option<String>,
+    pub user: User,
+    /// `approved`, `changes_requested`, or `commented`.
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +129,25 @@ pub fn parse_event(event_type: &str, payload: &WebhookPayload) -> GitHubEvent {
                     issue_number: issue.number,
                     comment_body: comment.body.clone(),
                     commenter_login: comment.user.login.clone(),
+                    on_pull_request: issue.pull_request.is_some(),
+                });
+            }
+        }
+        "pull_request_review" if payload.action.as_deref() == Some("submitted") => {
+            if let (Some(inst), Some(repo), Some(pr), Some(review)) = (
+                &payload.installation,
+                &payload.repository,
+                &payload.pull_request,
+                &payload.review,
+            ) {
+                return GitHubEvent::PullRequestReview(PrReviewEvent {
+                    installation_id: inst.id,
+                    repo_owner: repo.owner.login.clone(),
+                    repo_name: repo.name.clone(),
+                    pr_number: pr.number,
+                    review_body: review.body.clone().unwrap_or_default(),
+                    review_state: review.state.clone().unwrap_or_default(),
+                    reviewer_login: review.user.login.clone(),
                 });
             }
         }
@@ -135,6 +168,7 @@ pub fn parse_event(event_type: &str, payload: &WebhookPayload) -> GitHubEvent {
                 });
             }
         }
+        "ping" => return GitHubEvent::Ping,
         _ => {}
     }
 

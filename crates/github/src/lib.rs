@@ -5,9 +5,18 @@ use serde::{Deserialize, Serialize};
 pub mod check_run;
 pub mod installation;
 pub mod pr;
+pub mod repo;
 pub mod tasks;
 
 pub const DEFAULT_API_BASE_URL: &str = "https://api.github.com";
+
+/// Major version of the coven-code headless execution contract this adapter
+/// speaks. See `docs/headless-contract.md`. Bump only on breaking changes.
+pub const HEADLESS_CONTRACT_VERSION: &str = "1";
+
+fn default_contract_version() -> String {
+    HEADLESS_CONTRACT_VERSION.to_string()
+}
 const GITHUB_API_VERSION: &str = "2026-03-10";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,14 +44,16 @@ async fn send_json(
     request: GitHubRequest,
 ) -> anyhow::Result<reqwest::Response> {
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
-    let response = client
+    let mut builder = client
         .request(method, api_url(base_url, &request.path))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .json(&request.body)
-        .send()
-        .await?;
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
+    // GET/metadata requests carry no body; only attach JSON for mutations.
+    if !request.body.is_null() {
+        builder = builder.json(&request.body);
+    }
+    let response = builder.send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -60,7 +71,10 @@ pub enum GitHubEvent {
     IssueAssigned(IssueAssignedEvent),
     IssueLabeled(IssueLabeledEvent),
     IssueComment(IssueCommentEvent),
+    PullRequestReview(PrReviewEvent),
     PullRequestReviewComment(PrReviewCommentEvent),
+    /// `ping` delivery GitHub sends when a webhook is first configured.
+    Ping,
     Unsupported { name: String },
 }
 
@@ -94,6 +108,27 @@ pub struct IssueCommentEvent {
     pub issue_number: u64,
     pub comment_body: String,
     pub commenter_login: String,
+    /// `issue_comment` fires for pull-request conversation comments as well as
+    /// issue comments. GitHub flags the former with an `issue.pull_request`
+    /// object; this lets routing send PR comments through PR iteration rather
+    /// than issue-mention handling.
+    pub on_pull_request: bool,
+}
+
+/// Top-level pull request review submission (`pull_request_review` → `submitted`).
+///
+/// Distinct from [`PrReviewCommentEvent`], which is a single inline comment on a
+/// diff hunk. This carries the review summary body and verdict (state).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PrReviewEvent {
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub review_body: String,
+    /// Review verdict: `approved`, `changes_requested`, or `commented`.
+    pub review_state: String,
+    pub reviewer_login: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -139,6 +174,11 @@ pub enum TaskKind {
 /// Structured result envelope written by coven-code --headless.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SessionResult {
+    /// Contract major version. Defaults to the current version when a runtime
+    /// omits it, but conformant producers MUST emit it. See
+    /// `docs/headless-contract.md`.
+    #[serde(default = "default_contract_version")]
+    pub contract_version: String,
     pub status: SessionStatus,
     pub branch: Option<String>,
     pub commits: Vec<CommitInfo>,

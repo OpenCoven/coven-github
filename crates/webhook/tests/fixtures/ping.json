@@ -1,0 +1,20 @@
+{
+  "zen": "Non-blocking is better than blocking.",
+  "hook_id": 44556677,
+  "hook": {
+    "type": "App",
+    "id": 44556677,
+    "events": [
+      "issues",
+      "issue_comment",
+      "pull_request_review",
+      "pull_request_review_comment"
+    ]
+  },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" }
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

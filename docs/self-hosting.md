@@ -14,6 +14,28 @@ This guide targets macOS and Linux operators. Windows should work through WSL2 o
 
 ## 1. Register a GitHub App
 
+You can register the App from the prefilled manifest (fastest) or by hand.
+
+### Option A — manifest flow (recommended)
+
+`docs/app-manifest.json` describes the exact permissions and event subscriptions
+`coven-github` needs. Use it to create the App in one round trip:
+
+1. Open `docs/app-manifest.json` and replace the two `https://your-host`
+   placeholders (`hook_attributes.url` → `https://your-host/webhook`,
+   `redirect_url`) with your public endpoint.
+2. Visit `https://github.com/settings/apps/new` (personal) or
+   `https://github.com/organizations/<org>/settings/apps/new` (org) and use the
+   "Create from manifest" flow, or POST the manifest via the
+   [App manifest API](https://docs.github.com/apps/sharing-github-apps/registering-a-github-app-from-a-manifest).
+3. GitHub returns the **App ID**, generated **webhook secret**, and a downloadable
+   **private key** — save all three for the config step.
+
+The manifest already requests the correct permissions and subscribes to every
+event below, so you can skip the manual checklist.
+
+### Option B — manual registration
+
 1. Go to **GitHub → Settings → Developer settings → GitHub Apps → New GitHub App**
 2. Set:
    - **App name:** `coven-cody` (or your org's name)
@@ -29,11 +51,18 @@ This guide targets macOS and Linux operators. Windows should work through WSL2 o
 4. **Subscribe to events:**
    - Issues
    - Issue comment
+   - Pull request review
    - Pull request review comment
    - Check suite / Check run
 5. Click **Create GitHub App**
 6. Generate and download a **private key** (PEM file)
 7. Note your **App ID**
+
+> **Webhook triggers.** `coven-github` reacts to: issue **assignment** to a bot
+> familiar, configured **trigger labels**, **@mentions** in issue comments, PR
+> conversation comments, submitted **PR reviews**, and inline **review comments**.
+> GitHub's `ping` delivery is acknowledged with a `pong` so you can confirm the
+> endpoint is wired up from the App's **Advanced → Recent Deliveries** page.
 
 ## 2. Install the App on a repo
 

@@ -116,6 +116,17 @@ The same lifecycle in operational prose:
 
 ## coven-code Delta: Headless Mode
 
+> **The normative, locked contract lives in [`docs/headless-contract.md`](docs/headless-contract.md)
+> (contract version `1`).** That document is the single source of truth, with
+> machine-checkable JSON Schemas and golden fixtures in [`docs/contracts/`](docs/contracts/)
+> and a conformance test (`crates/worker/tests/contract.rs`). The summary below
+> is illustrative; where it disagrees with the contract, the contract wins. In
+> particular the contract supersedes this section on three points: the session
+> brief is **tokenless** (git auth flows via the `COVEN_GIT_TOKEN` env var, not
+> `GIT_ASKPASS`/an embedded `auth.token`), the brief carries a `task` tagged
+> union (not an `issue` object), and the v1 `result.json` envelope does **not**
+> include an `events` array (progress streaming is deferred to M2).
+
 The execution runtime needs the following additions to work as a GitHub App backend:
 
 ### `--headless` flag

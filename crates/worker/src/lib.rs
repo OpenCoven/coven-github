@@ -6,8 +6,8 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use coven_github_api::{
-    check_run, installation, pr, tasks::TaskStore, SessionResult, SessionStatus, Task, TaskKind,
-    DEFAULT_API_BASE_URL,
+    check_run, installation, pr, repo, tasks::TaskStore, SessionResult, SessionStatus, Task,
+    TaskKind, DEFAULT_API_BASE_URL,
 };
 use coven_github_config::Config;
 
@@ -59,14 +59,19 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
     )
     .await?;
 
-    // Create Check Run.
+    // Resolve target refs and base branch from live GitHub state. Check Runs
+    // must attach to an immutable commit SHA, and PRs must target the repo's
+    // actual base branch rather than a hardcoded "main".
+    let targets = resolve_targets(api_base_url, &token, &task).await?;
+
+    // Create Check Run against the resolved head SHA.
     let check_name = format!("{} — {}", familiar.display_name, task_title(&task.kind));
     let check_id = check_run::create_with_base_url(
         api_base_url,
         &token,
         &task.repo_owner,
         &task.repo_name,
-        "HEAD", // TODO: resolve head SHA
+        &targets.head_sha,
         &check_name,
         config
             .server
@@ -104,7 +109,7 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
     let workspace = config.worker.workspace_root.join(&task.id);
     tokio::fs::create_dir_all(&workspace).await?;
 
-    let brief = brief::build(&task, familiar, &token, &workspace);
+    let brief = brief::build(&task, familiar, &workspace, &targets.default_branch);
     let brief_path = workspace.join("session-brief.json");
     let result_path = workspace.join("result.json");
     tokio::fs::write(&brief_path, serde_json::to_string_pretty(&brief)?).await?;
@@ -122,7 +127,14 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
     )
     .await?;
 
-    let result = run_with_retry(config, &brief_path, &result_path, config.worker.max_retries).await;
+    let result = run_with_retry(
+        config,
+        &brief_path,
+        &result_path,
+        &token,
+        config.worker.max_retries,
+    )
+    .await;
 
     match result {
         Ok(session_result) => {
@@ -139,7 +151,7 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
                         &task.repo_owner,
                         &task.repo_name,
                         branch,
-                        "main",
+                        &targets.base_ref,
                         &format!(
                             "{} (#{} via Coven)",
                             session_result.summary,
@@ -217,11 +229,12 @@ async fn run_with_retry(
     config: &Config,
     brief_path: &PathBuf,
     result_path: &PathBuf,
+    git_token: &str,
     max_retries: u32,
 ) -> Result<SessionResult> {
     let mut attempts = 0;
     loop {
-        match run_coven_code(config, brief_path, result_path).await {
+        match run_coven_code(config, brief_path, result_path, git_token).await {
             Ok(r) => return Ok(r),
             Err(e) if attempts < max_retries => {
                 warn!("coven-code attempt {attempts} failed ({e:#}), retrying…");
@@ -237,6 +250,7 @@ async fn run_coven_code(
     config: &Config,
     brief_path: &PathBuf,
     result_path: &PathBuf,
+    git_token: &str,
 ) -> Result<SessionResult> {
     let mut child = Command::new(&config.worker.coven_code_bin)
         .arg("--headless")
@@ -244,6 +258,9 @@ async fn run_coven_code(
         .arg(brief_path)
         .arg("--output")
         .arg(result_path)
+        // Git auth is injected via the environment, never written to the
+        // session brief or any durable artifact (issue #4).
+        .env("COVEN_GIT_TOKEN", git_token)
         .spawn()?;
 
     let status = match tokio::time::timeout(
@@ -292,6 +309,57 @@ fn task_title(kind: &TaskKind) -> String {
         }
         TaskKind::RespondToMention { issue_number, .. } => {
             format!("Respond on issue #{issue_number}")
+        }
+    }
+}
+
+/// Refs resolved from live GitHub state for a task.
+struct ResolvedTargets {
+    /// Repository default branch (for the session brief).
+    default_branch: String,
+    /// Branch a draft PR should target.
+    base_ref: String,
+    /// Immutable commit SHA the Check Run attaches to.
+    head_sha: String,
+}
+
+/// Resolves the repository default branch and the immutable target refs a task
+/// operates on. Issue tasks target the default branch tip; PR review-comment
+/// tasks target the PR's own head/base refs.
+async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result<ResolvedTargets> {
+    let meta = repo::get_repo_with_base_url(api_base_url, token, &task.repo_owner, &task.repo_name)
+        .await?;
+
+    match &task.kind {
+        TaskKind::AddressReviewComment { pr_number, .. } => {
+            let refs = repo::get_pull_request_refs_with_base_url(
+                api_base_url,
+                token,
+                &task.repo_owner,
+                &task.repo_name,
+                *pr_number,
+            )
+            .await?;
+            Ok(ResolvedTargets {
+                default_branch: meta.default_branch,
+                base_ref: refs.base_ref,
+                head_sha: refs.head_sha,
+            })
+        }
+        TaskKind::FixIssue { .. } | TaskKind::RespondToMention { .. } => {
+            let head_sha = repo::get_branch_sha_with_base_url(
+                api_base_url,
+                token,
+                &task.repo_owner,
+                &task.repo_name,
+                &meta.default_branch,
+            )
+            .await?;
+            Ok(ResolvedTargets {
+                base_ref: meta.default_branch.clone(),
+                default_branch: meta.default_branch,
+                head_sha,
+            })
         }
     }
 }
@@ -358,7 +426,7 @@ mod tests {
         fs::write(&brief_path, "{}").expect("brief should be written");
 
         let started = Instant::now();
-        let result = run_coven_code(&config, &brief_path, &result_path).await;
+        let result = run_coven_code(&config, &brief_path, &result_path, "test-token").await;
 
         assert!(result.is_err());
         assert!(

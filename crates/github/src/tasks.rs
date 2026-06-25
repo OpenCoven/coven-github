@@ -170,6 +170,7 @@ mod tests {
                 "task-1",
                 "OpenCoven/coven-code",
                 &SessionResult {
+                    contract_version: crate::HEADLESS_CONTRACT_VERSION.to_string(),
                     status: SessionStatus::Success,
                     branch: Some("cody/fix-auth".to_string()),
                     commits: vec![],

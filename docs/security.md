@@ -57,9 +57,11 @@ See [Container Isolation](container-isolation.md) for the production isolation t
 
 ## Token Handling
 
-The current session brief includes clone auth so `coven-code` can operate on the repository. The production target is stricter:
+The session brief is **tokenless**: it carries read context only and never embeds an installation token or a credentialed `clone_url`. Git authentication is injected into the `coven-code` child process out-of-band through the `COVEN_GIT_TOKEN` environment variable, which is never written to `session-brief.json` or any durable artifact. GitHub write authority (comments, Check Runs, branches, PRs) stays with the adapter behind its publication gate; the agent emits a result envelope and the adapter publishes. A serialization test fails if the brief ever serializes an `auth`/`token` field or an `x-access-token` clone URL.
 
-- Prefer `GIT_ASKPASS` or environment-based git auth over embedding tokens in JSON.
+Remaining hardening targets:
+
+- Prefer `GIT_ASKPASS` / credential-helper injection over a plain env var so the token never appears in child process listings.
 - Avoid writing installation tokens to durable task stores.
 - Redact tokens in logs, Check Runs, issue comments, PR bodies, and task APIs.
 - Refresh installation tokens through a single token manager with cache expiry.

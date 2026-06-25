@@ -93,6 +93,13 @@ pub async fn handle_webhook(
     let event = parse_event(&event_type, &payload);
     info!(?event_type, "received webhook event");
 
+    // `ping` is GitHub's webhook-configuration handshake — acknowledge it
+    // explicitly so operators get a clear signal the endpoint is wired up.
+    if matches!(event, GitHubEvent::Ping) {
+        info!("webhook ping received — endpoint configured");
+        return (StatusCode::OK, Json(json!({"ok": true, "pong": true}))).into_response();
+    }
+
     // 4. Route event → task.
     if let Some(task) = event_to_task(&state, event) {
         let task_id = task.id.clone();
@@ -153,12 +160,29 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         }
 
         GitHubEvent::IssueComment(e) => {
-            // Find a familiar mentioned in the comment body.
-            let familiar = state.config.familiars.iter().find(|f| {
-                e.commenter_login != f.bot_username
-                    && e.comment_body
-                        .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
-            })?;
+            // Find a familiar mentioned in the comment body (skip the bot's own
+            // comments to avoid self-trigger loops).
+            let familiar = state
+                .config
+                .familiars
+                .iter()
+                .find(|f| e.commenter_login != f.bot_username && mentions(&e.comment_body, &f.bot_username))?;
+
+            // GitHub delivers PR conversation comments through `issue_comment`.
+            // Route those through PR iteration so the familiar gets PR context
+            // rather than issue context (the numbers coincide in GitHub).
+            let kind = if e.on_pull_request {
+                TaskKind::AddressReviewComment {
+                    pr_number: e.issue_number,
+                    comment_body: e.comment_body,
+                    diff_hunk: None,
+                }
+            } else {
+                TaskKind::RespondToMention {
+                    issue_number: e.issue_number,
+                    comment_body: e.comment_body,
+                }
+            };
 
             Some(Task {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -166,19 +190,39 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
-                kind: TaskKind::RespondToMention {
-                    issue_number: e.issue_number,
-                    comment_body: e.comment_body,
+                kind,
+            })
+        }
+
+        GitHubEvent::PullRequestReview(e) => {
+            // A submitted review carries a summary body and a verdict. Trigger
+            // on an explicit mention in the body, same as inline comments.
+            let familiar = state
+                .config
+                .familiars
+                .iter()
+                .find(|f| e.reviewer_login != f.bot_username && mentions(&e.review_body, &f.bot_username))?;
+
+            Some(Task {
+                id: uuid::Uuid::new_v4().to_string(),
+                installation_id: e.installation_id,
+                repo_owner: e.repo_owner,
+                repo_name: e.repo_name,
+                familiar_id: familiar.id.clone(),
+                kind: TaskKind::AddressReviewComment {
+                    pr_number: e.pr_number,
+                    comment_body: e.review_body,
+                    diff_hunk: None,
                 },
             })
         }
 
         GitHubEvent::PullRequestReviewComment(e) => {
-            let familiar = state.config.familiars.iter().find(|f| {
-                e.commenter_login != f.bot_username
-                    && e.comment_body
-                        .contains(&format!("@{}", f.bot_username.trim_end_matches("[bot]")))
-            })?;
+            let familiar = state
+                .config
+                .familiars
+                .iter()
+                .find(|f| e.commenter_login != f.bot_username && mentions(&e.comment_body, &f.bot_username))?;
 
             Some(Task {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -194,8 +238,40 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
             })
         }
 
-        GitHubEvent::Unsupported { .. } => None,
+        // `ping` is acknowledged at the handler; it never produces a task.
+        GitHubEvent::Ping | GitHubEvent::Unsupported { .. } => None,
     }
+}
+
+/// Returns true if `body` mentions the familiar's `@handle` as a whole token.
+///
+/// `bot_username` is the GitHub App bot login (e.g. `coven-cody[bot]`); the
+/// `[bot]` suffix is dropped since mentions are written `@coven-cody`. Matching
+/// is boundary-aware: `@cody` inside `@codyx`, `@cody-2`, or `email@cody` does
+/// not count, and `@coven-cody/team` (a team mention) is not a bot mention.
+fn mentions(body: &str, bot_username: &str) -> bool {
+    let handle = bot_username.trim_end_matches("[bot]");
+    if handle.is_empty() {
+        return false;
+    }
+    let needle = format!("@{handle}");
+    let mut offset = 0;
+    while let Some(pos) = body[offset..].find(&needle) {
+        let start = offset + pos;
+        let end = start + needle.len();
+        let before = body[..start].chars().next_back();
+        let after = body[end..].chars().next();
+        // The character before `@` must be a separator (or start of string),
+        // and the character after the handle must not continue an identifier.
+        let boundary_before = before.is_none_or(|c| !c.is_alphanumeric() && c != '@');
+        let boundary_after =
+            after.is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '/'));
+        if boundary_before && boundary_after {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -306,6 +382,7 @@ mod tests {
                 issue_number: 42,
                 comment_body: "@coven-cody thanks, I opened a PR.".to_string(),
                 commenter_login: "coven-cody[bot]".to_string(),
+                on_pull_request: false,
             }),
         );
 
@@ -328,5 +405,121 @@ mod tests {
         );
 
         assert!(task.is_none());
+    }
+
+    #[test]
+    fn issue_comment_on_pr_routes_to_pr_iteration() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 73,
+                comment_body: "@coven-cody the lint is still failing".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: true,
+            }),
+        )
+        .expect("a mention on a PR comment should create a task");
+
+        match task.kind {
+            TaskKind::AddressReviewComment {
+                pr_number,
+                diff_hunk,
+                ..
+            } => {
+                assert_eq!(pr_number, 73);
+                assert!(diff_hunk.is_none());
+            }
+            other => panic!("expected AddressReviewComment for a PR comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_comment_on_issue_routes_to_respond_to_mention() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                comment_body: "@coven-cody can you take a look?".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: false,
+            }),
+        )
+        .expect("a mention on an issue comment should create a task");
+
+        match task.kind {
+            TaskKind::RespondToMention { issue_number, .. } => assert_eq!(issue_number, 42),
+            other => panic!("expected RespondToMention for an issue comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submitted_review_mention_routes_to_pr_iteration() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::PullRequestReview(coven_github_api::PrReviewEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                pr_number: 73,
+                review_body: "@coven-cody please add test coverage before merge.".to_string(),
+                review_state: "changes_requested".to_string(),
+                reviewer_login: "octocat".to_string(),
+            }),
+        )
+        .expect("a mention in a review body should create a task");
+
+        match task.kind {
+            TaskKind::AddressReviewComment { pr_number, .. } => assert_eq!(pr_number, 73),
+            other => panic!("expected AddressReviewComment for a review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submitted_review_without_mention_is_ignored() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::PullRequestReview(coven_github_api::PrReviewEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                pr_number: 73,
+                review_body: "LGTM, nice work!".to_string(),
+                review_state: "approved".to_string(),
+                reviewer_login: "octocat".to_string(),
+            }),
+        );
+
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn ping_event_produces_no_task() {
+        let state = app_state();
+        assert!(event_to_task(&state, GitHubEvent::Ping).is_none());
+    }
+
+    #[test]
+    fn mention_matching_is_boundary_aware() {
+        // Exact handle (with the [bot] suffix stripped) matches.
+        assert!(mentions("hey @coven-cody can you help", "coven-cody[bot]"));
+        // Trailing identifier characters must not be swallowed into the handle.
+        assert!(!mentions("ping @coven-codyx instead", "coven-cody[bot]"));
+        assert!(!mentions("ping @coven-cody-2 instead", "coven-cody[bot]"));
+        // A team mention (`@org/team`) is not a bot mention.
+        assert!(!mentions("cc @coven-cody/maintainers", "coven-cody[bot]"));
+        // An email-like local part is not a mention.
+        assert!(!mentions("mail user@coven-cody.example", "coven-cody[bot]"));
+        // Mention at end of string still matches.
+        assert!(mentions("over to you @coven-cody", "coven-cody[bot]"));
     }
 }

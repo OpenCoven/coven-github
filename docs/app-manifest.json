@@ -1,0 +1,26 @@
+{
+  "name": "coven-cody",
+  "url": "https://opencoven.ai",
+  "description": "Coven-native GitHub coding agent. Assign an issue to a familiar bot and it plans, edits, commits, and opens a PR — with live oversight in CovenCave.",
+  "hook_attributes": {
+    "url": "https://your-host/webhook",
+    "active": true
+  },
+  "redirect_url": "https://your-host/app/created",
+  "public": false,
+  "default_permissions": {
+    "contents": "write",
+    "issues": "write",
+    "pull_requests": "write",
+    "checks": "write",
+    "metadata": "read"
+  },
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "check_suite",
+    "check_run"
+  ]
+}

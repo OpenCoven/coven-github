@@ -1,0 +1,22 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 42,
+    "title": "Fix OAuth token refresh",
+    "body": "The refresh path drops clock skew.",
+    "state": "open",
+    "user": { "login": "octocat" }
+  },
+  "comment": {
+    "id": 1122334455,
+    "body": "@coven-cody can you take a look at this one?",
+    "user": { "login": "octocat" }
+  },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" },
+    "default_branch": "main"
+  },
+  "installation": { "id": 987654 },
+  "sender": { "login": "octocat" }
+}

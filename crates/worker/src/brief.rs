@@ -3,18 +3,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use coven_github_api::{Task, TaskKind};
+use coven_github_api::{Task, TaskKind, HEADLESS_CONTRACT_VERSION};
 use coven_github_config::FamiliarConfig;
 
+fn default_contract_version() -> String {
+    HEADLESS_CONTRACT_VERSION.to_string()
+}
+
 /// The session-brief.json schema injected into coven-code --headless.
+///
+/// The brief is intentionally tokenless: the agent receives read context only.
+/// Git authentication is injected out-of-band (env / GIT_ASKPASS) and GitHub
+/// write authority (comments, Check Runs, branches, PRs) stays with the adapter
+/// behind its publication gate. See issue #4.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionBrief {
+    /// Contract major version this brief is written against. See
+    /// `docs/headless-contract.md`.
+    #[serde(default = "default_contract_version")]
+    pub contract_version: String,
     pub trigger: String,
     pub repo: RepoBrief,
     pub task: TaskBrief,
     pub familiar: FamiliarBrief,
     pub workspace: WorkspaceBrief,
-    pub auth: AuthBrief,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,17 +69,15 @@ pub struct WorkspaceBrief {
     pub root: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AuthBrief {
-    pub token: String,
-}
-
-/// Build a session brief from a Task and familiar config.
+/// Build a tokenless session brief from a Task and familiar config.
+///
+/// `default_branch` is resolved from live GitHub repository metadata rather than
+/// assuming `main` (see issue #9).
 pub fn build(
     task: &Task,
     familiar: &FamiliarConfig,
-    token: &str,
     workspace: &Path,
+    default_branch: &str,
 ) -> SessionBrief {
     let trigger = match &task.kind {
         TaskKind::FixIssue { .. } => "issue_assigned",
@@ -104,15 +114,17 @@ pub fn build(
     };
 
     SessionBrief {
+        contract_version: HEADLESS_CONTRACT_VERSION.to_string(),
         trigger: trigger.to_string(),
         repo: RepoBrief {
             owner: task.repo_owner.clone(),
             name: task.repo_name.clone(),
+            // No embedded credentials: git auth is injected out-of-band.
             clone_url: format!(
-                "https://x-access-token:{}@github.com/{}/{}.git",
-                token, task.repo_owner, task.repo_name
+                "https://github.com/{}/{}.git",
+                task.repo_owner, task.repo_name
             ),
-            default_branch: "main".to_string(),
+            default_branch: default_branch.to_string(),
         },
         task: task_brief,
         familiar: FamiliarBrief {
@@ -124,8 +136,66 @@ pub fn build(
         workspace: WorkspaceBrief {
             root: workspace.to_string_lossy().to_string(),
         },
-        auth: AuthBrief {
-            token: token.to_string(),
-        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coven_github_api::{Task, TaskKind};
+
+    fn familiar() -> FamiliarConfig {
+        FamiliarConfig {
+            id: "cody".to_string(),
+            display_name: "Cody".to_string(),
+            bot_username: "coven-cody[bot]".to_string(),
+            model: None,
+            skills: vec![],
+            trigger_labels: vec![],
+        }
+    }
+
+    fn task() -> Task {
+        Task {
+            id: "task-1".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            familiar_id: "cody".to_string(),
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn brief_uses_resolved_default_branch_not_hardcoded_main() {
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "develop");
+        assert_eq!(brief.repo.default_branch, "develop");
+    }
+
+    #[test]
+    fn brief_serialization_never_contains_token_or_auth_fields() {
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main");
+        let value = serde_json::to_value(&brief).expect("brief should serialize");
+        let json = serde_json::to_string(&brief).expect("brief should serialize");
+
+        // The brief must never carry credentials (issue #4). Check for the
+        // serialized field keys rather than raw substrings, since free-text
+        // task content may legitimately mention "auth"/"token".
+        assert!(
+            value.get("auth").is_none(),
+            "brief leaked an auth field: {json}"
+        );
+        assert!(
+            !json.contains("\"token\""),
+            "brief leaked a token field: {json}"
+        );
+        assert!(
+            !json.contains("x-access-token"),
+            "clone_url leaked an embedded credential: {json}"
+        );
     }
 }
