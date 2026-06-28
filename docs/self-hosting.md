@@ -104,6 +104,21 @@ Important config fields:
 | `familiars[].bot_username` | GitHub App bot username that assignment and mentions match. |
 | `familiars[].trigger_labels` | Labels such as `coven:fix` that create familiar tasks. |
 
+### Validate the config
+
+Before starting the server, run the built-in doctor. It checks for the mistakes
+that otherwise surface as opaque runtime failures — a placeholder webhook
+secret, a missing PEM, a `coven_code_bin` that is not on disk or `PATH`, an
+empty `[[familiars]]` list, or duplicate familiar ids/bot usernames:
+
+```bash
+./target/release/coven-github doctor --config config/local.toml
+```
+
+It prints one line per finding and exits non-zero if any **error** remains, so
+it works as a CI gate or container preflight. `serve` runs the same checks on
+startup and refuses to boot when an error is present.
+
 ## 5. Run
 
 ```bash
@@ -131,6 +146,17 @@ curl -i \
 
 Expected result: `401 Unauthorized` with `{"error":"missing signature"}`. That confirms the webhook route is reachable and signature enforcement is active.
 
+For the full signature path — unsigned rejected, bad signature rejected, and a
+correctly HMAC-signed delivery accepted — run the bundled script against the
+running server:
+
+```bash
+scripts/smoke-webhook.sh http://localhost:3000/webhook "$WEBHOOK_SECRET"
+```
+
+It signs a `ping` payload with the same HMAC-SHA256 scheme GitHub uses, so a
+green run proves the receiver end-to-end without a real delivery or `coven-code`.
+
 ## 7. End-to-end test
 
 On a repo where the App is installed:
@@ -149,18 +175,35 @@ ngrok http 3000
 
 ## Docker
 
-```dockerfile
-FROM rust:1.82 AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
+A production-shaped multi-stage [`Dockerfile`](../Dockerfile) and a
+[`compose.yaml`](../compose.yaml) ship in the repo root. The image runs as an
+unprivileged user and bakes in no secrets — config and the private key are
+mounted read-only at runtime (the [`.dockerignore`](../.dockerignore) keeps
+`keys/`, `*.pem`, and `config/local.toml` out of the build context).
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/coven-github /usr/local/bin/
-COPY config/example.toml /config/local.toml
-CMD ["coven-github", "serve", "--config", "/config/local.toml"]
+```bash
+# Build the image
+docker build -t coven-github .
+
+# Validate the mounted config before serving (exits non-zero on errors)
+docker run --rm -v "$PWD/config:/config:ro" -v "$PWD/keys:/keys:ro" \
+  coven-github doctor --config /config/local.toml
+
+# Serve
+docker run --rm -p 3000:3000 \
+  -v "$PWD/config:/config:ro" -v "$PWD/keys:/keys:ro" \
+  coven-github
 ```
+
+Or with Compose (create `./keys/` and drop your PEM in first):
+
+```bash
+docker compose run --rm coven-github doctor --config /config/local.toml
+docker compose up
+```
+
+`coven-code` must be reachable inside the container — bake it into a derived
+image or mount it, and point `worker.coven_code_bin` at its in-container path.
 
 ## Security notes
 

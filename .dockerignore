@@ -1,0 +1,12 @@
+# Keep the Docker build context small and secret-free.
+target/
+.git/
+.worktrees/
+
+# Never ship secrets or local config into an image.
+keys/
+config/local.toml
+*.pem
+
+# Editor / OS noise
+.DS_Store

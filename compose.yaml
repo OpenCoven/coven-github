@@ -1,0 +1,32 @@
+# Docker Compose service for coven-github.
+#
+#   1. Copy config/example.toml → config/local.toml and fill it in.
+#   2. Drop your GitHub App PEM into ./keys/ and point
+#      github.private_key_path at /keys/<your-key>.pem in local.toml.
+#   3. Validate, then run:
+#        docker compose run --rm coven-github doctor --config /config/local.toml
+#        docker compose up
+#
+# coven-code must be reachable inside the container. Either bake it into a
+# derived image and set worker.coven_code_bin to its path, or mount it via an
+# extra read-only volume below.
+services:
+  coven-github:
+    build: .
+    image: coven-github:local
+    command: ["serve", "--config", "/config/local.toml"]
+    ports:
+      - "3000:3000"
+    volumes:
+      # Config and secrets are mounted read-only — never baked into the image.
+      - ./config:/config:ro
+      - ./keys:/keys:ro
+      # Ephemeral per-task workspaces. Keep worker.workspace_root pointed here.
+      - coven-workspaces:/tmp/coven-github-tasks
+    environment:
+      # Adjust log verbosity, e.g. RUST_LOG=coven_github=debug
+      RUST_LOG: "coven_github=info"
+    restart: unless-stopped
+
+volumes:
+  coven-workspaces:
