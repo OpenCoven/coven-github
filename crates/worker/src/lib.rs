@@ -1,7 +1,8 @@
 //! Worker: pulls tasks from the queue, spawns coven-code sessions, streams progress.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
@@ -9,9 +10,16 @@ use coven_github_api::{
     check_run, installation, pr, repo, tasks::TaskStore, SessionResult, SessionStatus, Task,
     TaskKind, DEFAULT_API_BASE_URL,
 };
-use coven_github_config::Config;
+use coven_github_config::{Config, FamiliarConfig};
 
 pub mod brief;
+
+/// Base unit for exponential backoff between retry-safe coven-code attempts.
+/// Attempt `n` sleeps `RETRY_BACKOFF_BASE * 2^n` (so 2s, 4s, … in production).
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Default Cave base URL used in familiar-voice comments when none is configured.
+const DEFAULT_CAVE_BASE_URL: &str = "https://cave.opencoven.ai";
 
 /// Runs the worker loop: pulls tasks and executes them concurrently.
 pub async fn run(
@@ -24,11 +32,15 @@ pub async fn run(
     while let Some(task) = task_rx.recv().await {
         let config = config.clone();
         let task_store = task_store.clone();
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            // The semaphore is only ever closed on shutdown; stop pulling tasks.
+            Err(_) => break,
+        };
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = execute_task(&config, task_store.clone(), task).await {
+            if let Err(e) = execute_task(&config, task_store, task).await {
                 error!("task execution error: {e:#}");
             }
         });
@@ -49,164 +61,110 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         .as_deref()
         .unwrap_or(DEFAULT_API_BASE_URL);
 
-    // Get installation token.
-    let private_key = std::fs::read_to_string(&config.github.private_key_path)?;
-    let token = installation::get_token_with_base_url(
-        api_base_url,
-        config.github.app_id,
-        &private_key,
-        task.installation_id,
-    )
-    .await?;
+    // Pre-flight: installation token, ref resolution, and Check Run creation.
+    // These run *before* the Check Run exists, so a failure here can't orphan a
+    // check — but it would otherwise make the task vanish silently. Record it as
+    // failed so it stays visible in Cave, then propagate.
+    let prepared = async {
+        let private_key = std::fs::read_to_string(&config.github.private_key_path)?;
+        let token = installation::get_token_with_base_url(
+            api_base_url,
+            config.github.app_id,
+            &private_key,
+            task.installation_id,
+        )
+        .await?;
 
-    // Resolve target refs and base branch from live GitHub state. Check Runs
-    // must attach to an immutable commit SHA, and PRs must target the repo's
-    // actual base branch rather than a hardcoded "main".
-    let targets = resolve_targets(api_base_url, &token, &task).await?;
+        // Resolve target refs and base branch from live GitHub state. Check Runs
+        // must attach to an immutable commit SHA, and PRs must target the repo's
+        // actual base branch rather than a hardcoded "main".
+        let targets = resolve_targets(api_base_url, &token, &task).await?;
 
-    // Create Check Run against the resolved head SHA.
-    let check_name = format!("{} — {}", familiar.display_name, task_title(&task.kind));
-    let check_id = check_run::create_with_base_url(
-        api_base_url,
-        &token,
-        &task.repo_owner,
-        &task.repo_name,
-        &targets.head_sha,
-        &check_name,
-        config
-            .server
-            .cave_base_url
-            .as_deref()
-            .map(|b| format!("{b}/sessions/{}", task.id))
-            .as_deref(),
-    )
-    .await?;
+        // Create Check Run against the resolved head SHA. From this point on the
+        // Check Run MUST reach a terminal conclusion on every code path — a flaky
+        // comment or PR API call must never leave a perpetually in-progress check
+        // blocking merges on a real repo.
+        let check_name = format!("{} — {}", familiar.display_name, task_title(&task.kind));
+        let check_id = check_run::create_with_base_url(
+            api_base_url,
+            &token,
+            &task.repo_owner,
+            &task.repo_name,
+            &targets.head_sha,
+            &check_name,
+            config
+                .server
+                .cave_base_url
+                .as_deref()
+                .map(|b| format!("{b}/sessions/{}", task.id))
+                .as_deref(),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((token, targets, check_id))
+    }
+    .await;
+
+    let (token, targets, check_id) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            error!(task_id = %task.id, "pre-flight failed before check run: {e:#}");
+            task_store
+                .register_failed(&task, &familiar.display_name)
+                .await;
+            return Err(e);
+        }
+    };
+
     let repo = format!("{}/{}", task.repo_owner, task.repo_name);
     let check_run_url = Some(format!("https://github.com/{repo}/runs/{check_id}"));
     task_store
         .mark_running(&task, &familiar.display_name, check_run_url)
         .await;
 
-    // Post "starting" comment.
-    if let Some(issue_number) = task_issue_number(&task.kind) {
-        let start_msg = format!(
-            "👋 I'm **{}**, your Coven coding familiar. I'm on it — I'll open a PR once I've had a look.\n\n[Watch this session in CovenCave →]({})",
-            familiar.display_name,
-            config.server.cave_base_url.as_deref().unwrap_or("https://cave.opencoven.ai"),
-        );
-        pr::post_comment_with_base_url(
-            api_base_url,
-            &token,
-            &task.repo_owner,
-            &task.repo_name,
-            issue_number,
-            &start_msg,
-        )
-        .await?;
-    }
-
-    // Build session brief.
+    // Everything past check creation is fallible but must not orphan the check
+    // or leak the workspace. Run it, then finalize unconditionally below.
     let workspace = config.worker.workspace_root.join(&task.id);
-    tokio::fs::create_dir_all(&workspace).await?;
-
-    let brief = brief::build(&task, familiar, &workspace, &targets.default_branch);
-    let brief_path = workspace.join("session-brief.json");
-    let result_path = workspace.join("result.json");
-    tokio::fs::write(&brief_path, serde_json::to_string_pretty(&brief)?).await?;
-
-    // Spawn coven-code.
-    check_run::update_with_base_url(
-        api_base_url,
-        &token,
-        &task.repo_owner,
-        &task.repo_name,
-        check_id,
-        check_run::CheckStatus::InProgress,
-        "Running",
-        "Familiar is working on the task…",
-    )
-    .await?;
-
-    let result = run_with_retry(
+    let outcome = run_and_publish(
         config,
-        &brief_path,
-        &result_path,
+        &task,
+        familiar,
         &token,
-        config.worker.max_retries,
+        api_base_url,
+        &targets,
+        &workspace,
+        check_id,
     )
     .await;
 
-    match result {
-        Ok(session_result) => {
-            let success = session_result.status == SessionStatus::Success
-                || session_result.status == SessionStatus::Partial;
+    // Workspace cleanup ALWAYS runs — success or failure.
+    tokio::fs::remove_dir_all(&workspace).await.ok();
 
-            // Open PR if we have commits.
-            let mut opened_pr = None;
-            if !session_result.commits.is_empty() {
-                if let Some(branch) = &session_result.branch {
-                    let pr_num = pr::open_pull_request_with_base_url(
-                        api_base_url,
-                        &token,
-                        &task.repo_owner,
-                        &task.repo_name,
-                        branch,
-                        &targets.base_ref,
-                        &format!(
-                            "{} (#{} via Coven)",
-                            session_result.summary,
-                            task_issue_number(&task.kind).unwrap_or(0)
-                        ),
-                        &session_result.pr_body,
-                        true, // draft
-                    )
-                    .await?;
-                    opened_pr = Some(pr_num);
-
-                    if let Some(issue_number) = task_issue_number(&task.kind) {
-                        pr::post_comment_with_base_url(
-                            api_base_url,
-                            &token,
-                            &task.repo_owner,
-                            &task.repo_name,
-                            issue_number,
-                            &format!(
-                                "✅ PR #{pr_num} opened — [watch in CovenCave →]({})",
-                                config
-                                    .server
-                                    .cave_base_url
-                                    .as_deref()
-                                    .unwrap_or("https://cave.opencoven.ai")
-                            ),
-                        )
-                        .await?;
-                    }
-                }
-            }
+    // The Check Run ALWAYS reaches a terminal conclusion; both arms complete it.
+    match outcome {
+        Ok(published) => {
+            let disp = disposition(&published.result);
             task_store
-                .mark_complete(&task.id, &repo, &session_result, opened_pr)
+                .mark_complete(&task.id, &repo, &published.result, published.opened_pr)
                 .await;
-
-            check_run::complete_with_base_url(
+            if let Err(e) = check_run::complete_with_base_url(
                 api_base_url,
                 &token,
                 &task.repo_owner,
                 &task.repo_name,
                 check_id,
-                if success {
-                    check_run::CheckConclusion::Success
-                } else {
-                    check_run::CheckConclusion::Failure
-                },
-                if success { "Done" } else { "Incomplete" },
-                &session_result.summary,
+                disp.conclusion,
+                disp.title,
+                &published.result.summary,
             )
-            .await?;
+            .await
+            {
+                error!(task_id = %task.id, "failed to finalize check run: {e:#}");
+            }
         }
         Err(e) => {
             error!(task_id = %task.id, "session failed: {e:#}");
             task_store.mark_failed(&task.id).await;
-            check_run::complete_with_base_url(
+            if let Err(ce) = check_run::complete_with_base_url(
                 api_base_url,
                 &token,
                 &task.repo_owner,
@@ -216,43 +174,294 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
                 "Error",
                 &format!("Task failed: {e}"),
             )
-            .await?;
+            .await
+            {
+                error!(task_id = %task.id, "failed to finalize check run after error: {ce:#}");
+            }
         }
     }
 
-    // Clean up workspace.
-    tokio::fs::remove_dir_all(&workspace).await.ok();
     Ok(())
 }
 
-async fn run_with_retry(
+/// Successful end-to-end publication of a session result.
+struct Published {
+    result: SessionResult,
+    opened_pr: Option<u64>,
+}
+
+/// Provisions the workspace, runs coven-code with the retry policy, and publishes
+/// the outcome (PR + comments). Returns `Err` only for failures that should mark
+/// the task — and complete the Check Run — as failed: workspace/brief I/O errors
+/// and retry-safe session failures that exhausted the retry budget. Cosmetic
+/// side-effects (comments, the in-progress transition, even PR opening) are
+/// best-effort and logged rather than propagated.
+#[allow(clippy::too_many_arguments)]
+async fn run_and_publish(
     config: &Config,
-    brief_path: &PathBuf,
-    result_path: &PathBuf,
+    task: &Task,
+    familiar: &FamiliarConfig,
+    token: &str,
+    api_base_url: &str,
+    targets: &ResolvedTargets,
+    workspace: &Path,
+    check_id: u64,
+) -> Result<Published> {
+    // Provision ephemeral workspace and write the tokenless session brief.
+    tokio::fs::create_dir_all(workspace).await?;
+    let brief = brief::build(task, familiar, workspace, &targets.default_branch);
+    let brief_path = workspace.join("session-brief.json");
+    let result_path = workspace.join("result.json");
+    tokio::fs::write(&brief_path, serde_json::to_string_pretty(&brief)?).await?;
+
+    // Best-effort "starting" comment — a flaky comment API call must not abort
+    // the task or orphan the Check Run.
+    if let Some(issue_number) = task_issue_number(&task.kind) {
+        let start_msg = format!(
+            "👋 I'm **{}**, your Coven coding familiar. I'm on it — I'll open a PR once I've had a look.\n\n[Watch this session in CovenCave →]({})",
+            familiar.display_name,
+            cave_base_url(config),
+        );
+        if let Err(e) = pr::post_comment_with_base_url(
+            api_base_url,
+            token,
+            &task.repo_owner,
+            &task.repo_name,
+            issue_number,
+            &start_msg,
+        )
+        .await
+        {
+            warn!(task_id = %task.id, "failed to post starting comment: {e:#}");
+        }
+    }
+
+    // Best-effort progress transition; the check is completed regardless below.
+    if let Err(e) = check_run::update_with_base_url(
+        api_base_url,
+        token,
+        &task.repo_owner,
+        &task.repo_name,
+        check_id,
+        check_run::CheckStatus::InProgress,
+        "Running",
+        "Familiar is working on the task…",
+    )
+    .await
+    {
+        warn!(task_id = %task.id, "failed to mark check in progress: {e:#}");
+    }
+
+    // Run coven-code. Only retry-safe failures (exit 2, timeout, signal) are
+    // retried; exit 1 (gave up) and exit 3 (needs input) are terminal.
+    let result = run_session(
+        config,
+        &brief_path,
+        &result_path,
+        token,
+        config.worker.max_retries,
+    )
+    .await?;
+
+    // Publish according to the terminal disposition of the result.
+    let disp = disposition(&result);
+    let mut opened_pr = None;
+    if disp.open_pr {
+        if let Some(branch) = &result.branch {
+            match pr::open_pull_request_with_base_url(
+                api_base_url,
+                token,
+                &task.repo_owner,
+                &task.repo_name,
+                branch,
+                &targets.base_ref,
+                &pr_title(&result, task),
+                &result.pr_body,
+                true, // draft
+            )
+            .await
+            {
+                Ok(pr_num) => {
+                    opened_pr = Some(pr_num);
+                    if let Some(issue_number) = task_issue_number(&task.kind) {
+                        let msg = format!(
+                            "✅ PR #{pr_num} opened — [watch in CovenCave →]({})",
+                            cave_base_url(config)
+                        );
+                        if let Err(e) = pr::post_comment_with_base_url(
+                            api_base_url,
+                            token,
+                            &task.repo_owner,
+                            &task.repo_name,
+                            issue_number,
+                            &msg,
+                        )
+                        .await
+                        {
+                            warn!(task_id = %task.id, "failed to post PR comment: {e:#}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The branch is already pushed; the PR just didn't open.
+                    // Surface it rather than failing the whole task, so the work
+                    // isn't lost from the user's view.
+                    warn!(task_id = %task.id, "failed to open PR: {e:#}");
+                    if let Some(issue_number) = task_issue_number(&task.kind) {
+                        let msg = format!(
+                            "⚠️ I pushed `{branch}` but couldn't open the PR automatically ({e}). You can open it manually."
+                        );
+                        let _ = pr::post_comment_with_base_url(
+                            api_base_url,
+                            token,
+                            &task.repo_owner,
+                            &task.repo_name,
+                            issue_number,
+                            &msg,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Needs-input: surface the familiar's clarifying question on the issue/PR.
+    if result.status == SessionStatus::NeedsInput {
+        if let Some(issue_number) = task_issue_number(&task.kind) {
+            let msg = format!(
+                "🤔 I need a bit more direction before I continue:\n\n{}",
+                result.summary
+            );
+            if let Err(e) = pr::post_comment_with_base_url(
+                api_base_url,
+                token,
+                &task.repo_owner,
+                &task.repo_name,
+                issue_number,
+                &msg,
+            )
+            .await
+            {
+                warn!(task_id = %task.id, "failed to post clarifying comment: {e:#}");
+            }
+        }
+    }
+
+    Ok(Published { result, opened_pr })
+}
+
+/// Terminal disposition of a completed session, derived purely from the result.
+///
+/// This refines the coarse "success or failure" prose in the headless contract
+/// (`docs/headless-contract.md` §4) into the adapter's own Check Run UX. It is an
+/// adapter-internal mapping, not part of the coven-code wire contract, so the
+/// finer conclusions (`neutral`/`action_required`) require no contract bump:
+///
+/// | status      | conclusion        | opens PR   | rationale |
+/// |-------------|-------------------|------------|-----------|
+/// | success     | success           | if commits | work complete |
+/// | partial     | neutral           | if commits | progress made, not done — non-blocking |
+/// | failure     | failure           | no         | agent gave up |
+/// | needs_input | action_required   | no         | human must answer a question |
+struct Disposition {
+    conclusion: check_run::CheckConclusion,
+    title: &'static str,
+    open_pr: bool,
+}
+
+fn disposition(result: &SessionResult) -> Disposition {
+    use check_run::CheckConclusion;
+
+    // The adapter only opens a PR when there is a branch AND commits to review.
+    let has_changes = result.branch.is_some() && !result.commits.is_empty();
+
+    match result.status {
+        SessionStatus::Success => Disposition {
+            conclusion: CheckConclusion::Success,
+            title: "Done",
+            open_pr: has_changes,
+        },
+        SessionStatus::Partial => Disposition {
+            conclusion: CheckConclusion::Neutral,
+            title: "Partial",
+            open_pr: has_changes,
+        },
+        SessionStatus::Failure => Disposition {
+            conclusion: CheckConclusion::Failure,
+            title: "Failed",
+            open_pr: false,
+        },
+        SessionStatus::NeedsInput => Disposition {
+            conclusion: CheckConclusion::ActionRequired,
+            title: "Needs input",
+            open_pr: false,
+        },
+    }
+}
+
+/// Outcome of a single coven-code invocation, classified per the exit-code
+/// contract (`docs/headless-contract.md` §4).
+enum Attempt {
+    /// The runtime exited 0/1/3 and wrote a parseable `result.json`. Terminal:
+    /// the adapter acts on `status`/`exit_reason` and MUST NOT retry.
+    Completed(SessionResult),
+    /// Exit 2, timeout, kill-by-signal, an unexpected exit code, or a spawn/read
+    /// failure. Retry-safe per the contract.
+    RetrySafe(anyhow::Error),
+}
+
+async fn run_session(
+    config: &Config,
+    brief_path: &Path,
+    result_path: &Path,
     git_token: &str,
     max_retries: u32,
 ) -> Result<SessionResult> {
-    let mut attempts = 0;
+    run_session_with_backoff(
+        config,
+        brief_path,
+        result_path,
+        git_token,
+        max_retries,
+        RETRY_BACKOFF_BASE,
+    )
+    .await
+}
+
+/// Retry loop with an injectable backoff base so tests don't sleep for seconds.
+/// Only `Attempt::RetrySafe` failures are retried; `Attempt::Completed` (exit
+/// 0/1/3) is returned immediately even when the agent gave up (exit 1) — the
+/// retry boundary is exit 2 / timeout / signal, never exit 1 or 3.
+async fn run_session_with_backoff(
+    config: &Config,
+    brief_path: &Path,
+    result_path: &Path,
+    git_token: &str,
+    max_retries: u32,
+    backoff_base: Duration,
+) -> Result<SessionResult> {
+    let mut attempts = 0u32;
     loop {
         match run_coven_code(config, brief_path, result_path, git_token).await {
-            Ok(r) => return Ok(r),
-            Err(e) if attempts < max_retries => {
-                warn!("coven-code attempt {attempts} failed ({e:#}), retrying…");
+            Attempt::Completed(result) => return Ok(result),
+            Attempt::RetrySafe(e) if attempts < max_retries => {
                 attempts += 1;
-                tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempts))).await;
+                warn!("coven-code attempt {attempts} hit a retry-safe failure ({e:#}), retrying…");
+                tokio::time::sleep(backoff_base * 2u32.pow(attempts)).await;
             }
-            Err(e) => return Err(e),
+            Attempt::RetrySafe(e) => return Err(e),
         }
     }
 }
 
 async fn run_coven_code(
     config: &Config,
-    brief_path: &PathBuf,
-    result_path: &PathBuf,
+    brief_path: &Path,
+    result_path: &Path,
     git_token: &str,
-) -> Result<SessionResult> {
-    let mut child = Command::new(&config.worker.coven_code_bin)
+) -> Attempt {
+    let child = Command::new(&config.worker.coven_code_bin)
         .arg("--headless")
         .arg("--context")
         .arg(brief_path)
@@ -261,40 +470,73 @@ async fn run_coven_code(
         // Git auth is injected via the environment, never written to the
         // session brief or any durable artifact (issue #4).
         .env("COVEN_GIT_TOKEN", git_token)
-        .spawn()?;
+        .spawn();
+
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => return Attempt::RetrySafe(anyhow::anyhow!("failed to spawn coven-code: {e}")),
+    };
 
     let status = match tokio::time::timeout(
-        std::time::Duration::from_secs(config.worker.timeout_secs),
+        Duration::from_secs(config.worker.timeout_secs),
         child.wait(),
     )
     .await
     {
-        Ok(status) => status?,
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            return Attempt::RetrySafe(anyhow::anyhow!("failed to await coven-code: {e}"))
+        }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            anyhow::bail!(
+            return Attempt::RetrySafe(anyhow::anyhow!(
                 "coven-code timed out after {} seconds",
                 config.worker.timeout_secs
-            );
+            ));
         }
     };
 
     match status.code() {
-        Some(0) => {}
-        Some(2) => anyhow::bail!("coven-code infra error (exit 2) — retry-safe"),
-        Some(3) => {
-            // Agent needs clarification — read partial result.
+        // Terminal outcomes. result.json MUST be present and parseable for these
+        // exit codes; if it isn't, the runtime misbehaved — fall back to a
+        // retry-safe failure rather than silently losing the task.
+        Some(code @ (0 | 1 | 3)) => match read_result(result_path).await {
+            Ok(result) => Attempt::Completed(result),
+            Err(e) => Attempt::RetrySafe(anyhow::anyhow!(
+                "coven-code exited {code} but result.json was unusable: {e}"
+            )),
+        },
+        Some(2) => Attempt::RetrySafe(anyhow::anyhow!("coven-code infra error (exit 2)")),
+        Some(code) => {
+            Attempt::RetrySafe(anyhow::anyhow!("coven-code exited with unexpected code {code}"))
         }
-        Some(code) => anyhow::bail!("coven-code exited with code {code}"),
-        None => anyhow::bail!("coven-code killed by signal"),
+        None => Attempt::RetrySafe(anyhow::anyhow!("coven-code killed by signal")),
     }
+}
 
-    let result_bytes = tokio::fs::read(result_path)
+async fn read_result(result_path: &Path) -> Result<SessionResult> {
+    let bytes = tokio::fs::read(result_path)
         .await
         .map_err(|_| anyhow::anyhow!("result.json not written by coven-code"))?;
-    let result: SessionResult = serde_json::from_slice(&result_bytes)?;
+    let result: SessionResult = serde_json::from_slice(&bytes)?;
     Ok(result)
+}
+
+fn cave_base_url(config: &Config) -> &str {
+    config
+        .server
+        .cave_base_url
+        .as_deref()
+        .unwrap_or(DEFAULT_CAVE_BASE_URL)
+}
+
+fn pr_title(result: &SessionResult, task: &Task) -> String {
+    format!(
+        "{} (#{} via Coven)",
+        result.summary,
+        task_issue_number(&task.kind).unwrap_or(0)
+    )
 }
 
 fn task_title(kind: &TaskKind) -> String {
@@ -372,13 +614,93 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
     }
 }
 
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+    use coven_github_api::{CommitInfo, HEADLESS_CONTRACT_VERSION};
+
+    fn result(status: SessionStatus, branch: Option<&str>, commits: usize) -> SessionResult {
+        SessionResult {
+            contract_version: HEADLESS_CONTRACT_VERSION.to_string(),
+            status,
+            branch: branch.map(str::to_string),
+            commits: (0..commits)
+                .map(|i| CommitInfo {
+                    sha: format!("sha{i}"),
+                    message: "msg".to_string(),
+                })
+                .collect(),
+            files_changed: vec![],
+            summary: "summary".to_string(),
+            pr_body: "body".to_string(),
+            exit_reason: None,
+        }
+    }
+
+    #[test]
+    fn success_with_commits_opens_pr_and_concludes_success() {
+        let disp = disposition(&result(SessionStatus::Success, Some("cody/fix"), 1));
+        assert!(disp.open_pr);
+        assert!(matches!(
+            disp.conclusion,
+            check_run::CheckConclusion::Success
+        ));
+    }
+
+    #[test]
+    fn success_without_commits_does_not_open_pr() {
+        let disp = disposition(&result(SessionStatus::Success, None, 0));
+        assert!(!disp.open_pr);
+        assert!(matches!(
+            disp.conclusion,
+            check_run::CheckConclusion::Success
+        ));
+    }
+
+    #[test]
+    fn partial_with_commits_opens_pr_but_concludes_neutral() {
+        let disp = disposition(&result(SessionStatus::Partial, Some("cody/fix"), 2));
+        assert!(disp.open_pr);
+        assert!(matches!(
+            disp.conclusion,
+            check_run::CheckConclusion::Neutral
+        ));
+    }
+
+    #[test]
+    fn failure_never_opens_pr_and_concludes_failure() {
+        // Even if the agent left a branch behind, a failed session opens no PR.
+        let disp = disposition(&result(SessionStatus::Failure, Some("cody/fix"), 3));
+        assert!(!disp.open_pr);
+        assert!(matches!(
+            disp.conclusion,
+            check_run::CheckConclusion::Failure
+        ));
+    }
+
+    #[test]
+    fn needs_input_concludes_action_required_without_pr() {
+        let disp = disposition(&result(SessionStatus::NeedsInput, None, 0));
+        assert!(!disp.open_pr);
+        assert!(matches!(
+            disp.conclusion,
+            check_run::CheckConclusion::ActionRequired
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
-mod tests {
+mod process_tests {
     use super::*;
     use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
-    use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
-    fn test_config(coven_code_bin: PathBuf, workspace_root: PathBuf) -> Config {
+    fn test_config(coven_code_bin: PathBuf, workspace_root: PathBuf, max_retries: u32) -> Config {
         Config {
             server: ServerConfig {
                 bind: "127.0.0.1:0".to_string(),
@@ -395,7 +717,7 @@ mod tests {
                 coven_code_bin,
                 workspace_root,
                 timeout_secs: 1,
-                max_retries: 0,
+                max_retries,
             },
             familiars: vec![FamiliarConfig {
                 id: "cody".to_string(),
@@ -408,32 +730,174 @@ mod tests {
         }
     }
 
+    /// Builds an isolated temp dir for one test and writes an executable script
+    /// (the fake coven-code binary) into it. Returns (root, script_path).
+    fn scratch(name: &str, script: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("coven-github-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test dir should be created");
+        let script_path = root.join("fake-coven-code.sh");
+        fs::write(&script_path, script).expect("script should be written");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("script should be executable");
+        (root, script_path)
+    }
+
+    /// A minimal contract-valid result.json with the given status/exit_reason.
+    fn result_json(status: &str, exit_reason: &str) -> String {
+        format!(
+            r#"{{"contract_version":"1","status":"{status}","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","exit_reason":{exit_reason}}}"#
+        )
+    }
+
     #[tokio::test]
     async fn coven_code_process_is_stopped_after_configured_timeout() {
-        let root = std::env::temp_dir().join(format!(
-            "coven-github-timeout-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).expect("test dir should be created");
-        let script = root.join("slow-coven-code.sh");
-        fs::write(&script, "#!/usr/bin/env bash\nsleep 5\n").expect("script should be written");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-            .expect("script should be executable");
-
-        let config = test_config(script, root.clone());
+        let (root, script) = scratch("timeout-test", "#!/usr/bin/env bash\nsleep 5\n");
+        let config = test_config(script, root.clone(), 0);
         let brief_path = root.join("session-brief.json");
         let result_path = root.join("result.json");
         fs::write(&brief_path, "{}").expect("brief should be written");
 
         let started = Instant::now();
-        let result = run_coven_code(&config, &brief_path, &result_path, "test-token").await;
+        let attempt = run_coven_code(&config, &brief_path, &result_path, "test-token").await;
 
-        assert!(result.is_err());
+        assert!(matches!(attempt, Attempt::RetrySafe(_)));
         assert!(
             started.elapsed().as_secs() < 3,
             "process should stop close to the configured timeout"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_zero_with_result_is_completed() {
+        let body = result_json("success", "null");
+        let script = format!("#!/usr/bin/env bash\ncat > \"$5\" <<'EOF'\n{body}\nEOF\nexit 0\n");
+        let (root, path) = scratch("exit0", &script);
+        let config = test_config(path, root.clone(), 0);
+        let brief = root.join("session-brief.json");
+        let result = root.join("result.json");
+        fs::write(&brief, "{}").unwrap();
+
+        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        match attempt {
+            Attempt::Completed(r) => assert_eq!(r.status, SessionStatus::Success),
+            Attempt::RetrySafe(e) => panic!("expected Completed, got RetrySafe: {e:#}"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_three_needs_input_is_completed_not_retried() {
+        let body = result_json("needs_input", "\"ambiguous_spec\"");
+        let script = format!("#!/usr/bin/env bash\ncat > \"$5\" <<'EOF'\n{body}\nEOF\nexit 3\n");
+        let (root, path) = scratch("exit3", &script);
+        let config = test_config(path, root.clone(), 0);
+        let brief = root.join("session-brief.json");
+        let result = root.join("result.json");
+        fs::write(&brief, "{}").unwrap();
+
+        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        match attempt {
+            Attempt::Completed(r) => assert_eq!(r.status, SessionStatus::NeedsInput),
+            Attempt::RetrySafe(e) => panic!("exit 3 must be terminal, got RetrySafe: {e:#}"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_two_is_retry_safe() {
+        let (root, path) = scratch("exit2", "#!/usr/bin/env bash\nexit 2\n");
+        let config = test_config(path, root.clone(), 0);
+        let brief = root.join("session-brief.json");
+        let result = root.join("result.json");
+        fs::write(&brief, "{}").unwrap();
+
+        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        assert!(matches!(attempt, Attempt::RetrySafe(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_one_failure_is_not_retried_and_surfaces_result() {
+        // Exit 1 = agent gave up; the contract forbids retrying it. The script
+        // records each invocation so we can assert it ran exactly once.
+        let body = result_json("failure", "\"test_failure\"");
+        let script = format!(
+            "#!/usr/bin/env bash\necho x >> \"$(dirname \"$5\")/runs\"\ncat > \"$5\" <<'EOF'\n{body}\nEOF\nexit 1\n"
+        );
+        let (root, path) = scratch("exit1", &script);
+        let config = test_config(path, root.clone(), 2); // budget of 2 retries
+        let brief = root.join("session-brief.json");
+        let result = root.join("result.json");
+        fs::write(&brief, "{}").unwrap();
+
+        let session = run_session_with_backoff(
+            &config,
+            &brief,
+            &result,
+            "tok",
+            config.worker.max_retries,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("exit 1 yields a terminal result, not an error");
+        assert_eq!(session.status, SessionStatus::Failure);
+
+        let runs = fs::read_to_string(root.join("runs")).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "exit 1 must run exactly once (no retries)"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_two_retries_until_budget_exhausted_then_errors() {
+        // Exit 2 is retry-safe: with max_retries=2 the binary runs 1 + 2 = 3
+        // times before the session gives up with an error.
+        let script =
+            "#!/usr/bin/env bash\necho x >> \"$(dirname \"$5\")/runs\"\nexit 2\n".to_string();
+        let (root, path) = scratch("exit2-retries", &script);
+        let config = test_config(path, root.clone(), 2);
+        let brief = root.join("session-brief.json");
+        let result = root.join("result.json");
+        fs::write(&brief, "{}").unwrap();
+
+        let err = run_session_with_backoff(
+            &config,
+            &brief,
+            &result,
+            "tok",
+            config.worker.max_retries,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(err.is_err(), "exhausted retry budget should error");
+
+        let runs = fs::read_to_string(root.join("runs")).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            3,
+            "exit 2 should run 1 + max_retries times"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_zero_without_result_file_is_retry_safe() {
+        // A runtime that exits 0 but never writes result.json misbehaved; treat
+        // it as retry-safe rather than crashing the task.
+        let (root, path) = scratch("exit0-noresult", "#!/usr/bin/env bash\nexit 0\n");
+        let config = test_config(path, root.clone(), 0);
+        let brief = root.join("session-brief.json");
+        let result = root.join("result.json");
+        fs::write(&brief, "{}").unwrap();
+
+        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        assert!(matches!(attempt, Attempt::RetrySafe(_)));
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -216,7 +216,8 @@ The PR body and issue comments are written in the familiar's voice:
 I looked at issue #42 and here's what I found:
 
 The OAuth token refresh path in `src/auth/refresh.rs` wasn't accounting for
-clock skew between the client and the auth server. I added a 60-second buffer\nto the expiry check.
+clock skew between the client and the auth server. I added a 60-second buffer
+to the expiry check.
 
 **Changed:** `src/auth/refresh.rs` (+12 / -3)
 **Tests:** 8/8 passing (added 2 regression cases)

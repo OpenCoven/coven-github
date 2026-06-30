@@ -84,6 +84,20 @@ impl TaskStore {
         }
     }
 
+    /// Records a task as failed, inserting it if it was never marked running.
+    ///
+    /// Used for pre-flight failures (token, ref resolution, Check Run creation)
+    /// that happen before [`mark_running`](Self::mark_running), so the task is
+    /// still visible in Cave as failed rather than vanishing silently.
+    pub async fn register_failed(&self, task: &Task, familiar_name: &str) {
+        let mut items = self.inner.write().await;
+        let item = items
+            .entry(task.id.clone())
+            .or_insert_with(|| task_list_item(task, familiar_name));
+        item.status = TaskListStatus::Failed;
+        item.updated_at = now_rfc3339();
+    }
+
     pub async fn list(&self) -> Vec<TaskListItem> {
         let mut items: Vec<_> = self.inner.read().await.values().cloned().collect();
         items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -190,5 +204,19 @@ mod tests {
             review[0].pr_url.as_deref(),
             Some("https://github.com/OpenCoven/coven-code/pull/9")
         );
+    }
+
+    #[tokio::test]
+    async fn register_failed_inserts_a_failed_task_when_never_running() {
+        // A pre-flight failure (token / ref resolution / Check Run creation)
+        // happens before mark_running, so the task is not yet in the store.
+        let store = TaskStore::default();
+        store.register_failed(&task(), "Cody").await;
+
+        let items = store.list().await;
+        assert_eq!(items.len(), 1, "pre-flight failure must still be visible");
+        assert_eq!(items[0].status, TaskListStatus::Failed);
+        assert_eq!(items[0].issue_number, 42);
+        assert_eq!(items[0].familiar_name, "Cody");
     }
 }

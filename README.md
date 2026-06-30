@@ -132,7 +132,9 @@ cd coven-github
 cargo build --release
 
 # Configure (see config/example.toml)
-cp config/example.toml config/local.toml\n# Set: github_app_id, private_key_path, webhook_secret, familiar config
+cp config/example.toml config/local.toml
+# Then set in config/local.toml: github.app_id, github.private_key_path,
+# github.webhook_secret, worker.coven_code_bin, and a [[familiars]] block.
 
 # Run
 ./target/release/coven-github serve --config config/local.toml
