@@ -30,6 +30,14 @@ enum Command {
         #[arg(long, default_value = "config/local.toml")]
         config: PathBuf,
     },
+    /// Validate a config file and report missing or placeholder values.
+    ///
+    /// Exits non-zero if any error-severity problem is found, so it doubles as
+    /// a pre-flight check in CI or a container entrypoint.
+    Doctor {
+        #[arg(long, default_value = "config/local.toml")]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -42,13 +50,40 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Doctor {
+            config: config_path,
+        } => {
+            // Doctor reports problems on stderr and via exit code; it must not
+            // start the server even if the config is clean.
+            let exit = run_doctor(&config_path);
+            std::process::exit(exit);
+        }
         Command::Serve {
             config: config_path,
         } => {
-            let config_str = std::fs::read_to_string(&config_path).map_err(|e| {
-                anyhow::anyhow!("failed to read config at {}: {e}", config_path.display())
-            })?;
-            let config: Config = toml::from_str(&config_str)?;
+            let config = Config::load(&config_path)?;
+
+            // Fail fast on a broken config instead of crashing later with an
+            // opaque error mid-request. `doctor` gives the full report.
+            let diagnostics = config.check();
+            let error_count = diagnostics.iter().filter(|d| d.is_error()).count();
+            for d in &diagnostics {
+                match d.severity {
+                    coven_github_config::Severity::Error => {
+                        tracing::error!(field = %d.field, "config error: {}", d.message)
+                    }
+                    coven_github_config::Severity::Warning => {
+                        tracing::warn!(field = %d.field, "config warning: {}", d.message)
+                    }
+                }
+            }
+            if error_count > 0 {
+                anyhow::bail!(
+                    "config has {error_count} error(s) — run `coven-github doctor --config {}` for details",
+                    config_path.display()
+                );
+            }
+
             let config = Arc::new(config);
 
             let (task_tx, task_rx) = mpsc::channel(256);
@@ -82,4 +117,52 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Load + validate a config and print a human-readable report.
+///
+/// Returns the process exit code: `0` if there are no errors (warnings are
+/// allowed), `1` if validation found errors, `2` if the file could not be read
+/// or parsed at all.
+fn run_doctor(config_path: &std::path::Path) -> i32 {
+    use coven_github_config::Severity;
+
+    let config = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ {e}");
+            return 2;
+        }
+    };
+
+    let diagnostics = config.check();
+    let errors = diagnostics.iter().filter(|d| d.is_error()).count();
+    let warnings = diagnostics.len() - errors;
+
+    for d in &diagnostics {
+        let mark = match d.severity {
+            Severity::Error => "✗ error",
+            Severity::Warning => "! warn ",
+        };
+        eprintln!("{mark}  {:<28}  {}", d.field, d.message);
+    }
+
+    if diagnostics.is_empty() {
+        println!(
+            "✓ config at {} looks good — {} familiar(s) configured.",
+            config_path.display(),
+            config.familiars.len()
+        );
+    } else {
+        eprintln!(
+            "\n{errors} error(s), {warnings} warning(s) in {}",
+            config_path.display()
+        );
+    }
+
+    if errors > 0 {
+        1
+    } else {
+        0
+    }
 }

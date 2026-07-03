@@ -136,9 +136,15 @@ cp config/example.toml config/local.toml
 # Then set in config/local.toml: github.app_id, github.private_key_path,
 # github.webhook_secret, worker.coven_code_bin, and a [[familiars]] block.
 
+# Validate the config (catches placeholder secrets, missing PEM/binary, etc.)
+./target/release/coven-github doctor --config config/local.toml
+
 # Run
 ./target/release/coven-github serve --config config/local.toml
 ```
+
+Prefer containers? A multi-stage [`Dockerfile`](Dockerfile) and
+[`compose.yaml`](compose.yaml) ship in the repo root.
 
 See [docs/self-hosting.md](docs/self-hosting.md) for full setup including GitHub App registration. For a minimal familiar route, start from [`examples/familiar-github-starter`](examples/familiar-github-starter/).
 
