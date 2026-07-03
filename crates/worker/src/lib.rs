@@ -716,7 +716,9 @@ mod process_tests {
                 concurrency: 1,
                 coven_code_bin,
                 workspace_root,
-                timeout_secs: 1,
+                // Generous default so exit-code tests never race the kill timer.
+                // The timeout test overrides this to a short value on purpose.
+                timeout_secs: 30,
                 max_retries,
             },
             familiars: vec![FamiliarConfig {
@@ -753,7 +755,9 @@ mod process_tests {
     #[tokio::test]
     async fn coven_code_process_is_stopped_after_configured_timeout() {
         let (root, script) = scratch("timeout-test", "#!/usr/bin/env bash\nsleep 5\n");
-        let config = test_config(script, root.clone(), 0);
+        let mut config = test_config(script, root.clone(), 0);
+        // This test specifically exercises the kill-on-timeout path.
+        config.worker.timeout_secs = 1;
         let brief_path = root.join("session-brief.json");
         let result_path = root.join("result.json");
         fs::write(&brief_path, "{}").expect("brief should be written");
