@@ -250,7 +250,15 @@ impl Diagnostic {
 }
 
 const PLACEHOLDER_SECRETS: &[&str] =
-    &["CHANGE_ME", "CHANGEME", "changeme", "your-secret", "secret"];
+    &[
+        "CHANGE_ME",
+        "CHANGEME",
+        "changeme",
+        "replace-with-a-random-webhook-secret",
+        "replace-me",
+        "your-secret",
+        "secret",
+    ];
 
 fn next_step_for(field: &str, _message: &str) -> &'static str {
     match field {
@@ -456,6 +464,32 @@ mod tests {
         assert!(errs.contains(&"github.app_id"));
         assert!(errs.contains(&"github.webhook_secret"));
         assert!(errs.contains(&"github.private_key_path"));
+    }
+
+    #[test]
+    fn flags_starter_webhook_secret_placeholder() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let cfg = config_with(
+            GitHubAppConfig {
+                app_id: 1,
+                private_key_path: pem,
+                webhook_secret: "replace-with-a-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        let diags = cfg.check();
+        let errs = errors(&diags);
+        assert!(errs.contains(&"github.webhook_secret"));
     }
 
     #[test]
