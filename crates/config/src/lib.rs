@@ -249,16 +249,15 @@ impl Diagnostic {
     }
 }
 
-const PLACEHOLDER_SECRETS: &[&str] =
-    &[
-        "CHANGE_ME",
-        "CHANGEME",
-        "changeme",
-        "replace-with-a-random-webhook-secret",
-        "replace-me",
-        "your-secret",
-        "secret",
-    ];
+const PLACEHOLDER_SECRETS: &[&str] = &[
+    "CHANGE_ME",
+    "CHANGEME",
+    "changeme",
+    "replace-with-a-random-webhook-secret",
+    "replace-me",
+    "your-secret",
+    "secret",
+];
 
 fn next_step_for(field: &str, _message: &str) -> &'static str {
     match field {
