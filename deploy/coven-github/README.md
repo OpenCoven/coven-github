@@ -1,7 +1,7 @@
-# CompleteTech hosted dogfood adapter
+# coven-github hosted dogfood adapter
 
-This directory tracks the Python adapter currently deployed for the
-CompleteTech-hosted dogfood GitHub App at `webhook.complete.tech`.
+This directory tracks the Python adapter used by the hosted coven-github
+dogfood GitHub App.
 
 The adapter is intentionally deployment-specific. It is not the canonical Rust
 worker implementation; it exists so hosted dogfood behavior can be reviewed,
@@ -9,8 +9,9 @@ reproduced, and changed through PRs instead of invisible server edits.
 
 ## Files
 
-- `coven_github_adapter.py` - webhook handler, task runner, PR evidence capture,
-  Codex-backed headless runtime invocation, and dogfood comment publisher.
+- `coven_github_adapter.py` - webhook routing helpers, task runner, PR evidence
+  capture, Codex-backed headless runtime invocation, and dogfood comment
+  publisher.
 
 ## Runtime inputs
 
@@ -18,6 +19,7 @@ The deployment expects secrets and mutable state to be supplied outside git:
 
 - `GITHUB_APP_PRIVATE_KEY_PATH` or `.coven-github-private-key.pem`
 - `GITHUB_APP_ID`
+- `GITHUB_WEBHOOK_SECRET`
 - `COVEN_GITHUB_STATE_DIR`
 - `COVEN_GITHUB_POLICY_PATH`
 - `COVEN_CODE_BIN`

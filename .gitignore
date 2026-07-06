@@ -4,6 +4,6 @@ keys/
 *.pem
 .env
 .DS_Store
-deploy/complete-tech/.coven-github-private-key.pem
-deploy/complete-tech/coven-github-policy.json
-deploy/complete-tech/coven-github-state/
+deploy/coven-github/.coven-github-private-key.pem
+deploy/coven-github/coven-github-policy.json
+deploy/coven-github/coven-github-state/

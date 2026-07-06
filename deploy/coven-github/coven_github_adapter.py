@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -22,9 +23,10 @@ POLICY_PATH = Path(os.environ.get("COVEN_GITHUB_POLICY_PATH", ROOT_DIR / "coven-
 PRIVATE_KEY_PATH = Path(
     os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", ROOT_DIR / ".coven-github-private-key.pem")
 )
-APP_ID = os.environ.get("GITHUB_APP_ID", "4224630").strip()
+APP_ID = os.environ.get("GITHUB_APP_ID", "").strip()
 COVEN_CODE_BIN = os.environ.get("COVEN_CODE_BIN", "coven-code").strip() or "coven-code"
 COVEN_CODE_MODEL = os.environ.get("COVEN_CODE_MODEL", "gpt-5.5").strip()
+WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip()
 
 
 def env_int(name, default, minimum=0, maximum=10):
@@ -63,34 +65,17 @@ for directory in (DELIVERIES_DIR, TASKS_DIR, WORKSPACES_DIR, ATTEMPTS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 
+DEFAULT_FAMILIAR = {
+    "id": "cody",
+    "display_name": "Cody",
+    "model": None,
+    "skills": ["code-review"],
+}
+
+
 DEFAULT_POLICY = {
     "version": 1,
-    "installations": {
-        "144638200": {
-            "repositories": {
-                "1290307745": {
-                    "full_name": "CompleteTech-LLC-AI-Research/coven-code",
-                    "default_branch": "main",
-                    "enabled_triggers": [
-                        "issue_mention",
-                        "issue_label",
-                        "pr_review_comment",
-                        "pull_request",
-                        "push",
-                    ],
-                    "trigger_labels": ["coven", "coven:fix", "coven:review"],
-                    "bot_usernames": ["coven-github", "cody"],
-                    "familiar": {
-                        "id": "cody",
-                        "display_name": "Cody",
-                        "model": None,
-                        "skills": ["code-review"],
-                    },
-                    "publication": {"mode": "comment"},
-                }
-            }
-        }
-    },
+    "installations": {},
 }
 
 
@@ -133,6 +118,8 @@ def sign_rs256(message):
 
 
 def github_app_jwt():
+    if not APP_ID:
+        raise RuntimeError("GITHUB_APP_ID is required")
     now = int(time.time())
     header = {"alg": "RS256", "typ": "JWT"}
     payload = {"iat": now - 60, "exp": now + 540, "iss": APP_ID}
@@ -242,10 +229,17 @@ def labels_include_trigger(labels, policy):
     return False
 
 
+def trigger_enabled(policy, trigger):
+    enabled = policy.get("enabled_triggers")
+    if enabled is None:
+        return True
+    return trigger in set(enabled or [])
+
+
 def build_task_from_event(event_name, delivery_id, payload, policy):
     repository = payload.get("repository") or {}
     installation = payload.get("installation") or {}
-    familiar = policy.get("familiar") or DEFAULT_POLICY["installations"]["144638200"]["repositories"]["1290307745"]["familiar"]
+    familiar = policy.get("familiar") or DEFAULT_FAMILIAR
     base = {
         "task_id": delivery_id,
         "delivery_id": delivery_id,
@@ -269,10 +263,12 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
         comment = payload.get("comment") or {}
         if not mentioned(comment.get("body"), policy):
             return ignored(base, "issue_comment_without_mention")
+        if not trigger_enabled(policy, "issue_mention"):
+            return ignored(base, "issue_mention_not_enabled")
         if issue.get("pull_request"):
             base.update(
                 {
-                    "trigger": "pr_mention",
+                    "trigger": "issue_mention",
                     "target": {
                         "kind": "pull_request",
                         "pr_number": int(issue.get("number") or 0),
@@ -304,6 +300,8 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
         pull_request = payload.get("pull_request") or {}
         if not mentioned(comment.get("body"), policy):
             return ignored(base, "pr_review_comment_without_mention")
+        if not trigger_enabled(policy, "pr_review_comment"):
+            return ignored(base, "pr_review_comment_not_enabled")
         base.update(
             {
                 "trigger": "pr_review_comment",
@@ -328,8 +326,14 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
         action = payload.get("action")
         if action not in ("assigned", "labeled", "opened"):
             return ignored(base, "unsupported_issue_action")
+        if action == "assigned" and not trigger_enabled(policy, "issue_assigned"):
+            return ignored(base, "issue_assigned_not_enabled")
         if action == "labeled" and not labels_include_trigger(issue.get("labels"), policy):
             return ignored(base, "issue_label_not_enabled")
+        if action == "labeled" and not trigger_enabled(policy, "issue_label"):
+            return ignored(base, "issue_label_not_enabled")
+        if action == "opened" and not trigger_enabled(policy, "issue_mention"):
+            return ignored(base, "issue_mention_not_enabled")
         base.update(
             {
                 "trigger": "issue_assigned" if action == "assigned" else "issue_mention",
@@ -346,10 +350,12 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
 
     if event_name == "pull_request":
         pull_request = payload.get("pull_request") or {}
+        if not trigger_enabled(policy, "pull_request"):
+            return ignored(base, "pull_request_not_enabled")
         base.update(
             {
                 "state": "ignored",
-                "ignored_reason": "pull_request_review_task_not_in_headless_contract_v1",
+                "ignored_reason": "pull_request_review_task_not_in_headless_contract_v2",
                 "trigger": "pull_request",
                 "target": {
                     "action": payload.get("action"),
@@ -364,10 +370,12 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
         return base
 
     if event_name == "push":
+        if not trigger_enabled(policy, "push"):
+            return ignored(base, "push_not_enabled")
         base.update(
             {
                 "state": "ignored",
-                "ignored_reason": "push_review_task_not_in_headless_contract_v1",
+                "ignored_reason": "push_review_task_not_in_headless_contract_v2",
                 "trigger": "push",
                 "target": {
                     "ref": payload.get("ref"),
@@ -387,6 +395,53 @@ def ignored(base, reason):
     base["state"] = "ignored"
     base["ignored_reason"] = reason
     return base
+
+
+def header_value(headers, name):
+    wanted = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == wanted:
+            return value
+    return None
+
+
+def verify_webhook_signature(secret, body, signature):
+    if not secret:
+        raise RuntimeError("GITHUB_WEBHOOK_SECRET is required")
+    if not signature or not str(signature).startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, str(signature))
+
+
+def route_signed_delivery(headers, body, debug, webhook_secret=None):
+    raw_body = body.encode("utf-8") if isinstance(body, str) else body
+    if raw_body is None:
+        raw_body = b""
+
+    signature = header_value(headers, "x-hub-signature-256")
+    if not verify_webhook_signature(webhook_secret or WEBHOOK_SECRET, raw_body, signature):
+        return {"ok": False, "status": 401, "error": "invalid signature"}
+
+    event_name = header_value(headers, "x-github-event")
+    if not event_name:
+        return {"ok": False, "status": 400, "error": "missing event type"}
+
+    delivery_id = header_value(headers, "x-github-delivery")
+    if not delivery_id:
+        return {"ok": False, "status": 400, "error": "missing delivery id"}
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return {"ok": False, "status": 400, "error": "invalid json"}
+
+    if event_name == "ping":
+        return {"ok": True, "status": 200, "pong": True, "delivery_id": delivery_id}
+
+    result = route_delivery(str(event_name), str(delivery_id), payload, debug)
+    result["status"] = 200
+    return result
 
 
 def route_delivery(event_name, delivery_id, payload, debug):
@@ -785,11 +840,7 @@ def prepare_review_context(task, workspace, token, env, attempt_dir):
         "https://api.github.com/repos/{}/pulls/{}".format(repo, pr_number),
         token,
     )
-    files = github_request(
-        "GET",
-        "https://api.github.com/repos/{}/pulls/{}/files?per_page=100".format(repo, pr_number),
-        token,
-    )
+    files = paginated_pr_files(repo, pr_number, token)
 
     fetch = run_command(
         ["git", "fetch", "--depth", "1", "origin", "pull/{}/head".format(pr_number)],
@@ -799,16 +850,12 @@ def prepare_review_context(task, workspace, token, env, attempt_dir):
     )
     write_json_atomic(attempt_dir / "fetch-pr.json", redacted_command_result(fetch))
     if fetch["returncode"] != 0:
-        return {
-            "kind": "pull_request",
-            "pr_number": pr_number,
-            "fetch_error": fetch["stderr"],
-            "metadata": summarize_pr(pr),
-            "files": summarize_pr_files(files),
-        }
+        raise RuntimeError("failed to fetch PR #{} head: {}".format(pr_number, fetch["stderr"]))
 
     checkout = run_command(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=str(workspace), env=env)
     write_json_atomic(attempt_dir / "checkout-pr.json", redacted_command_result(checkout))
+    if checkout["returncode"] != 0:
+        raise RuntimeError("failed to checkout PR #{} head: {}".format(pr_number, checkout["stderr"]))
 
     head = run_command(["git", "rev-parse", "HEAD"], cwd=str(workspace), env=env)
     status = run_command(["git", "status", "--short", "--branch"], cwd=str(workspace), env=env)
@@ -831,6 +878,24 @@ def prepare_review_context(task, workspace, token, env, attempt_dir):
             "workspace_status": status["stdout"].strip(),
         },
     }
+
+
+def paginated_pr_files(repo, pr_number, token):
+    files = []
+    page = 1
+    while True:
+        page_items = github_request(
+            "GET",
+            "https://api.github.com/repos/{}/pulls/{}/files?per_page=100&page={}".format(
+                repo, pr_number, page
+            ),
+            token,
+        )
+        files.extend(page_items or [])
+        if len(page_items or []) < 100:
+            break
+        page += 1
+    return files
 
 
 def summarize_pr(pr):

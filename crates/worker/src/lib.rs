@@ -506,6 +506,13 @@ async fn read_result(result_path: &Path) -> Result<SessionResult> {
         .await
         .map_err(|_| anyhow::anyhow!("result.json not written by coven-code"))?;
     let result: SessionResult = serde_json::from_slice(&bytes)?;
+    if result.contract_version != coven_github_api::HEADLESS_CONTRACT_VERSION {
+        anyhow::bail!(
+            "unsupported result contract_version {}; expected {}",
+            result.contract_version,
+            coven_github_api::HEADLESS_CONTRACT_VERSION
+        );
+    }
     Ok(result)
 }
 
@@ -619,6 +626,35 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
         TaskKind::FixIssue { issue_number, .. } => Some(*issue_number),
         TaskKind::RespondToMention { issue_number, .. } => Some(*issue_number),
         TaskKind::AddressReviewComment { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn read_result_rejects_unsupported_contract_version() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-version-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"1","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("v1 result must be rejected");
+        assert!(
+            format!("{error:#}").contains("unsupported result contract_version 1"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
     }
 }
 
