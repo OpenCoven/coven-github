@@ -85,14 +85,32 @@
         "root": { "type": "string" }
       }
     },
-    "review_context": {
-      "type": "object",
-      "description": "Optional tokenless hosted-review evidence supplied by the adapter.",
-      "additionalProperties": true
-    },
     "audit_instruction": {
-      "type": "string",
+      "type": ["string", "null"],
       "description": "Optional hosted-review instruction paired with review_context."
+    },
+    "review_context": {
+      "type": ["object", "null"],
+      "description": "Optional tokenless hosted-review evidence supplied by the adapter.",
+      "additionalProperties": false,
+      "required": ["kind", "files"],
+      "properties": {
+        "kind": {
+          "type": ["string", "null"],
+          "enum": ["pull_request", null]
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["filename"],
+            "properties": {
+              "filename": { "type": "string" }
+            }
+          }
+        }
+      }
     }
   }
 }

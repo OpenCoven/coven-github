@@ -521,7 +521,11 @@ fn validate_result_contract(result: &SessionResult) -> Result<()> {
     if result.status == SessionStatus::Success && result.exit_reason.is_some() {
         anyhow::bail!("result exit_reason must be null when status is success");
     }
-    if result.status != SessionStatus::Success && result.exit_reason.is_none() {
+    if matches!(
+        result.status,
+        SessionStatus::Failure | SessionStatus::NeedsInput
+    ) && result.exit_reason.is_none()
+    {
         anyhow::bail!(
             "result exit_reason is required when status is {:?}",
             result.status
@@ -546,7 +550,8 @@ fn validate_result_contract(result: &SessionResult) -> Result<()> {
                 result.review.mode
             );
         }
-        if result.review.findings.is_empty()
+        if result.review.evidence_status == ReviewEvidenceStatus::Complete
+            && result.review.findings.is_empty()
             && result
                 .review
                 .no_findings_reason
@@ -555,7 +560,7 @@ fn validate_result_contract(result: &SessionResult) -> Result<()> {
                 .unwrap_or_default()
                 .is_empty()
         {
-            anyhow::bail!("no_findings_reason is required when review findings are empty");
+            anyhow::bail!("no_findings_reason is required when complete review findings are empty");
         }
     }
     if result.review.mode == ReviewMode::None
@@ -896,9 +901,32 @@ mod result_tests {
     }
 
     #[tokio::test]
-    async fn read_result_rejects_empty_review_without_reason() {
+    async fn read_result_accepts_partial_review_without_reason() {
         let path = std::env::temp_dir().join(format!(
             "coven-github-result-review-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"partial","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"partial","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":["Review output was degraded before a clean-review conclusion."]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let result = read_result(&path)
+            .await
+            .expect("partial degraded review result should remain valid");
+        assert_eq!(result.status, SessionStatus::Partial);
+        assert!(result.exit_reason.is_none());
+        assert!(result.review.findings.is_empty());
+        assert!(result.review.no_findings_reason.is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_complete_review_without_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-complete-review-reason-{}.json",
             uuid::Uuid::new_v4()
         ));
         fs::write(
@@ -909,9 +937,9 @@ mod result_tests {
 
         let error = read_result(&path)
             .await
-            .expect_err("empty review result must require a reason");
+            .expect_err("complete empty review result must require a reason");
         assert!(
-            format!("{error:#}").contains("no_findings_reason is required"),
+            format!("{error:#}").contains("complete review findings are empty"),
             "unexpected error: {error:#}"
         );
 
