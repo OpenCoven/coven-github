@@ -13,6 +13,8 @@ jobs:
   check:
     name: python + cargo check + clippy + test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
