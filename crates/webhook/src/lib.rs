@@ -4,6 +4,7 @@ use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+pub mod commands;
 pub mod events;
 pub mod routes;
 
