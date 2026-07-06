@@ -172,6 +172,7 @@ pub enum TaskKind {
 
 /// Structured result envelope written by coven-code --headless.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionResult {
     /// Contract major version. Conformant producers MUST emit it. See
     /// `docs/headless-contract.md`.
@@ -196,12 +197,14 @@ pub enum SessionStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitInfo {
     pub sha: String,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewResult {
     pub mode: ReviewMode,
     pub evidence_status: ReviewEvidenceStatus,
@@ -246,6 +249,7 @@ pub enum ReviewEvidenceStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewFinding {
     pub severity: ReviewSeverity,
     pub file: String,
@@ -266,6 +270,7 @@ pub enum ReviewSeverity {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewTestRun {
     pub command: String,
     pub status: ReviewTestStatus,

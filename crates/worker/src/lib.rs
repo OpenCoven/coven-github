@@ -780,6 +780,52 @@ mod result_tests {
     }
 
     #[tokio::test]
+    async fn read_result_rejects_unknown_root_field() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-extra-root-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null,"extra_root_field":"rejected"}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("unknown root field must be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `extra_root_field`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_unknown_review_field() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-extra-review-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[],"extra_review_field":"rejected"},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("unknown review field must be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `extra_review_field`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn read_result_rejects_not_applicable_evidence_for_review_modes() {
         let path = std::env::temp_dir().join(format!(
             "coven-github-result-review-evidence-{}.json",
@@ -820,6 +866,30 @@ mod result_tests {
         assert!(
             format!("{error:#}").contains("reviewed_files is required"),
             "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_accepts_review_findings_with_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-findings-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[{"severity":"low","file":"src/lib.rs","line":null,"title":"t","body":"b","recommendation":null}],"tests_run":[],"no_findings_reason":"Also reviewed nearby context and found this issue.","limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let result = read_result(&path)
+            .await
+            .expect("findings with a reason should remain valid");
+        assert_eq!(result.review.findings.len(), 1);
+        assert_eq!(
+            result.review.no_findings_reason.as_deref(),
+            Some("Also reviewed nearby context and found this issue.")
         );
 
         let _ = fs::remove_file(path);

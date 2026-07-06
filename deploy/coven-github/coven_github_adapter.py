@@ -45,6 +45,30 @@ TERMINAL_RESULT_EXIT_CODES = {0, 1, 3}
 RESULT_STATUSES = {"success", "failure", "partial", "needs_input"}
 REVIEW_MODES = {"none", "pull_request", "review_comment"}
 REVIEW_EVIDENCE_STATUSES = {"not_applicable", "complete", "partial", "missing"}
+RESULT_FIELDS = {
+    "contract_version",
+    "status",
+    "branch",
+    "commits",
+    "files_changed",
+    "summary",
+    "pr_body",
+    "review",
+    "exit_reason",
+}
+COMMIT_FIELDS = {"sha", "message"}
+REVIEW_FIELDS = {
+    "mode",
+    "evidence_status",
+    "reviewed_files",
+    "supporting_files",
+    "findings",
+    "tests_run",
+    "no_findings_reason",
+    "limitations",
+}
+FINDING_FIELDS = {"severity", "file", "line", "title", "body", "recommendation"}
+TEST_RUN_FIELDS = {"command", "status", "output_summary"}
 
 
 def account_home():
@@ -557,6 +581,12 @@ def require_optional_string(value, path):
         raise ValueError("{} must be a string or null".format(path))
 
 
+def validate_object_fields(value, allowed, path):
+    extra = set(value.keys()) - allowed
+    if extra:
+        raise ValueError("{} has unsupported field {}".format(path, sorted(extra)[0]))
+
+
 def validate_string_array(values, path):
     if not isinstance(values, list):
         raise ValueError("{} must be an array".format(path))
@@ -570,7 +600,8 @@ def validate_commits(commits):
     for index, commit in enumerate(commits):
         if not isinstance(commit, dict):
             raise ValueError("result.commits[{}] must be an object".format(index))
-        for field in ("sha", "message"):
+        validate_object_fields(commit, COMMIT_FIELDS, "result.commits[{}]".format(index))
+        for field in COMMIT_FIELDS:
             if field not in commit:
                 raise ValueError(
                     "result.commits[{}] missing required field {}".format(index, field)
@@ -585,7 +616,8 @@ def validate_findings(findings):
     for index, finding in enumerate(findings):
         if not isinstance(finding, dict):
             raise ValueError("result.review.findings[{}] must be an object".format(index))
-        for field in ("severity", "file", "line", "title", "body", "recommendation"):
+        validate_object_fields(finding, FINDING_FIELDS, "result.review.findings[{}]".format(index))
+        for field in FINDING_FIELDS:
             if field not in finding:
                 raise ValueError(
                     "result.review.findings[{}] missing required field {}".format(index, field)
@@ -616,7 +648,8 @@ def validate_tests_run(tests_run):
     for index, test in enumerate(tests_run):
         if not isinstance(test, dict):
             raise ValueError("result.review.tests_run[{}] must be an object".format(index))
-        for field in ("command", "status", "output_summary"):
+        validate_object_fields(test, TEST_RUN_FIELDS, "result.review.tests_run[{}]".format(index))
+        for field in TEST_RUN_FIELDS:
             if field not in test:
                 raise ValueError(
                     "result.review.tests_run[{}] missing required field {}".format(index, field)
@@ -635,6 +668,7 @@ def validate_result_contract(result):
     if not isinstance(result, dict):
         raise ValueError("result.json must be a JSON object")
 
+    validate_object_fields(result, RESULT_FIELDS, "result.json")
     for field in ("contract_version", "status", "commits", "files_changed", "summary", "pr_body", "review"):
         if field not in result:
             raise ValueError("result.json missing required field {}".format(field))
@@ -668,16 +702,8 @@ def validate_result_contract(result):
     review = result.get("review")
     if not isinstance(review, dict):
         raise ValueError("result.review must be an object")
-    for field in (
-        "mode",
-        "evidence_status",
-        "reviewed_files",
-        "supporting_files",
-        "findings",
-        "tests_run",
-        "no_findings_reason",
-        "limitations",
-    ):
+    validate_object_fields(review, REVIEW_FIELDS, "result.review")
+    for field in REVIEW_FIELDS:
         if field not in review:
             raise ValueError("result.review missing required field {}".format(field))
 

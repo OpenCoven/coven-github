@@ -123,7 +123,7 @@
               { "properties": { "reviewed_files": { "minItems": 1 } }, "required": ["reviewed_files"] },
               { "properties": { "evidence_status": { "const": "missing" } }, "required": ["evidence_status"] }
             ],
-            "oneOf": [
+            "anyOf": [
               { "properties": { "findings": { "minItems": 1 } }, "required": ["findings"] },
               {
                 "properties": {
