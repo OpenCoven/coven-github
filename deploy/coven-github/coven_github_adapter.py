@@ -547,6 +547,90 @@ def write_askpass(work_dir):
     return script
 
 
+def require_string(value, path):
+    if not isinstance(value, str):
+        raise ValueError("{} must be a string".format(path))
+
+
+def require_optional_string(value, path):
+    if value is not None and not isinstance(value, str):
+        raise ValueError("{} must be a string or null".format(path))
+
+
+def validate_string_array(values, path):
+    if not isinstance(values, list):
+        raise ValueError("{} must be an array".format(path))
+    for index, item in enumerate(values):
+        require_string(item, "{}[{}]".format(path, index))
+
+
+def validate_commits(commits):
+    if not isinstance(commits, list):
+        raise ValueError("result.commits must be an array")
+    for index, commit in enumerate(commits):
+        if not isinstance(commit, dict):
+            raise ValueError("result.commits[{}] must be an object".format(index))
+        for field in ("sha", "message"):
+            if field not in commit:
+                raise ValueError(
+                    "result.commits[{}] missing required field {}".format(index, field)
+                )
+            require_string(commit.get(field), "result.commits[{}].{}".format(index, field))
+
+
+def validate_findings(findings):
+    if not isinstance(findings, list):
+        raise ValueError("result.review.findings must be an array")
+    severities = {"info", "low", "medium", "high", "critical"}
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            raise ValueError("result.review.findings[{}] must be an object".format(index))
+        for field in ("severity", "file", "line", "title", "body", "recommendation"):
+            if field not in finding:
+                raise ValueError(
+                    "result.review.findings[{}] missing required field {}".format(index, field)
+                )
+        severity = finding.get("severity")
+        if severity not in severities:
+            raise ValueError("unsupported review finding severity {}".format(severity))
+        require_string(finding.get("file"), "result.review.findings[{}].file".format(index))
+        line = finding.get("line")
+        if line is not None and (isinstance(line, bool) or not isinstance(line, int) or line < 1):
+            raise ValueError(
+                "result.review.findings[{}].line must be an integer >= 1 or null".format(
+                    index
+                )
+            )
+        require_string(finding.get("title"), "result.review.findings[{}].title".format(index))
+        require_string(finding.get("body"), "result.review.findings[{}].body".format(index))
+        require_optional_string(
+            finding.get("recommendation"),
+            "result.review.findings[{}].recommendation".format(index),
+        )
+
+
+def validate_tests_run(tests_run):
+    if not isinstance(tests_run, list):
+        raise ValueError("result.review.tests_run must be an array")
+    statuses = {"passed", "failed", "not_run", "unknown"}
+    for index, test in enumerate(tests_run):
+        if not isinstance(test, dict):
+            raise ValueError("result.review.tests_run[{}] must be an object".format(index))
+        for field in ("command", "status", "output_summary"):
+            if field not in test:
+                raise ValueError(
+                    "result.review.tests_run[{}] missing required field {}".format(index, field)
+                )
+        require_string(test.get("command"), "result.review.tests_run[{}].command".format(index))
+        status = test.get("status")
+        if status not in statuses:
+            raise ValueError("unsupported review test status {}".format(status))
+        require_optional_string(
+            test.get("output_summary"),
+            "result.review.tests_run[{}].output_summary".format(index),
+        )
+
+
 def validate_result_contract(result):
     if not isinstance(result, dict):
         raise ValueError("result.json must be a JSON object")
@@ -559,14 +643,22 @@ def validate_result_contract(result):
         raise ValueError("unsupported result contract_version {}".format(result.get("contract_version")))
     if result.get("status") not in RESULT_STATUSES:
         raise ValueError("unsupported result status {}".format(result.get("status")))
-    if not isinstance(result.get("commits"), list):
-        raise ValueError("result.commits must be an array")
-    if not isinstance(result.get("files_changed"), list):
-        raise ValueError("result.files_changed must be an array")
+    validate_commits(result.get("commits"))
+    validate_string_array(result.get("files_changed"), "result.files_changed")
     if not isinstance(result.get("summary"), str):
         raise ValueError("result.summary must be a string")
     if not isinstance(result.get("pr_body"), str):
         raise ValueError("result.pr_body must be a string")
+    if result.get("branch") is not None and not isinstance(result.get("branch"), str):
+        raise ValueError("result.branch must be a string or null")
+    if result.get("exit_reason") not in (
+        "test_failure",
+        "ambiguous_spec",
+        "git_conflict",
+        "infra_error",
+        None,
+    ):
+        raise ValueError("unsupported result exit_reason {}".format(result.get("exit_reason")))
 
     review = result.get("review")
     if not isinstance(review, dict):
@@ -591,9 +683,11 @@ def validate_result_contract(result):
     if evidence_status not in REVIEW_EVIDENCE_STATUSES:
         raise ValueError("unsupported review evidence_status {}".format(evidence_status))
 
-    for field in ("reviewed_files", "supporting_files", "findings", "tests_run", "limitations"):
-        if not isinstance(review.get(field), list):
-            raise ValueError("result.review.{} must be an array".format(field))
+    validate_string_array(review.get("reviewed_files"), "result.review.reviewed_files")
+    validate_string_array(review.get("supporting_files"), "result.review.supporting_files")
+    validate_findings(review.get("findings"))
+    validate_tests_run(review.get("tests_run"))
+    validate_string_array(review.get("limitations"), "result.review.limitations")
 
     if mode in ("pull_request", "review_comment"):
         if evidence_status == "not_applicable":
@@ -605,6 +699,8 @@ def validate_result_contract(result):
             isinstance(no_findings_reason, str) and no_findings_reason.strip()
         ):
             raise ValueError("no_findings_reason is required when review findings are empty")
+    if mode == "none" and evidence_status != "not_applicable":
+        raise ValueError("review evidence_status {} is invalid for none mode".format(evidence_status))
 
 
 def session_brief(task, workspace, review_context=None, extra_audit_instruction=None):

@@ -528,6 +528,14 @@ fn validate_result_contract(result: &SessionResult) -> Result<()> {
             result.review.mode
         );
     }
+    if result.review.mode == ReviewMode::None
+        && result.review.evidence_status != ReviewEvidenceStatus::NotApplicable
+    {
+        anyhow::bail!(
+            "review evidence_status {:?} is invalid for none mode",
+            result.review.evidence_status
+        );
+    }
     Ok(())
 }
 
@@ -712,6 +720,29 @@ mod result_tests {
             .expect_err("review result must reject not_applicable evidence");
         assert!(
             format!("{error:#}").contains("review evidence_status not_applicable is invalid"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_applicable_evidence_for_none_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-none-evidence-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"complete","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("none-mode result must reject applicable evidence");
+        assert!(
+            format!("{error:#}").contains("is invalid for none mode"),
             "unexpected error: {error:#}"
         );
 

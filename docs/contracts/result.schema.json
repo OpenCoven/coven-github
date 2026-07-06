@@ -133,6 +133,18 @@
               }
             ]
           }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "none" } },
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "evidence_status": { "const": "not_applicable" }
+            },
+            "required": ["evidence_status"]
+          }
         }
       ]
     },
