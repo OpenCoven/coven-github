@@ -13,6 +13,7 @@ use coven_github_api::{
 use coven_github_config::{Config, FamiliarConfig};
 
 pub mod brief;
+pub mod redact;
 
 /// Base unit for exponential backoff between retry-safe coven-code attempts.
 /// Attempt `n` sleeps `RETRY_BACKOFF_BASE * 2^n` (so 2s, 4s, … in production).
