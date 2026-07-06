@@ -190,8 +190,8 @@ the intended code. It is required on every result. Non-review tasks MUST set
 | `no_findings_reason` | string \| null | Required when `mode` is a review mode and `findings` is empty. |
 | `limitations` | string[] | Evidence gaps, skipped checks, or other caveats. |
 
-Each finding carries `severity`, `file`, optional `line`, `title`, `body`, and
-optional `recommendation`. Valid severities are `info`, `low`, `medium`, `high`,
+Each finding carries `severity`, `file`, `line` (required, may be null), `title`, `body`, and
+`recommendation` (required, may be null). Valid severities are `info`, `low`, `medium`, `high`,
 and `critical`.
 
 ### 3.3 `status`

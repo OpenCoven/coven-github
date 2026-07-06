@@ -473,7 +473,11 @@ def route_signed_delivery(headers, body, debug, webhook_secret=None):
         raw_body = b""
 
     signature = header_value(headers, "x-hub-signature-256")
-    if not verify_webhook_signature(webhook_secret or WEBHOOK_SECRET, raw_body, signature):
+    try:
+        verified = verify_webhook_signature(webhook_secret or WEBHOOK_SECRET, raw_body, signature)
+    except RuntimeError:
+        return {"ok": False, "status": 500, "error": "webhook secret not configured"}
+    if not verified:
         return {"ok": False, "status": 401, "error": "invalid signature"}
 
     event_name = header_value(headers, "x-github-event")
