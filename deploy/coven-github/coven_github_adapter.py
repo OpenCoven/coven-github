@@ -908,7 +908,7 @@ def run_task(task_id, debug):
         env["COVEN_GIT_TOKEN"] = token
         env["COVEN_CODE_PROVIDER"] = "codex"
         env["COVEN_CODE_HOSTED_REVIEW"] = "1"
-        env["HOME"] = str(CODEX_TOKENS_PATH.parent.parent)
+        env["HOME"] = str(account_home())
         codex_access_token = load_codex_access_token()
         if not codex_access_token:
             return fail_task(
