@@ -232,6 +232,9 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
             })
         }
 
+        // Routed through the review policy in the next change (issue #10).
+        GitHubEvent::PullRequestChanged(_) | GitHubEvent::Push(_) => None,
+
         // `ping` is acknowledged at the handler; it never produces a task.
         GitHubEvent::Ping | GitHubEvent::Unsupported { .. } => None,
     }

@@ -1,0 +1,16 @@
+{
+  "ref": "refs/heads/feat/spell-cache",
+  "before": "f00dfacef00dfacef00dfacef00dfacef00dface",
+  "after": "0000000000000000000000000000000000000000",
+  "created": false,
+  "deleted": true,
+  "forced": false,
+  "commits": [],
+  "installation": { "id": 123 },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" }
+  },
+  "pusher": { "name": "octocat", "email": "octocat@example.com" },
+  "sender": { "login": "octocat" }
+}

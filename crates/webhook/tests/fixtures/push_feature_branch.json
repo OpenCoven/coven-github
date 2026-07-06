@@ -1,0 +1,18 @@
+{
+  "ref": "refs/heads/feat/spell-cache",
+  "before": "abc123def4567890abc123def4567890abc123de",
+  "after": "f00dfacef00dfacef00dfacef00dfacef00dface",
+  "created": false,
+  "deleted": false,
+  "forced": true,
+  "commits": [
+    { "id": "f00dfacef00dfacef00dfacef00dfacef00dface", "message": "rework cache eviction" }
+  ],
+  "installation": { "id": 123 },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" }
+  },
+  "pusher": { "name": "octocat", "email": "octocat@example.com" },
+  "sender": { "login": "octocat" }
+}

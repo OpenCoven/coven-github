@@ -1,0 +1,18 @@
+{
+  "action": "ready_for_review",
+  "number": 91,
+  "installation": { "id": 123 },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" }
+  },
+  "pull_request": {
+    "number": 91,
+    "title": "Harden sigil parser",
+    "draft": false,
+    "user": { "login": "hexadecimal-cat" },
+    "head": { "ref": "fix/sigil-parser", "sha": "beadfeedbeadfeedbeadfeedbeadfeedbeadfeed" },
+    "base": { "ref": "main", "sha": "0001112223334445556667778889990001112223" }
+  },
+  "sender": { "login": "hexadecimal-cat" }
+}

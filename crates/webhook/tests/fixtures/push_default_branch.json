@@ -1,0 +1,19 @@
+{
+  "ref": "refs/heads/main",
+  "before": "0001112223334445556667778889990001112223",
+  "after": "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff",
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "commits": [
+    { "id": "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111", "message": "fix: patch sigil overflow" },
+    { "id": "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff", "message": "docs: update grimoire" }
+  ],
+  "installation": { "id": 123 },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" }
+  },
+  "pusher": { "name": "octocat", "email": "octocat@example.com" },
+  "sender": { "login": "octocat" }
+}

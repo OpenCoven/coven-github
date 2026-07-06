@@ -1,8 +1,8 @@
 //! Webhook event parsing: GitHub payload → typed events.
 
 use coven_github_api::{
-    GitHubEvent, IssueAssignedEvent, IssueCommentEvent, IssueLabeledEvent, PrReviewCommentEvent,
-    PrReviewEvent,
+    GitHubEvent, IssueAssignedEvent, IssueCommentEvent, IssueLabeledEvent, PrChangedEvent,
+    PrReviewCommentEvent, PrReviewEvent, PushEvent,
 };
 use serde::Deserialize;
 
@@ -18,6 +18,19 @@ pub struct WebhookPayload {
     pub label: Option<Label>,
     pub assignee: Option<User>,
     pub pull_request: Option<PullRequest>,
+    /// push: the updated ref, e.g. "refs/heads/main".
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    /// push: SHA of the ref before/after the push.
+    pub before: Option<String>,
+    pub after: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub forced: bool,
+    #[serde(default)]
+    pub commits: Vec<PushCommit>,
+    pub sender: Option<User>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +87,26 @@ pub struct User {
 #[derive(Debug, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
+    /// Full PR metadata is present on `pull_request` events; review/comment
+    /// events may omit it, so everything past `number` is optional.
+    pub title: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    pub head: Option<GitRef>,
+    pub base: Option<GitRef>,
+    pub user: Option<User>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitRef {
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PushCommit {
+    pub id: String,
 }
 
 /// Parse a raw webhook into a typed `GitHubEvent`.
@@ -165,6 +198,60 @@ pub fn parse_event(event_type: &str, payload: &WebhookPayload) -> GitHubEvent {
                     pr_number: pr.number,
                     comment_body: comment.body.clone(),
                     commenter_login: comment.user.login.clone(),
+                });
+            }
+        }
+        "pull_request"
+            if matches!(
+                payload.action.as_deref(),
+                Some("opened" | "synchronize" | "reopened" | "ready_for_review" | "labeled")
+            ) =>
+        {
+            if let (Some(inst), Some(repo), Some(pr)) = (
+                &payload.installation,
+                &payload.repository,
+                &payload.pull_request,
+            ) {
+                if let (Some(title), Some(head), Some(base), Some(user)) =
+                    (&pr.title, &pr.head, &pr.base, &pr.user)
+                {
+                    return GitHubEvent::PullRequestChanged(PrChangedEvent {
+                        installation_id: inst.id,
+                        repo_owner: repo.owner.login.clone(),
+                        repo_name: repo.name.clone(),
+                        pr_number: pr.number,
+                        pr_title: title.clone(),
+                        action: payload.action.clone().unwrap_or_default(),
+                        label_name: payload.label.as_ref().map(|l| l.name.clone()),
+                        head_ref: head.git_ref.clone(),
+                        head_sha: head.sha.clone(),
+                        base_ref: base.git_ref.clone(),
+                        author_login: user.login.clone(),
+                        draft: pr.draft,
+                    });
+                }
+            }
+        }
+        "push" => {
+            if let (Some(inst), Some(repo), Some(git_ref), Some(before), Some(after), Some(sender)) = (
+                &payload.installation,
+                &payload.repository,
+                &payload.git_ref,
+                &payload.before,
+                &payload.after,
+                &payload.sender,
+            ) {
+                return GitHubEvent::Push(PushEvent {
+                    installation_id: inst.id,
+                    repo_owner: repo.owner.login.clone(),
+                    repo_name: repo.name.clone(),
+                    branch: git_ref.strip_prefix("refs/heads/").map(str::to_string),
+                    before_sha: before.clone(),
+                    after_sha: after.clone(),
+                    deleted: payload.deleted,
+                    forced: payload.forced,
+                    pusher_login: sender.login.clone(),
+                    commit_count: payload.commits.len(),
                 });
             }
         }

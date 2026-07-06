@@ -1,0 +1,18 @@
+{
+  "action": "opened",
+  "number": 88,
+  "installation": { "id": 123 },
+  "repository": {
+    "name": "coven-code",
+    "owner": { "login": "OpenCoven" }
+  },
+  "pull_request": {
+    "number": 88,
+    "title": "Add spell compiler cache",
+    "draft": false,
+    "user": { "login": "octocat" },
+    "head": { "ref": "feat/spell-cache", "sha": "abc123def4567890abc123def4567890abc123de" },
+    "base": { "ref": "main", "sha": "0001112223334445556667778889990001112223" }
+  },
+  "sender": { "login": "octocat" }
+}

@@ -70,11 +70,53 @@ pub enum GitHubEvent {
     IssueComment(IssueCommentEvent),
     PullRequestReview(PrReviewEvent),
     PullRequestReviewComment(PrReviewCommentEvent),
+    PullRequestChanged(PrChangedEvent),
+    Push(PushEvent),
     /// `ping` delivery GitHub sends when a webhook is first configured.
     Ping,
     Unsupported {
         name: String,
     },
+}
+
+/// Pull-request lifecycle change relevant to review triggers
+/// (`pull_request` → opened / synchronize / reopened / ready_for_review /
+/// labeled). Carries the refs at event time so review tasks pin an immutable
+/// target (issue #10).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PrChangedEvent {
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub pr_title: String,
+    /// The webhook action that fired.
+    pub action: String,
+    /// Set for `labeled` actions.
+    pub label_name: Option<String>,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub author_login: String,
+    pub draft: bool,
+}
+
+/// Branch push. Parsed and typed today; the review execution lane ships with
+/// headless contract v3 — v2 task kinds cannot express a PR-less review
+/// (issue #10).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PushEvent {
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    /// `None` for refs outside `refs/heads/` (e.g. tag pushes).
+    pub branch: Option<String>,
+    pub before_sha: String,
+    pub after_sha: String,
+    pub deleted: bool,
+    pub forced: bool,
+    pub pusher_login: String,
+    pub commit_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
