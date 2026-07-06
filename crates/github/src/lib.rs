@@ -147,6 +147,10 @@ pub struct IssueCommentEvent {
     pub repo_owner: String,
     pub repo_name: String,
     pub issue_number: u64,
+    /// Issue (or PR) title — needed when a `fix` command turns the comment
+    /// into a FixIssue task (issue #13).
+    pub issue_title: String,
+    pub issue_body: String,
     pub comment_body: String,
     pub commenter_login: String,
     /// `issue_comment` fires for pull-request conversation comments as well as
@@ -166,6 +170,7 @@ pub struct PrReviewEvent {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
+    pub pr_title: String,
     pub review_body: String,
     /// Review verdict: `approved`, `changes_requested`, or `commented`.
     pub review_state: String,
@@ -178,6 +183,7 @@ pub struct PrReviewCommentEvent {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
+    pub pr_title: String,
     pub comment_body: String,
     pub commenter_login: String,
 }

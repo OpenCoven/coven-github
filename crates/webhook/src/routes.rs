@@ -14,9 +14,11 @@ use coven_github_api::{tasks::TaskStore, GitHubEvent, Task, TaskKind};
 use coven_github_config::Config;
 
 use crate::{
+    commands::{parse_mention, Command, MentionKind, COMMAND_LIST},
     events::{parse_event, WebhookPayload},
     verify_signature,
 };
+use coven_github_api::tasks::TaskListStatus;
 
 /// Shared application state passed to route handlers.
 #[derive(Clone)]
@@ -101,7 +103,7 @@ pub async fn handle_webhook(
     }
 
     // 4. Route event → task.
-    if let Some(task) = event_to_task(&state, event) {
+    if let Some(task) = event_to_task(&state, event).await {
         let task_id = task.id.clone();
         // Register auto-reviews BEFORE enqueueing so the worker can never
         // dequeue a task that a newer event has already superseded (#10).
@@ -123,7 +125,7 @@ pub async fn handle_webhook(
 }
 
 /// Maps a parsed event to a worker task, or returns None if not actionable.
-fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
+async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
     match event {
         GitHubEvent::IssueAssigned(e) => {
             // Find a familiar whose bot_username matches the assignee.
@@ -170,80 +172,54 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
             })
         }
 
+        // Comment surfaces speak the maintainer command protocol (issue #13):
+        // only command-position mentions act; casual mentions are ignored.
         GitHubEvent::IssueComment(e) => {
-            // Find a familiar mentioned in the comment body (skip the bot's own
-            // comments to avoid self-trigger loops).
-            let familiar = state.config.familiars.iter().find(|f| {
-                e.commenter_login != f.bot_username && mentions(&e.comment_body, &f.bot_username)
-            })?;
-
-            // GitHub delivers PR conversation comments through `issue_comment`.
-            // Route those through PR iteration so the familiar gets PR context
-            // rather than issue context (the numbers coincide in GitHub).
-            let kind = if e.on_pull_request {
-                TaskKind::AddressReviewComment {
-                    pr_number: e.issue_number,
-                    comment_body: e.comment_body,
-                    diff_hunk: None,
-                }
-            } else {
-                TaskKind::RespondToMention {
-                    issue_number: e.issue_number,
-                    comment_body: e.comment_body,
-                }
-            };
-
-            Some(Task {
-                id: uuid::Uuid::new_v4().to_string(),
+            let (familiar, command) = parse_command(state, &e.comment_body, &e.commenter_login)?;
+            let surface = CommandSurface {
                 installation_id: e.installation_id,
-                repo_owner: e.repo_owner,
-                repo_name: e.repo_name,
-                familiar_id: familiar.id.clone(),
-                commander: None,
-                kind,
-            })
+                repo_owner: &e.repo_owner,
+                repo_name: &e.repo_name,
+                number: e.issue_number,
+                title: &e.issue_title,
+                issue_body: &e.issue_body,
+                comment_body: &e.comment_body,
+                on_pull_request: e.on_pull_request,
+                commander: &e.commenter_login,
+            };
+            command_task(state, familiar, command, surface).await
         }
 
         GitHubEvent::PullRequestReview(e) => {
-            // A submitted review carries a summary body and a verdict. Trigger
-            // on an explicit mention in the body, same as inline comments.
-            let familiar = state.config.familiars.iter().find(|f| {
-                e.reviewer_login != f.bot_username && mentions(&e.review_body, &f.bot_username)
-            })?;
-
-            Some(Task {
-                id: uuid::Uuid::new_v4().to_string(),
+            let (familiar, command) = parse_command(state, &e.review_body, &e.reviewer_login)?;
+            let surface = CommandSurface {
                 installation_id: e.installation_id,
-                repo_owner: e.repo_owner,
-                repo_name: e.repo_name,
-                familiar_id: familiar.id.clone(),
-                commander: None,
-                kind: TaskKind::AddressReviewComment {
-                    pr_number: e.pr_number,
-                    comment_body: e.review_body,
-                    diff_hunk: None,
-                },
-            })
+                repo_owner: &e.repo_owner,
+                repo_name: &e.repo_name,
+                number: e.pr_number,
+                title: &e.pr_title,
+                issue_body: "",
+                comment_body: &e.review_body,
+                on_pull_request: true,
+                commander: &e.reviewer_login,
+            };
+            command_task(state, familiar, command, surface).await
         }
 
         GitHubEvent::PullRequestReviewComment(e) => {
-            let familiar = state.config.familiars.iter().find(|f| {
-                e.commenter_login != f.bot_username && mentions(&e.comment_body, &f.bot_username)
-            })?;
-
-            Some(Task {
-                id: uuid::Uuid::new_v4().to_string(),
+            let (familiar, command) = parse_command(state, &e.comment_body, &e.commenter_login)?;
+            let surface = CommandSurface {
                 installation_id: e.installation_id,
-                repo_owner: e.repo_owner,
-                repo_name: e.repo_name,
-                familiar_id: familiar.id.clone(),
-                commander: None,
-                kind: TaskKind::AddressReviewComment {
-                    pr_number: e.pr_number,
-                    comment_body: e.comment_body,
-                    diff_hunk: None,
-                },
-            })
+                repo_owner: &e.repo_owner,
+                repo_name: &e.repo_name,
+                number: e.pr_number,
+                title: &e.pr_title,
+                issue_body: "",
+                comment_body: &e.comment_body,
+                on_pull_request: true,
+                commander: &e.commenter_login,
+            };
+            command_task(state, familiar, command, surface).await
         }
 
         GitHubEvent::PullRequestChanged(e) => {
@@ -305,35 +281,166 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
     }
 }
 
-/// Returns true if `body` mentions the familiar's `@handle` as a whole token.
-///
-/// `bot_username` is the GitHub App bot login (e.g. `coven-cody[bot]`); the
-/// `[bot]` suffix is dropped since mentions are written `@coven-cody`. Matching
-/// is boundary-aware: `@cody` inside `@codyx`, `@cody-2`, or `email@cody` does
-/// not count, and `@coven-cody/team` (a team mention) is not a bot mention.
-fn mentions(body: &str, bot_username: &str) -> bool {
-    let handle = bot_username.trim_end_matches("[bot]");
-    if handle.is_empty() {
-        return false;
-    }
-    let needle = format!("@{handle}");
-    let mut offset = 0;
-    while let Some(pos) = body[offset..].find(&needle) {
-        let start = offset + pos;
-        let end = start + needle.len();
-        let before = body[..start].chars().next_back();
-        let after = body[end..].chars().next();
-        // The character before `@` must be a separator (or start of string),
-        // and the character after the handle must not continue an identifier.
-        let boundary_before = before.is_none_or(|c| !c.is_alphanumeric() && c != '@');
-        let boundary_after =
-            after.is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '/'));
-        if boundary_before && boundary_after {
-            return true;
+/// Finds the first familiar addressed in command position, skipping the bots'
+/// own comments (self-trigger loop guard).
+fn parse_command<'a>(
+    state: &'a AppState,
+    body: &str,
+    author: &str,
+) -> Option<(&'a coven_github_config::FamiliarConfig, Command)> {
+    state.config.familiars.iter().find_map(|f| {
+        if author == f.bot_username {
+            return None;
         }
-        offset = start + 1;
+        match parse_mention(body, &f.bot_username) {
+            MentionKind::Command(command) => Some((f, command)),
+            MentionKind::Casual | MentionKind::None => None,
+        }
+    })
+}
+
+/// The issue/PR conversation a command arrived on.
+struct CommandSurface<'a> {
+    installation_id: u64,
+    repo_owner: &'a str,
+    repo_name: &'a str,
+    number: u64,
+    title: &'a str,
+    issue_body: &'a str,
+    comment_body: &'a str,
+    on_pull_request: bool,
+    commander: &'a str,
+}
+
+/// Maps a typed maintainer command to a task. Work commands carry the
+/// commander for the worker's permission gate; replies carry none.
+async fn command_task(
+    state: &AppState,
+    familiar: &coven_github_config::FamiliarConfig,
+    command: Command,
+    s: CommandSurface<'_>,
+) -> Option<Task> {
+    let repo = format!("{}/{}", s.repo_owner, s.repo_name);
+    let make = |kind: TaskKind, commander: Option<String>| Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        installation_id: s.installation_id,
+        repo_owner: s.repo_owner.to_string(),
+        repo_name: s.repo_name.to_string(),
+        familiar_id: familiar.id.clone(),
+        commander,
+        kind,
+    };
+    let commander = Some(s.commander.to_string());
+    let reply = |body: String| {
+        make(
+            TaskKind::CommandReply {
+                issue_number: s.number,
+                body,
+            },
+            None,
+        )
+    };
+
+    Some(match command {
+        Command::Review | Command::Deepen | Command::Retry if s.on_pull_request => make(
+            TaskKind::ReviewPullRequest {
+                pr_number: s.number,
+                pr_title: s.title.to_string(),
+                reason: format!("command:{}", verb(&command)),
+            },
+            commander,
+        ),
+        // `retry` on an issue re-runs the fix lane.
+        Command::Retry => make(
+            TaskKind::FixIssue {
+                issue_number: s.number,
+                issue_title: s.title.to_string(),
+                issue_body: s.issue_body.to_string(),
+            },
+            commander,
+        ),
+        Command::Review | Command::Deepen => reply(format!(
+            "`{}` needs a pull request; this is an issue. Commands here: {COMMAND_LIST}.",
+            verb(&command)
+        )),
+        Command::Fix { .. } if s.on_pull_request => make(
+            TaskKind::AddressReviewComment {
+                pr_number: s.number,
+                comment_body: s.comment_body.to_string(),
+                diff_hunk: None,
+            },
+            commander,
+        ),
+        Command::Fix { .. } => make(
+            TaskKind::FixIssue {
+                issue_number: s.number,
+                issue_title: s.title.to_string(),
+                issue_body: s.issue_body.to_string(),
+            },
+            commander,
+        ),
+        Command::Cancel if s.on_pull_request => {
+            // Tombstone queued reviews for this PR. In-flight work is not
+            // interrupted (documented limitation); the next review command or
+            // PR event re-arms the lane.
+            state
+                .task_store
+                .register_pr_review(&repo, s.number, &format!("cancelled:{}", uuid::Uuid::new_v4()))
+                .await;
+            reply(format!(
+                "Cancelled queued reviews for PR #{}. Work already running will finish; `@{} review` re-arms the lane.",
+                s.number,
+                familiar.bot_username.trim_end_matches("[bot]")
+            ))
+        }
+        Command::Cancel => reply("`cancel` currently applies to queued pull-request reviews only.".to_string()),
+        Command::Remember { .. } | Command::Forget { .. } => reply(
+            "Noted, but memory persistence is not wired up yet — it lands with the hosted \
+             memory governance contract (#6). Nothing was stored or deleted."
+                .to_string(),
+        ),
+        Command::Status => {
+            let items = state.task_store.list().await;
+            let mut lines: Vec<String> = items
+                .iter()
+                .filter(|t| t.repo == repo && t.issue_number == s.number)
+                .map(|t| format!("- {} — {}", t.issue_title, status_label(&t.status)))
+                .collect();
+            let body = if lines.is_empty() {
+                format!("No tracked tasks for {repo}#{}.", s.number)
+            } else {
+                lines.sort();
+                format!("Tasks for {repo}#{}:\n{}", s.number, lines.join("\n"))
+            };
+            reply(body)
+        }
+        Command::Unknown { verb } => reply(format!(
+            "I don't recognize `{verb}`. Supported commands: {COMMAND_LIST}."
+        )),
+    })
+}
+
+fn verb(command: &Command) -> &'static str {
+    match command {
+        Command::Review => "review",
+        Command::Fix { .. } => "fix",
+        Command::Deepen => "deepen",
+        Command::Retry => "retry",
+        Command::Cancel => "cancel",
+        Command::Remember { .. } => "remember",
+        Command::Forget { .. } => "forget",
+        Command::Status => "status",
+        Command::Unknown { .. } => "unknown",
     }
-    false
+}
+
+fn status_label(status: &TaskListStatus) -> &'static str {
+    match status {
+        TaskListStatus::Running => "running",
+        TaskListStatus::Review => "awaiting review",
+        TaskListStatus::Done => "done",
+        TaskListStatus::Failed => "failed",
+    }
 }
 
 #[cfg(test)]
@@ -383,8 +490,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn labeled_issue_routes_to_familiar_trigger_label() {
+    #[tokio::test]
+    async fn labeled_issue_routes_to_familiar_trigger_label() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -398,6 +505,7 @@ mod tests {
                 label_name: "coven:fix".to_string(),
             }),
         )
+        .await
         .expect("matching trigger label should create a task");
 
         assert_eq!(task.installation_id, 123);
@@ -418,8 +526,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn labeled_issue_ignores_unknown_labels() {
+    #[tokio::test]
+    async fn labeled_issue_ignores_unknown_labels() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -432,13 +540,14 @@ mod tests {
                 issue_body: "Token refresh is broken.".to_string(),
                 label_name: "help wanted".to_string(),
             }),
-        );
+        )
+        .await;
 
         assert!(task.is_none());
     }
 
-    #[test]
-    fn issue_comment_ignores_bot_self_mentions() {
+    #[tokio::test]
+    async fn issue_comment_ignores_bot_self_mentions() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -447,17 +556,20 @@ mod tests {
                 repo_owner: "OpenCoven".to_string(),
                 repo_name: "coven-code".to_string(),
                 issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
                 comment_body: "@coven-cody thanks, I opened a PR.".to_string(),
                 commenter_login: "coven-cody[bot]".to_string(),
                 on_pull_request: false,
             }),
-        );
+        )
+        .await;
 
         assert!(task.is_none());
     }
 
-    #[test]
-    fn pr_review_comment_ignores_bot_self_mentions() {
+    #[tokio::test]
+    async fn pr_review_comment_ignores_bot_self_mentions() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -466,16 +578,18 @@ mod tests {
                 repo_owner: "OpenCoven".to_string(),
                 repo_name: "coven-code".to_string(),
                 pr_number: 7,
-                comment_body: "@coven-cody please fix.".to_string(),
+                pr_title: "Harden sigil parser".to_string(),
+                comment_body: "@coven-cody fix: please".to_string(),
                 commenter_login: "coven-cody[bot]".to_string(),
             }),
-        );
+        )
+        .await;
 
         assert!(task.is_none());
     }
 
-    #[test]
-    fn issue_comment_on_pr_routes_to_pr_iteration() {
+    #[tokio::test]
+    async fn issue_comment_on_pr_routes_to_pr_iteration() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -484,28 +598,32 @@ mod tests {
                 repo_owner: "OpenCoven".to_string(),
                 repo_name: "coven-code".to_string(),
                 issue_number: 73,
-                comment_body: "@coven-cody the lint is still failing".to_string(),
+                issue_title: "Add spell compiler cache".to_string(),
+                issue_body: "".to_string(),
+                comment_body: "@coven-cody fix: the lint is still failing".to_string(),
                 commenter_login: "octocat".to_string(),
                 on_pull_request: true,
             }),
         )
+        .await
         .expect("a mention on a PR comment should create a task");
 
         match task.kind {
             TaskKind::AddressReviewComment {
                 pr_number,
+                comment_body,
                 diff_hunk,
-                ..
             } => {
                 assert_eq!(pr_number, 73);
+                assert!(comment_body.contains("lint is still failing"));
                 assert!(diff_hunk.is_none());
             }
             other => panic!("expected AddressReviewComment for a PR comment, got {other:?}"),
         }
     }
 
-    #[test]
-    fn issue_comment_on_issue_routes_to_respond_to_mention() {
+    #[tokio::test]
+    async fn fix_command_on_issue_routes_to_fix_issue_with_commander() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -514,21 +632,85 @@ mod tests {
                 repo_owner: "OpenCoven".to_string(),
                 repo_name: "coven-code".to_string(),
                 issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Token refresh is broken.".to_string(),
+                comment_body: "@coven-cody fix".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: false,
+            }),
+        )
+        .await
+        .expect("a fix command on an issue should create a task");
+
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
+        match task.kind {
+            TaskKind::FixIssue {
+                issue_number,
+                issue_title,
+                ..
+            } => {
+                assert_eq!(issue_number, 42);
+                assert_eq!(issue_title, "Fix auth");
+            }
+            other => panic!("expected FixIssue for a fix command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn casual_mention_creates_no_task() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
+                comment_body: "thanks @coven-cody, great work".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: false,
+            }),
+        )
+        .await;
+
+        assert!(task.is_none(), "casual mentions must not trigger work");
+    }
+
+    #[tokio::test]
+    async fn unknown_command_earns_a_clarification_reply() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
                 comment_body: "@coven-cody can you take a look?".to_string(),
                 commenter_login: "octocat".to_string(),
                 on_pull_request: false,
             }),
         )
-        .expect("a mention on an issue comment should create a task");
+        .await
+        .expect("unknown command should earn a clarification");
 
+        assert!(task.commander.is_none(), "replies need no permission gate");
         match task.kind {
-            TaskKind::RespondToMention { issue_number, .. } => assert_eq!(issue_number, 42),
-            other => panic!("expected RespondToMention for an issue comment, got {other:?}"),
+            TaskKind::CommandReply { issue_number, body } => {
+                assert_eq!(issue_number, 42);
+                assert!(body.contains("`can`"));
+                assert!(body.contains("`review`"), "reply should list commands: {body}");
+            }
+            other => panic!("expected CommandReply, got {other:?}"),
         }
     }
 
-    #[test]
-    fn submitted_review_mention_routes_to_pr_iteration() {
+    #[tokio::test]
+    async fn submitted_review_mention_routes_to_pr_iteration() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -537,11 +719,13 @@ mod tests {
                 repo_owner: "OpenCoven".to_string(),
                 repo_name: "coven-code".to_string(),
                 pr_number: 73,
-                review_body: "@coven-cody please add test coverage before merge.".to_string(),
+                pr_title: "Harden sigil parser".to_string(),
+                review_body: "@coven-cody fix: add test coverage before merge.".to_string(),
                 review_state: "changes_requested".to_string(),
                 reviewer_login: "octocat".to_string(),
             }),
         )
+        .await
         .expect("a mention in a review body should create a task");
 
         match task.kind {
@@ -550,8 +734,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn submitted_review_without_mention_is_ignored() {
+    #[tokio::test]
+    async fn submitted_review_without_mention_is_ignored() {
         let state = app_state();
         let task = event_to_task(
             &state,
@@ -560,35 +744,23 @@ mod tests {
                 repo_owner: "OpenCoven".to_string(),
                 repo_name: "coven-code".to_string(),
                 pr_number: 73,
+                pr_title: "Harden sigil parser".to_string(),
                 review_body: "LGTM, nice work!".to_string(),
                 review_state: "approved".to_string(),
                 reviewer_login: "octocat".to_string(),
             }),
-        );
+        )
+        .await;
 
         assert!(task.is_none());
     }
 
-    #[test]
-    fn ping_event_produces_no_task() {
+    #[tokio::test]
+    async fn ping_event_produces_no_task() {
         let state = app_state();
-        assert!(event_to_task(&state, GitHubEvent::Ping).is_none());
+        assert!(event_to_task(&state, GitHubEvent::Ping).await.is_none());
     }
 
-    #[test]
-    fn mention_matching_is_boundary_aware() {
-        // Exact handle (with the [bot] suffix stripped) matches.
-        assert!(mentions("hey @coven-cody can you help", "coven-cody[bot]"));
-        // Trailing identifier characters must not be swallowed into the handle.
-        assert!(!mentions("ping @coven-codyx instead", "coven-cody[bot]"));
-        assert!(!mentions("ping @coven-cody-2 instead", "coven-cody[bot]"));
-        // A team mention (`@org/team`) is not a bot mention.
-        assert!(!mentions("cc @coven-cody/maintainers", "coven-cody[bot]"));
-        // An email-like local part is not a mention.
-        assert!(!mentions("mail user@coven-cody.example", "coven-cody[bot]"));
-        // Mention at end of string still matches.
-        assert!(mentions("over to you @coven-cody", "coven-cody[bot]"));
-    }
 }
 
 #[cfg(test)]
@@ -625,10 +797,11 @@ mod review_lane_tests {
         }
     }
 
-    #[test]
-    fn pr_opened_routes_to_review_when_lane_enabled() {
+    #[tokio::test]
+    async fn pr_opened_routes_to_review_when_lane_enabled() {
         let state = app_state_with_review(review_on());
         let task = event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened")))
+            .await
             .expect("enabled lane should create a review task");
 
         assert_eq!(task.familiar_id, "cody");
@@ -643,12 +816,13 @@ mod review_lane_tests {
         }
     }
 
-    #[test]
-    fn pr_synchronize_carries_event_time_head() {
+    #[tokio::test]
+    async fn pr_synchronize_carries_event_time_head() {
         let state = app_state_with_review(review_on());
         let mut event = pr_event("synchronize");
         event.head_sha = "f00dface".to_string();
         let task = event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+            .await
             .expect("synchronize should create a review task");
 
         match task.kind {
@@ -659,38 +833,38 @@ mod review_lane_tests {
         }
     }
 
-    #[test]
-    fn pr_opened_is_ignored_when_lane_disabled() {
+    #[tokio::test]
+    async fn pr_opened_is_ignored_when_lane_disabled() {
         let state = app_state();
         assert!(
-            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).is_none()
+            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).await.is_none()
         );
     }
 
-    #[test]
-    fn familiar_authored_prs_are_never_auto_reviewed() {
+    #[tokio::test]
+    async fn familiar_authored_prs_are_never_auto_reviewed() {
         // The adapter's own draft PRs must not re-trigger reviews (loop guard).
         let state = app_state_with_review(review_on());
         let mut event = pr_event("opened");
         event.author_login = "coven-cody[bot]".to_string();
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).is_none());
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).await.is_none());
     }
 
-    #[test]
-    fn draft_prs_are_skipped_unless_policy_includes_them() {
+    #[tokio::test]
+    async fn draft_prs_are_skipped_unless_policy_includes_them() {
         let state = app_state_with_review(review_on());
         let mut event = pr_event("opened");
         event.draft = true;
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event.clone())).is_none());
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event.clone())).await.is_none());
 
         let mut inclusive = review_on();
         inclusive.include_drafts = true;
         let state = app_state_with_review(inclusive);
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).is_some());
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).await.is_some());
     }
 
-    #[test]
-    fn per_repo_override_disables_the_lane() {
+    #[tokio::test]
+    async fn per_repo_override_disables_the_lane() {
         let mut review = review_on();
         review.repos.insert(
             "OpenCoven/coven-code".to_string(),
@@ -703,33 +877,34 @@ mod review_lane_tests {
         );
         let state = app_state_with_review(review);
         assert!(
-            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).is_none()
+            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).await.is_none()
         );
     }
 
-    #[test]
-    fn review_label_is_an_explicit_opt_in_even_with_lane_off_and_draft() {
+    #[tokio::test]
+    async fn review_label_is_an_explicit_opt_in_even_with_lane_off_and_draft() {
         // No [review] policy at all — the label alone routes, like issue labels.
         let state = app_state();
         let mut event = pr_event("labeled");
         event.label_name = Some("coven:review".to_string());
         event.draft = true;
         let task = event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+            .await
             .expect("review label should opt the PR in");
         assert_eq!(task.familiar_id, "cody");
         assert!(matches!(task.kind, TaskKind::ReviewPullRequest { .. }));
     }
 
-    #[test]
-    fn unknown_labels_do_not_trigger_review() {
+    #[tokio::test]
+    async fn unknown_labels_do_not_trigger_review() {
         let state = app_state_with_review(review_on());
         let mut event = pr_event("labeled");
         event.label_name = Some("help wanted".to_string());
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).is_none());
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).await.is_none());
     }
 
-    #[test]
-    fn push_events_produce_no_task_until_contract_v3() {
+    #[tokio::test]
+    async fn push_events_produce_no_task_until_contract_v3() {
         let state = app_state_with_review(review_on());
         let event = GitHubEvent::Push(coven_github_api::PushEvent {
             installation_id: 123,
@@ -743,6 +918,153 @@ mod review_lane_tests {
             pusher_login: "octocat".to_string(),
             commit_count: 2,
         });
-        assert!(event_to_task(&state, event).is_none());
+        assert!(event_to_task(&state, event).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod command_routing_tests {
+    use super::tests::app_state;
+    use super::*;
+    use coven_github_api::PrReviewCommentEvent;
+
+    fn pr_comment(body: &str) -> GitHubEvent {
+        GitHubEvent::PullRequestReviewComment(PrReviewCommentEvent {
+            installation_id: 123,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            pr_number: 88,
+            pr_title: "Add spell compiler cache".to_string(),
+            comment_body: body.to_string(),
+            commenter_login: "octocat".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn review_command_on_pr_creates_commanded_review() {
+        let state = app_state();
+        let task = event_to_task(&state, pr_comment("@coven-cody review"))
+            .await
+            .expect("review command should create a task");
+
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
+        match task.kind {
+            TaskKind::ReviewPullRequest {
+                pr_number, reason, ..
+            } => {
+                assert_eq!(pr_number, 88);
+                assert_eq!(reason, "command:review");
+            }
+            other => panic!("expected ReviewPullRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deepen_command_carries_its_verb_in_the_reason() {
+        let state = app_state();
+        let task = event_to_task(&state, pr_comment("@coven-cody deepen"))
+            .await
+            .expect("deepen command should create a task");
+        assert!(
+            matches!(task.kind, TaskKind::ReviewPullRequest { ref reason, .. } if reason == "command:deepen")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_command_tombstones_queued_reviews_and_acknowledges() {
+        let state = app_state();
+        state
+            .task_store
+            .register_pr_review("OpenCoven/coven-code", 88, "task-queued")
+            .await;
+
+        let task = event_to_task(&state, pr_comment("@coven-cody cancel"))
+            .await
+            .expect("cancel should acknowledge");
+
+        assert!(
+            !state
+                .task_store
+                .is_current_pr_review("OpenCoven/coven-code", 88, "task-queued")
+                .await,
+            "queued review must be superseded by the cancel tombstone"
+        );
+        match task.kind {
+            TaskKind::CommandReply { issue_number, body } => {
+                assert_eq!(issue_number, 88);
+                assert!(body.contains("Cancelled queued reviews"));
+            }
+            other => panic!("expected CommandReply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_commands_are_acknowledged_but_deferred() {
+        let state = app_state();
+        let task = event_to_task(&state, pr_comment("@coven-cody remember we ship Fridays"))
+            .await
+            .expect("remember should acknowledge");
+        match task.kind {
+            TaskKind::CommandReply { body, .. } => {
+                assert!(body.contains("#6"));
+                assert!(body.contains("Nothing was stored"));
+            }
+            other => panic!("expected CommandReply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_tracked_tasks_for_the_surface() {
+        let state = app_state();
+        let tracked = Task {
+            id: "task-1".to_string(),
+            installation_id: 123,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "Add spell compiler cache".to_string(),
+                reason: "opened".to_string(),
+            },
+        };
+        state.task_store.mark_running(&tracked, "Cody", None).await;
+
+        let task = event_to_task(&state, pr_comment("@coven-cody status"))
+            .await
+            .expect("status should reply");
+        match task.kind {
+            TaskKind::CommandReply { body, .. } => {
+                assert!(body.contains("Review PR #88"), "status body: {body}");
+                assert!(body.contains("running"), "status body: {body}");
+            }
+            other => panic!("expected CommandReply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn review_command_on_an_issue_is_clarified() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(coven_github_api::IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
+                comment_body: "@coven-cody review".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: false,
+            }),
+        )
+        .await
+        .expect("review on an issue should clarify");
+        assert!(matches!(
+            task.kind,
+            TaskKind::CommandReply { ref body, .. } if body.contains("needs a pull request")
+        ));
     }
 }
