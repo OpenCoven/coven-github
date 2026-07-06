@@ -19,8 +19,8 @@ session links.
 
 ## DCO — every commit must be signed off (mandatory)
 
-This repo uses the **Developer Certificate of Origin**. Every commit needs a
-`Signed-off-by` trailer or CI/merge will block it:
+This repo uses the **Developer Certificate of Origin**. Every commit must carry
+a `Signed-off-by` trailer:
 
 ```sh
 git commit -s -m "type: summary"
