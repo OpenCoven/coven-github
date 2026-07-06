@@ -11,7 +11,7 @@ env:
 
 jobs:
   check:
-    name: cargo check + clippy + test
+    name: python + cargo check + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +19,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: hosted adapter python compile
+        run: python -B -m py_compile deploy/coven-github/coven_github_adapter.py deploy/coven-github/test_coven_github_adapter.py
+      - name: hosted adapter python tests
+        run: python -B -m unittest discover -s deploy/coven-github -p "test_*.py"
       - name: cargo check
         run: cargo check --all-targets
       - name: clippy

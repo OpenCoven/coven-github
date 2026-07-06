@@ -5,7 +5,10 @@
 //! If these fail, either the runtime contract drifted or the docs are stale —
 //! fix one of them, do not just bless the test.
 
-use coven_github_api::{ExitReason, SessionResult, SessionStatus, HEADLESS_CONTRACT_VERSION};
+use coven_github_api::{
+    ExitReason, ReviewEvidenceStatus, ReviewMode, SessionResult, SessionStatus,
+    HEADLESS_CONTRACT_VERSION,
+};
 use coven_github_worker::brief::SessionBrief;
 
 fn fixture(name: &str) -> String {
@@ -36,6 +39,296 @@ fn golden_session_brief_deserializes_into_adapter_type() {
 }
 
 #[test]
+fn hosted_review_session_brief_deserializes_optional_context() {
+    let raw = r#"{
+        "contract_version": "2",
+        "trigger": "pr_review_comment",
+        "repo": {
+            "owner": "OpenCoven",
+            "name": "coven-github",
+            "clone_url": "https://github.com/OpenCoven/coven-github.git",
+            "default_branch": "main"
+        },
+        "task": {
+            "kind": "address_review_comment",
+            "pr_number": 31,
+            "comment_body": "review this",
+            "diff_hunk": null
+        },
+        "familiar": {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": null,
+            "skills": []
+        },
+        "workspace": {
+            "root": "/tmp/coven"
+        },
+        "review_context": {
+            "pr_number": 31,
+            "files": [{ "path": "src/lib.rs" }]
+        },
+        "audit_instruction": "Inspect supplied changed-file patches."
+    }"#;
+
+    let brief: SessionBrief =
+        serde_json::from_str(raw).expect("hosted review brief must match SessionBrief");
+
+    assert_eq!(brief.trigger, "pr_review_comment");
+    assert_eq!(
+        brief
+            .review_context
+            .as_ref()
+            .and_then(|context| context.get("pr_number"))
+            .and_then(serde_json::Value::as_u64),
+        Some(31)
+    );
+    assert_eq!(
+        brief.audit_instruction.as_deref(),
+        Some("Inspect supplied changed-file patches.")
+    );
+}
+
+#[test]
+fn session_brief_without_contract_version_is_rejected() {
+    let raw = r#"{
+        "trigger": "issue_assigned",
+        "repo": {
+            "owner": "OpenCoven",
+            "name": "coven-github",
+            "clone_url": "https://github.com/OpenCoven/coven-github.git",
+            "default_branch": "main"
+        },
+        "task": {
+            "kind": "fix_issue",
+            "issue_number": 119,
+            "issue_title": "Review contract",
+            "issue_body": "Tighten the contract."
+        },
+        "familiar": {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": null,
+            "skills": []
+        },
+        "workspace": {
+            "root": "/tmp/coven"
+        }
+    }"#;
+
+    let error = serde_json::from_str::<SessionBrief>(raw)
+        .expect_err("v2 brief without contract_version must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing field `contract_version`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn session_brief_with_unsupported_contract_version_is_rejected() {
+    let raw = r#"{
+        "contract_version": "1",
+        "trigger": "issue_assigned",
+        "repo": {
+            "owner": "OpenCoven",
+            "name": "coven-github",
+            "clone_url": "https://github.com/OpenCoven/coven-github.git",
+            "default_branch": "main"
+        },
+        "task": {
+            "kind": "fix_issue",
+            "issue_number": 119,
+            "issue_title": "Review contract",
+            "issue_body": "Tighten the contract."
+        },
+        "familiar": {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": null,
+            "skills": []
+        },
+        "workspace": {
+            "root": "/tmp/coven"
+        }
+    }"#;
+
+    let error = serde_json::from_str::<SessionBrief>(raw).expect_err("v1 brief must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported session brief contract_version 1"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn session_brief_rejects_unknown_fields() {
+    let fixtures = [
+        (
+            "extra_root",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                },
+                "extra_root": true
+            }"#,
+        ),
+        (
+            "extra_repo",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main",
+                    "extra_repo": true
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                }
+            }"#,
+        ),
+        (
+            "extra_task",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract.",
+                    "extra_task": true
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                }
+            }"#,
+        ),
+        (
+            "extra_familiar",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": [],
+                    "extra_familiar": true
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                }
+            }"#,
+        ),
+        (
+            "extra_workspace",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven",
+                    "extra_workspace": true
+                }
+            }"#,
+        ),
+    ];
+
+    for (field, raw) in fixtures {
+        let error = match serde_json::from_str::<SessionBrief>(raw) {
+            Ok(_) => panic!("brief with {field} must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown field"),
+            "unexpected error for {field}: {message}"
+        );
+    }
+}
+
+#[test]
 fn golden_result_deserializes_into_adapter_type() {
     let raw = fixture("result.example.json");
     let result: SessionResult =
@@ -43,6 +336,11 @@ fn golden_result_deserializes_into_adapter_type() {
 
     assert_eq!(result.contract_version, HEADLESS_CONTRACT_VERSION);
     assert_eq!(result.status, SessionStatus::Success);
+    assert_eq!(result.review.mode, ReviewMode::None);
+    assert_eq!(
+        result.review.evidence_status,
+        ReviewEvidenceStatus::NotApplicable
+    );
     assert_eq!(result.branch.as_deref(), Some("cody/fix-issue-42"));
     assert_eq!(result.commits.len(), 1);
     assert_eq!(
@@ -53,9 +351,7 @@ fn golden_result_deserializes_into_adapter_type() {
 }
 
 #[test]
-fn result_without_contract_version_defaults_to_current() {
-    // Backward compatibility: a runtime that predates the version field still
-    // parses, and is treated as the current major version.
+fn result_without_contract_version_is_rejected() {
     let raw = r#"{
         "status": "failure",
         "branch": null,
@@ -63,12 +359,27 @@ fn result_without_contract_version_defaults_to_current() {
         "files_changed": [],
         "summary": "Could not reproduce.",
         "pr_body": "",
+        "review": {
+            "mode": "none",
+            "evidence_status": "not_applicable",
+            "reviewed_files": [],
+            "supporting_files": [],
+            "findings": [],
+            "tests_run": [],
+            "no_findings_reason": null,
+            "limitations": []
+        },
         "exit_reason": "ambiguous_spec"
     }"#;
-    let result: SessionResult = serde_json::from_str(raw).expect("legacy result must parse");
-    assert_eq!(result.contract_version, HEADLESS_CONTRACT_VERSION);
-    assert_eq!(result.status, SessionStatus::Failure);
-    assert_eq!(result.exit_reason, Some(ExitReason::AmbiguousSpec));
+    let error = serde_json::from_str::<SessionResult>(raw)
+        .expect_err("v2 result without contract_version must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing field `contract_version`"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

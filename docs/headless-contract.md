@@ -1,6 +1,6 @@
 # coven-code Headless Execution Contract
 
-**Contract version: `1`** · Status: **Locked** (V1 / M1)
+**Contract version: `2`** - Status: **Locked** (V2 / structured review output)
 
 This document is the single source of truth for the interface between
 `coven-github` (the GitHub ingress adapter) and `coven-code` (the execution
@@ -64,7 +64,7 @@ The adapter is the **producer**; the runtime is the **consumer**. The brief is
 
 ```json
 {
-  "contract_version": "1",
+  "contract_version": "2",
   "trigger": "issue_assigned",
   "repo": {
     "owner": "OpenCoven",
@@ -86,7 +86,9 @@ The adapter is the **producer**; the runtime is the **consumer**. The brief is
   },
   "workspace": {
     "root": "/tmp/task-abc123"
-  }
+  },
+  "review_context": null,
+  "audit_instruction": null
 }
 ```
 
@@ -94,7 +96,7 @@ The adapter is the **producer**; the runtime is the **consumer**. The brief is
 
 | Field | Type | Notes |
 |---|---|---|
-| `contract_version` | string | MUST be `"1"`. Consumers MUST reject a brief whose major version they do not implement. |
+| `contract_version` | string | MUST be `"2"`. Consumers MUST reject a brief whose major version they do not implement. |
 | `trigger` | string enum | `issue_assigned` \| `pr_review_comment` \| `issue_mention`. |
 | `repo.owner` | string | |
 | `repo.name` | string | |
@@ -106,6 +108,8 @@ The adapter is the **producer**; the runtime is the **consumer**. The brief is
 | `familiar.model` | string \| null | BYOM model id; `null`/absent means runtime default. |
 | `familiar.skills` | string[] | Skill ids to load for the session. MAY be empty. |
 | `workspace.root` | string | Absolute path to the pre-cloned, isolated workspace. The runtime operates **inside** this directory and MUST NOT write outside it. |
+| `review_context` | object \| null | Optional tokenless hosted-review evidence supplied by the adapter. `kind: "pull_request"` puts the runtime in PR review mode and carries changed-file metadata. |
+| `audit_instruction` | string \| null | Optional adapter-authored review instruction appended to the review prompt. |
 
 ### 2.2 Task kinds
 
@@ -128,7 +132,7 @@ the file MAY be absent.
 
 ```json
 {
-  "contract_version": "1",
+  "contract_version": "2",
   "status": "success",
   "branch": "cody/fix-issue-42",
   "commits": [
@@ -136,7 +140,17 @@ the file MAY be absent.
   ],
   "files_changed": ["src/auth/refresh.rs"],
   "summary": "Fixed OAuth token refresh by adding a 60-second clock skew buffer.",
-  "pr_body": "## Hey, I'm Cody 🦄\n\nI looked at issue #42…",
+  "pr_body": "## Hey, I'm Cody\n\nI looked at issue #42...",
+  "review": {
+    "mode": "pull_request",
+    "evidence_status": "complete",
+    "reviewed_files": ["src/auth/refresh.rs"],
+    "supporting_files": ["src/auth/mod.rs", "tests/auth_refresh.rs"],
+    "findings": [],
+    "tests_run": [],
+    "no_findings_reason": "Reviewed the supplied PR file and found no blocking issues.",
+    "limitations": []
+  },
   "exit_reason": null
 }
 ```
@@ -145,34 +159,56 @@ the file MAY be absent.
 
 | Field | Type | Notes |
 |---|---|---|
-| `contract_version` | string | MUST be `"1"`. If absent, the consumer assumes `"1"` for backward compatibility, but producers MUST emit it. |
-| `status` | string enum | `success` \| `failure` \| `partial` \| `needs_input`. See [3.2](#32-status). |
+| `contract_version` | string | MUST be `"2"`. Producers MUST emit it. |
+| `status` | string enum | `success` \| `failure` \| `partial` \| `needs_input`. See [3.3](#33-status). |
 | `branch` | string \| null | Branch the runtime pushed. `null` when no branch was created. The adapter only opens a PR when `branch` is set **and** `commits` is non-empty. |
 | `commits` | array | `{ "sha": string, "message": string }`. MAY be empty. |
 | `files_changed` | string[] | Workspace-relative paths. MAY be empty. |
 | `summary` | string | One-line familiar-voice summary. Used in the Check Run and PR title. |
 | `pr_body` | string | Full PR body, **authored by the familiar** in its own voice — not a template. |
-| `exit_reason` | string enum \| null | `null` on success; otherwise the terminal cause. See [3.3](#33-exit_reason). |
+| `review` | object | Structured review evidence and findings. Required even when `mode` is `none`. See [3.2](#32-review). |
+| `exit_reason` | string enum \| null | `null` on success; otherwise the terminal cause. See [3.4](#34-exit_reason). |
 
 > **Drift note (supersedes `COVEN-GITHUB.md`):** the prose result envelope listed
-> an `events` array. Progress/event streaming is **not** part of the v1 result
+> an `events` array. Progress/event streaming is **not** part of the v2 result
 > envelope — it is deferred to M2 and will travel over a separate channel. The
-> v1 envelope carries terminal task state only. Producers MUST NOT rely on
+> v2 envelope carries terminal task state only. Producers MUST NOT rely on
 > `events` being read.
 
-### 3.2 `status`
+### 3.2 `review`
+
+`review` is the machine-readable proof that a hosted review actually examined
+the intended code. It is required on every result. Non-review tasks MUST set
+`mode: "none"` and `evidence_status: "not_applicable"`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `mode` | string enum | `none`, `pull_request`, or `review_comment`. |
+| `evidence_status` | string enum | `not_applicable`, `complete`, `partial`, or `missing`. PR review modes MUST NOT use `not_applicable`. |
+| `reviewed_files` | string[] | Workspace-relative files supplied to or inspected by the runtime. PR review modes MUST include at least one file unless `evidence_status` is `missing`. |
+| `supporting_files` | string[] | Workspace-relative files beyond the changed-file list that the runtime can prove were inspected for context. Empty means no broader-codebase inspection was proven, not that none was needed. |
+| `findings` | array | Structured findings. Empty is allowed. For complete no-finding reviews, `no_findings_reason` SHOULD explain the clean outcome. |
+| `tests_run` | array | Commands run while reviewing, with `passed`, `failed`, `not_run`, or `unknown` status. |
+| `no_findings_reason` | string \| null | File-backed explanation for a clean review. MAY be `null` for degraded/partial output when `evidence_status` and `limitations` explain why a substantive clean-review conclusion was not possible. |
+| `limitations` | string[] | Evidence gaps, skipped checks, or other caveats. |
+
+Each finding carries required `severity`, `file`, `line`, `title`, `body`, and
+`recommendation` fields. `line` and `recommendation` may be `null`. Valid
+severities are `info`, `low`, `medium`, `high`, and `critical`.
+
+### 3.3 `status`
 
 | Value | Meaning |
 |---|---|
 | `success` | Work complete; commits made; ready for a PR. |
-| `partial` | Some progress committed but the task is not fully done (e.g. tests still failing after the retry budget). The adapter still opens a PR if there are commits. |
+| `partial` | Progress or review evidence is incomplete but usable. `exit_reason` MAY be `null` when the result is partial because of review-evidence limitations rather than a terminal error. The adapter still opens a PR if there are commits. |
 | `failure` | The agent gave up; no usable result. |
 | `needs_input` | The agent needs human clarification and has posted (or expects the adapter to surface) a question. Pairs with exit code `3`. |
 
 The adapter treats `success` and `partial` as PR-opening outcomes; `failure`
 and `needs_input` do not open a PR by themselves.
 
-### 3.3 `exit_reason`
+### 3.4 `exit_reason`
 
 `null` on success. Otherwise one of:
 
@@ -211,7 +247,7 @@ A process **killed by signal**, or one that **times out** (the adapter enforces
 
 ## 5. Security invariants
 
-These are non-negotiable for v1:
+These are non-negotiable for v2:
 
 1. The session brief is **tokenless**. Serializing a brief MUST NOT produce an
    `auth` field, a `"token"` field, or a credential-bearing `clone_url`

@@ -191,6 +191,7 @@ mod tests {
                     files_changed: vec![],
                     summary: "Done".to_string(),
                     pr_body: "Body".to_string(),
+                    review: crate::ReviewResult::none(),
                     exit_reason: None,
                 },
                 Some(9),

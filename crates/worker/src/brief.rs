@@ -6,8 +6,18 @@ use std::path::Path;
 use coven_github_api::{Task, TaskKind, HEADLESS_CONTRACT_VERSION};
 use coven_github_config::FamiliarConfig;
 
-fn default_contract_version() -> String {
-    HEADLESS_CONTRACT_VERSION.to_string()
+fn deserialize_contract_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = String::deserialize(deserializer)?;
+    if version != HEADLESS_CONTRACT_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported session brief contract_version {}; expected {}",
+            version, HEADLESS_CONTRACT_VERSION
+        )));
+    }
+    Ok(version)
 }
 
 /// The session-brief.json schema injected into coven-code --headless.
@@ -17,19 +27,25 @@ fn default_contract_version() -> String {
 /// write authority (comments, Check Runs, branches, PRs) stays with the adapter
 /// behind its publication gate. See issue #4.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionBrief {
     /// Contract major version this brief is written against. See
     /// `docs/headless-contract.md`.
-    #[serde(default = "default_contract_version")]
+    #[serde(deserialize_with = "deserialize_contract_version")]
     pub contract_version: String,
     pub trigger: String,
     pub repo: RepoBrief,
     pub task: TaskBrief,
     pub familiar: FamiliarBrief,
     pub workspace: WorkspaceBrief,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_context: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_instruction: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoBrief {
     pub owner: String,
     pub name: String,
@@ -38,7 +54,7 @@ pub struct RepoBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskBrief {
     FixIssue {
         issue_number: u64,
@@ -57,6 +73,7 @@ pub enum TaskBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FamiliarBrief {
     pub id: String,
     pub display_name: String,
@@ -65,6 +82,7 @@ pub struct FamiliarBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBrief {
     pub root: String,
 }
@@ -136,6 +154,8 @@ pub fn build(
         workspace: WorkspaceBrief {
             root: workspace.to_string_lossy().to_string(),
         },
+        review_context: None,
+        audit_instruction: None,
     }
 }
 

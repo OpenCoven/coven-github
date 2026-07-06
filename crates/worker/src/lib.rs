@@ -7,8 +7,8 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use coven_github_api::{
-    check_run, installation, pr, repo, tasks::TaskStore, SessionResult, SessionStatus, Task,
-    TaskKind, DEFAULT_API_BASE_URL,
+    check_run, installation, pr, repo, tasks::TaskStore, ReviewEvidenceStatus, ReviewMode,
+    SessionResult, SessionStatus, Task, TaskKind, DEFAULT_API_BASE_URL,
 };
 use coven_github_config::{Config, FamiliarConfig};
 
@@ -391,7 +391,7 @@ fn disposition(result: &SessionResult) -> Disposition {
 enum Attempt {
     /// The runtime exited 0/1/3 and wrote a parseable `result.json`. Terminal:
     /// the adapter acts on `status`/`exit_reason` and MUST NOT retry.
-    Completed(SessionResult),
+    Completed(Box<SessionResult>),
     /// Exit 2, timeout, kill-by-signal, an unexpected exit code, or a spawn/read
     /// failure. Retry-safe per the contract.
     RetrySafe(anyhow::Error),
@@ -430,7 +430,7 @@ async fn run_session_with_backoff(
     let mut attempts = 0u32;
     loop {
         match run_coven_code(config, brief_path, result_path, git_token).await {
-            Attempt::Completed(result) => return Ok(result),
+            Attempt::Completed(result) => return Ok(*result),
             Attempt::RetrySafe(e) if attempts < max_retries => {
                 attempts += 1;
                 warn!("coven-code attempt {attempts} hit a retry-safe failure ({e:#}), retrying…");
@@ -488,7 +488,7 @@ async fn run_coven_code(
         // exit codes; if it isn't, the runtime misbehaved — fall back to a
         // retry-safe failure rather than silently losing the task.
         Some(code @ (0 | 1 | 3)) => match read_result(result_path).await {
-            Ok(result) => Attempt::Completed(result),
+            Ok(result) => Attempt::Completed(Box::new(result)),
             Err(e) => Attempt::RetrySafe(anyhow::anyhow!(
                 "coven-code exited {code} but result.json was unusable: {e}"
             )),
@@ -506,7 +506,72 @@ async fn read_result(result_path: &Path) -> Result<SessionResult> {
         .await
         .map_err(|_| anyhow::anyhow!("result.json not written by coven-code"))?;
     let result: SessionResult = serde_json::from_slice(&bytes)?;
+    validate_result_contract(&result)?;
     Ok(result)
+}
+
+fn validate_result_contract(result: &SessionResult) -> Result<()> {
+    if result.contract_version != coven_github_api::HEADLESS_CONTRACT_VERSION {
+        anyhow::bail!(
+            "unsupported result contract_version {}; expected {}",
+            result.contract_version,
+            coven_github_api::HEADLESS_CONTRACT_VERSION
+        );
+    }
+    if result.status == SessionStatus::Success && result.exit_reason.is_some() {
+        anyhow::bail!("result exit_reason must be null when status is success");
+    }
+    if matches!(
+        result.status,
+        SessionStatus::Failure | SessionStatus::NeedsInput
+    ) && result.exit_reason.is_none()
+    {
+        anyhow::bail!(
+            "result exit_reason is required when status is {:?}",
+            result.status
+        );
+    }
+    let is_review_mode = matches!(
+        result.review.mode,
+        ReviewMode::PullRequest | ReviewMode::ReviewComment
+    );
+    if is_review_mode {
+        if result.review.evidence_status == ReviewEvidenceStatus::NotApplicable {
+            anyhow::bail!(
+                "review evidence_status not_applicable is invalid for {:?}",
+                result.review.mode
+            );
+        }
+        if result.review.evidence_status != ReviewEvidenceStatus::Missing
+            && result.review.reviewed_files.is_empty()
+        {
+            anyhow::bail!(
+                "reviewed_files is required for review mode {:?}",
+                result.review.mode
+            );
+        }
+        if result.review.evidence_status == ReviewEvidenceStatus::Complete
+            && result.review.findings.is_empty()
+            && result
+                .review
+                .no_findings_reason
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            anyhow::bail!("no_findings_reason is required when complete review findings are empty");
+        }
+    }
+    if result.review.mode == ReviewMode::None
+        && result.review.evidence_status != ReviewEvidenceStatus::NotApplicable
+    {
+        anyhow::bail!(
+            "review evidence_status {:?} is invalid for none mode",
+            result.review.evidence_status
+        );
+    }
+    Ok(())
 }
 
 fn cave_base_url(config: &Config) -> &str {
@@ -623,9 +688,292 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
 }
 
 #[cfg(test)]
+mod result_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn read_result_rejects_unsupported_contract_version() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-version-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"1","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("v1 result must be rejected");
+        assert!(
+            format!("{error:#}").contains("unsupported result contract_version 1"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_missing_contract_version() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-missing-version-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("missing contract_version result must be rejected");
+        assert!(
+            format!("{error:#}").contains("missing field `contract_version`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_success_with_exit_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-success-exit-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":"infra_error"}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("success result must reject non-null exit_reason");
+        assert!(
+            format!("{error:#}").contains("must be null when status is success"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_failure_without_exit_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-failure-exit-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"failure","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("non-success result must require exit_reason");
+        assert!(
+            format!("{error:#}").contains("exit_reason is required"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_unknown_root_field() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-extra-root-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null,"extra_root_field":"rejected"}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("unknown root field must be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `extra_root_field`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_unknown_review_field() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-extra-review-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[],"extra_review_field":"rejected"},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("unknown review field must be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `extra_review_field`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_not_applicable_evidence_for_review_modes() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-review-evidence-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"not_applicable","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":"reviewed supplied file","limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("review result must reject not_applicable evidence");
+        assert!(
+            format!("{error:#}").contains("review evidence_status not_applicable is invalid"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_review_without_reviewed_files() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-review-files-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":[],"supporting_files":[],"findings":[{"severity":"low","file":"src/lib.rs","line":null,"title":"t","body":"b","recommendation":null}],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("review result must reject missing reviewed_files");
+        assert!(
+            format!("{error:#}").contains("reviewed_files is required"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_accepts_review_findings_with_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-findings-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[{"severity":"low","file":"src/lib.rs","line":null,"title":"t","body":"b","recommendation":null}],"tests_run":[],"no_findings_reason":"Also reviewed nearby context and found this issue.","limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let result = read_result(&path)
+            .await
+            .expect("findings with a reason should remain valid");
+        assert_eq!(result.review.findings.len(), 1);
+        assert_eq!(
+            result.review.no_findings_reason.as_deref(),
+            Some("Also reviewed nearby context and found this issue.")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_accepts_partial_review_without_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-review-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"partial","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"partial","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":["Review output was degraded before a clean-review conclusion."]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let result = read_result(&path)
+            .await
+            .expect("partial degraded review result should remain valid");
+        assert_eq!(result.status, SessionStatus::Partial);
+        assert!(result.exit_reason.is_none());
+        assert!(result.review.findings.is_empty());
+        assert!(result.review.no_findings_reason.is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_complete_review_without_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-complete-review-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":"   ","limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("complete empty review result must require a reason");
+        assert!(
+            format!("{error:#}").contains("complete review findings are empty"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_applicable_evidence_for_none_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-none-evidence-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"complete","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("none-mode result must reject applicable evidence");
+        assert!(
+            format!("{error:#}").contains("is invalid for none mode"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
 mod disposition_tests {
     use super::*;
-    use coven_github_api::{CommitInfo, HEADLESS_CONTRACT_VERSION};
+    use coven_github_api::{CommitInfo, ReviewResult, HEADLESS_CONTRACT_VERSION};
     use coven_github_config::{GitHubAppConfig, ServerConfig, WorkerConfig};
     use std::path::PathBuf;
 
@@ -643,6 +991,7 @@ mod disposition_tests {
             files_changed: vec![],
             summary: "summary".to_string(),
             pr_body: "body".to_string(),
+            review: ReviewResult::none(),
             exit_reason: None,
         }
     }
@@ -828,7 +1177,7 @@ mod process_tests {
     /// A minimal contract-valid result.json with the given status/exit_reason.
     fn result_json(status: &str, exit_reason: &str) -> String {
         format!(
-            r#"{{"contract_version":"1","status":"{status}","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","exit_reason":{exit_reason}}}"#
+            r#"{{"contract_version":"2","status":"{status}","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]}},"exit_reason":{exit_reason}}}"#
         )
     }
 
