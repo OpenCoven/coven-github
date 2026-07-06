@@ -87,20 +87,33 @@ pub struct WorkspaceBrief {
     pub root: String,
 }
 
+/// Hosted-review evidence the adapter injects for ReviewPullRequest tasks
+/// (issue #10): the changed-file list plus an optional operator instruction.
+pub struct ReviewContext {
+    pub files: Vec<String>,
+    pub audit_instruction: Option<String>,
+}
+
 /// Build a tokenless session brief from a Task and familiar config.
 ///
 /// `default_branch` is resolved from live GitHub repository metadata rather than
-/// assuming `main` (see issue #9).
+/// assuming `main` (see issue #9). `review` carries hosted-review context for
+/// [`TaskKind::ReviewPullRequest`] tasks and is ignored for other kinds.
 pub fn build(
     task: &Task,
     familiar: &FamiliarConfig,
     workspace: &Path,
     default_branch: &str,
+    review: Option<&ReviewContext>,
 ) -> SessionBrief {
     let trigger = match &task.kind {
         TaskKind::FixIssue { .. } => "issue_assigned",
         TaskKind::AddressReviewComment { .. } => "pr_review_comment",
         TaskKind::RespondToMention { .. } => "issue_mention",
+        // Contract v2 locks the trigger enum to the three values above; the
+        // adapter-initiated review lane rides on pr_review_comment plus
+        // review_context until native pull_request/push triggers land in v3.
+        TaskKind::ReviewPullRequest { .. } => "pr_review_comment",
     };
 
     let task_brief = match &task.kind {
@@ -129,6 +142,20 @@ pub fn build(
             issue_number: *issue_number,
             comment_body: comment_body.clone(),
         },
+        TaskKind::ReviewPullRequest {
+            pr_number,
+            pr_title,
+            reason,
+            ..
+        } => TaskBrief::AddressReviewComment {
+            pr_number: *pr_number,
+            comment_body: format!(
+                "Hosted review requested for PR #{pr_number} (\"{pr_title}\", trigger: {reason}). \
+                 Review the changed files listed in review_context and report findings through \
+                 the structured review evidence. Do not modify code."
+            ),
+            diff_hunk: None,
+        },
     };
 
     SessionBrief {
@@ -154,8 +181,17 @@ pub fn build(
         workspace: WorkspaceBrief {
             root: workspace.to_string_lossy().to_string(),
         },
-        review_context: None,
-        audit_instruction: None,
+        review_context: review.map(|r| {
+            serde_json::json!({
+                "kind": "pull_request",
+                "files": r
+                    .files
+                    .iter()
+                    .map(|f| serde_json::json!({ "filename": f }))
+                    .collect::<Vec<_>>(),
+            })
+        }),
+        audit_instruction: review.and_then(|r| r.audit_instruction.clone()),
     }
 }
 
@@ -190,15 +226,87 @@ mod tests {
         }
     }
 
+    fn review_task() -> Task {
+        Task {
+            id: "task-2".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            familiar_id: "cody".to_string(),
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "Add spell compiler cache".to_string(),
+                head_ref: "feat/spell-cache".to_string(),
+                head_sha: "abc123".to_string(),
+                base_ref: "main".to_string(),
+                reason: "synchronize".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn brief_uses_resolved_default_branch_not_hardcoded_main() {
-        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "develop");
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "develop", None);
         assert_eq!(brief.repo.default_branch, "develop");
     }
 
     #[test]
+    fn review_task_briefs_as_contract_v2_review_comment_with_context() {
+        let review = ReviewContext {
+            files: vec!["src/cache.rs".to_string(), "src/lib.rs".to_string()],
+            audit_instruction: Some("Focus on eviction correctness.".to_string()),
+        };
+        let brief = build(
+            &review_task(),
+            &familiar(),
+            Path::new("/tmp/ws"),
+            "main",
+            Some(&review),
+        );
+
+        // Contract v2 locks trigger/task enums — the review lane must ride on
+        // the sanctioned pr_review_comment + review_context vehicle.
+        assert_eq!(brief.trigger, "pr_review_comment");
+        match &brief.task {
+            TaskBrief::AddressReviewComment {
+                pr_number,
+                comment_body,
+                diff_hunk,
+            } => {
+                assert_eq!(*pr_number, 88);
+                assert!(comment_body.contains("Hosted review requested for PR #88"));
+                assert!(comment_body.contains("synchronize"));
+                assert!(diff_hunk.is_none());
+            }
+            other => panic!("expected AddressReviewComment brief, got {other:?}"),
+        }
+        let ctx = brief
+            .review_context
+            .as_ref()
+            .expect("review context should be set");
+        assert_eq!(ctx["kind"], "pull_request");
+        assert_eq!(ctx["files"][0]["filename"], "src/cache.rs");
+        assert_eq!(ctx["files"][1]["filename"], "src/lib.rs");
+        assert_eq!(
+            brief.audit_instruction.as_deref(),
+            Some("Focus on eviction correctness.")
+        );
+
+        // The no-credential invariant holds for review briefs too (issue #4).
+        let json = serde_json::to_string(&brief).expect("brief should serialize");
+        assert!(!json.contains("\"token\""), "brief leaked a token: {json}");
+    }
+
+    #[test]
+    fn non_review_tasks_carry_no_review_context() {
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None);
+        assert!(brief.review_context.is_none());
+        assert!(brief.audit_instruction.is_none());
+    }
+
+    #[test]
     fn brief_serialization_never_contains_token_or_auth_fields() {
-        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main");
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None);
         let value = serde_json::to_value(&brief).expect("brief should serialize");
         let json = serde_json::to_string(&brief).expect("brief should serialize");
 

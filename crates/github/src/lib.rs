@@ -210,6 +210,18 @@ pub enum TaskKind {
         issue_number: u64,
         comment_body: String,
     },
+    /// Adapter-initiated hosted review of a pull request (issue #10). Carries
+    /// the refs captured at event time; supersession — not ref pinning — keeps
+    /// reviews current when the head moves.
+    ReviewPullRequest {
+        pr_number: u64,
+        pr_title: String,
+        head_ref: String,
+        head_sha: String,
+        base_ref: String,
+        /// The webhook action that triggered the review (opened, synchronize, …).
+        reason: String,
+    },
 }
 
 /// Structured result envelope written by coven-code --headless.

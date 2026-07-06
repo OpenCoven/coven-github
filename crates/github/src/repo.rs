@@ -145,6 +145,41 @@ pub async fn get_pull_request_refs_with_base_url(
     })
 }
 
+/// Lists the changed-file paths of a pull request for hosted-review context
+/// (issue #10). Fetches the first 100 files only; larger PRs surface the gap
+/// through the runtime's review `limitations` evidence.
+pub async fn get_pull_request_files_with_base_url(
+    api_base_url: &str,
+    installation_token: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Result<Vec<String>> {
+    let client = client()?;
+    let response = send_json(
+        &client,
+        api_base_url,
+        installation_token,
+        get_pull_request_files_request(owner, name, pr_number),
+    )
+    .await?;
+    let body: Vec<PullRequestFile> = response.json().await?;
+    Ok(body.into_iter().map(|f| f.filename).collect())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PullRequestFile {
+    filename: String,
+}
+
+fn get_pull_request_files_request(owner: &str, name: &str, pr_number: u64) -> GitHubRequest {
+    GitHubRequest {
+        method: "GET",
+        path: format!("/repos/{owner}/{name}/pulls/{pr_number}/files?per_page=100"),
+        body: serde_json::Value::Null,
+    }
+}
+
 fn get_repo_request(owner: &str, name: &str) -> GitHubRequest {
     GitHubRequest {
         method: "GET",
@@ -193,6 +228,24 @@ mod tests {
         let request = get_pull_request_request("octo", "repo", 7);
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/repos/octo/repo/pulls/7");
+    }
+
+    #[test]
+    fn get_pull_request_files_request_targets_files_endpoint() {
+        let request = get_pull_request_files_request("octo", "repo", 7);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/repos/octo/repo/pulls/7/files?per_page=100");
+    }
+
+    #[test]
+    fn pull_request_file_extracts_filename() {
+        let files: Vec<PullRequestFile> = serde_json::from_value(json!([
+            { "filename": "src/lib.rs", "status": "modified", "additions": 3 },
+            { "filename": "docs/security.md", "status": "added" }
+        ]))
+        .unwrap();
+        let names: Vec<_> = files.into_iter().map(|f| f.filename).collect();
+        assert_eq!(names, vec!["src/lib.rs", "docs/security.md"]);
     }
 
     #[test]

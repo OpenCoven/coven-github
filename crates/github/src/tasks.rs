@@ -35,9 +35,31 @@ pub struct TaskListItem {
 #[derive(Debug, Clone, Default)]
 pub struct TaskStore {
     inner: Arc<RwLock<HashMap<String, TaskListItem>>>,
+    /// Latest auto-review task per "owner/repo#pr". Newer PR events supersede
+    /// queued reviews for the same PR (issue #10): the webhook registers the
+    /// newest task id before enqueueing, and the worker consults this at
+    /// dequeue and silently skips stale entries.
+    review_heads: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl TaskStore {
+    pub async fn register_pr_review(&self, repo: &str, pr_number: u64, task_id: &str) {
+        self.review_heads
+            .write()
+            .await
+            .insert(format!("{repo}#{pr_number}"), task_id.to_string());
+    }
+
+    /// True when `task_id` is still the newest registered review for the PR.
+    /// Unregistered tasks are current by definition (e.g. after a restart).
+    pub async fn is_current_pr_review(&self, repo: &str, pr_number: u64, task_id: &str) -> bool {
+        self.review_heads
+            .read()
+            .await
+            .get(&format!("{repo}#{pr_number}"))
+            .is_none_or(|current| current == task_id)
+    }
+
     pub async fn mark_running(
         &self,
         task: &Task,
@@ -119,6 +141,11 @@ fn task_list_item(task: &Task, familiar_name: &str) -> TaskListItem {
         TaskKind::AddressReviewComment { pr_number, .. } => {
             (*pr_number, format!("Address review on PR #{pr_number}"))
         }
+        TaskKind::ReviewPullRequest {
+            pr_number,
+            pr_title,
+            ..
+        } => (*pr_number, format!("Review PR #{pr_number}: {pr_title}")),
     };
 
     TaskListItem {
@@ -204,6 +231,43 @@ mod tests {
         assert_eq!(
             review[0].pr_url.as_deref(),
             Some("https://github.com/OpenCoven/coven-code/pull/9")
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_pr_review_registration_supersedes_older_tasks() {
+        let store = TaskStore::default();
+
+        // Unregistered tasks are current (e.g. adapter restarted mid-queue).
+        assert!(
+            store
+                .is_current_pr_review("OpenCoven/coven-code", 88, "task-a")
+                .await
+        );
+
+        store
+            .register_pr_review("OpenCoven/coven-code", 88, "task-a")
+            .await;
+        store
+            .register_pr_review("OpenCoven/coven-code", 88, "task-b")
+            .await;
+
+        assert!(
+            !store
+                .is_current_pr_review("OpenCoven/coven-code", 88, "task-a")
+                .await,
+            "older queued review must be superseded"
+        );
+        assert!(
+            store
+                .is_current_pr_review("OpenCoven/coven-code", 88, "task-b")
+                .await
+        );
+        // A different PR in the same repo is unaffected.
+        assert!(
+            store
+                .is_current_pr_review("OpenCoven/coven-code", 89, "task-a")
+                .await
         );
     }
 

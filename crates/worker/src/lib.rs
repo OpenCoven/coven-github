@@ -56,6 +56,19 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         .find(|f| f.id == task.familiar_id)
         .ok_or_else(|| anyhow::anyhow!("unknown familiar: {}", task.familiar_id))?;
 
+    // A newer PR event may have superseded this queued review; skip silently
+    // before spending any GitHub calls on it (issue #10).
+    if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+        let repo = format!("{}/{}", task.repo_owner, task.repo_name);
+        if !task_store
+            .is_current_pr_review(&repo, *pr_number, &task.id)
+            .await
+        {
+            info!(task_id = %task.id, "PR review superseded by a newer event — skipping");
+            return Ok(());
+        }
+    }
+
     info!(task_id = %task.id, familiar = %familiar.id, "starting task");
     let api_base_url = config
         .github
@@ -257,7 +270,34 @@ async fn run_and_publish(
 ) -> Result<Published> {
     // Provision ephemeral workspace and write the tokenless session brief.
     tokio::fs::create_dir_all(workspace).await?;
-    let brief = brief::build(task, familiar, workspace, &targets.default_branch);
+    // Hosted reviews carry tokenless changed-file context so the runtime can
+    // prove coverage (issue #10); other task kinds brief without it.
+    let review = match &task.kind {
+        TaskKind::ReviewPullRequest { pr_number, .. } => {
+            let files = repo::get_pull_request_files_with_base_url(
+                api_base_url,
+                orchestration,
+                &task.repo_owner,
+                &task.repo_name,
+                *pr_number,
+            )
+            .await?;
+            Some(brief::ReviewContext {
+                files,
+                audit_instruction: config
+                    .review
+                    .audit_instruction_for(&format!("{}/{}", task.repo_owner, task.repo_name)),
+            })
+        }
+        _ => None,
+    };
+    let brief = brief::build(
+        task,
+        familiar,
+        workspace,
+        &targets.default_branch,
+        review.as_ref(),
+    );
     let brief_path = workspace.join("session-brief.json");
     let result_path = workspace.join("result.json");
     let brief_json = serde_json::to_string_pretty(&brief)?;
@@ -747,6 +787,11 @@ fn task_title(kind: &TaskKind) -> String {
         TaskKind::RespondToMention { issue_number, .. } => {
             format!("Respond on issue #{issue_number}")
         }
+        TaskKind::ReviewPullRequest {
+            pr_number,
+            pr_title,
+            ..
+        } => format!("Review PR #{pr_number}: {pr_title}"),
     }
 }
 
@@ -768,7 +813,8 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
         .await?;
 
     match &task.kind {
-        TaskKind::AddressReviewComment { pr_number, .. } => {
+        TaskKind::AddressReviewComment { pr_number, .. }
+        | TaskKind::ReviewPullRequest { pr_number, .. } => {
             let refs = repo::get_pull_request_refs_with_base_url(
                 api_base_url,
                 token,
@@ -805,7 +851,9 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
     match kind {
         TaskKind::FixIssue { issue_number, .. } => Some(*issue_number),
         TaskKind::RespondToMention { issue_number, .. } => Some(*issue_number),
-        TaskKind::AddressReviewComment { .. } => None,
+        // PR-scoped tasks post no issue-thread comments; review results travel
+        // via the Check Run (publication gates are issue #11).
+        TaskKind::AddressReviewComment { .. } | TaskKind::ReviewPullRequest { .. } => None,
     }
 }
 
@@ -1642,5 +1690,74 @@ exit 0
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod supersession_tests {
+    use super::*;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::path::PathBuf;
+
+    /// A superseded queued review must return cleanly before any network or
+    /// filesystem work — the config below would fail loudly if touched.
+    #[tokio::test]
+    async fn superseded_pr_review_is_skipped_before_preflight() {
+        let config = Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("/nonexistent/never-read.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: Some("http://127.0.0.1:1".to_string()),
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: PathBuf::from("/nonexistent/coven-code"),
+                workspace_root: PathBuf::from("/nonexistent/workspaces"),
+                timeout_secs: 1,
+                max_retries: 0,
+            },
+            familiars: vec![FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec![],
+            }],
+            review: coven_github_config::ReviewConfig::default(),
+        };
+        let task = Task {
+            id: "task-old".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "t".to_string(),
+                head_ref: "feat/x".to_string(),
+                head_sha: "old".to_string(),
+                base_ref: "main".to_string(),
+                reason: "synchronize".to_string(),
+            },
+        };
+        let task_store = TaskStore::default();
+        task_store
+            .register_pr_review("OpenCoven/demo", 88, "task-newer")
+            .await;
+
+        execute_task(&config, task_store.clone(), task)
+            .await
+            .expect("superseded review should skip cleanly");
+
+        assert!(
+            task_store.list().await.is_empty(),
+            "a skipped review must not surface as a task in Cave"
+        );
     }
 }
