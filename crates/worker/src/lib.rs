@@ -1189,6 +1189,7 @@ mod disposition_tests {
                 max_retries: 1,
             },
             familiars: vec![],
+            review: coven_github_config::ReviewConfig::default(),
         }
     }
 
@@ -1280,6 +1281,7 @@ mod process_tests {
                 skills: vec![],
                 trigger_labels: vec![],
             }],
+            review: coven_github_config::ReviewConfig::default(),
         }
     }
 
@@ -1546,6 +1548,7 @@ exit 0
                 max_retries: 0,
             },
             familiars: vec![familiar.clone()],
+            review: coven_github_config::ReviewConfig::default(),
         };
         let task = Task {
             id: "task-pub".to_string(),

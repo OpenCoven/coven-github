@@ -37,3 +37,14 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # model = "openai/gpt-5.5"
 # skills = ["requesting-code-review"]
 # trigger_labels = ["coven:review"]
+
+# ── Automatic review policy ─────────────────────────────────────────────────
+# Hosted PR review lanes (issue #10). Push/commit review is parsed today and
+# ships with headless contract v3.
+# [review]
+# familiar = "cody"       # Familiar that runs auto-triggered reviews
+# pull_request = true     # Review on opened/synchronize/reopened/ready_for_review
+# include_drafts = false  # Draft PRs are skipped unless explicitly labeled
+# audit_instruction = "Focus on correctness and security."
+# [review.repos."OpenCoven/coven-code"]
+# pull_request = false    # Per-repo override

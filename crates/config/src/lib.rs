@@ -10,6 +10,67 @@ pub struct Config {
     pub github: GitHubAppConfig,
     pub worker: WorkerConfig,
     pub familiars: Vec<FamiliarConfig>,
+    /// Automatic review trigger policy. Absent section = all lanes off.
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+/// Automatic review trigger policy (issue #10). Lanes default to off.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ReviewConfig {
+    /// Familiar id that runs auto-triggered reviews.
+    pub familiar: Option<String>,
+    /// Review PRs on opened / synchronize / reopened / ready_for_review.
+    #[serde(default)]
+    pub pull_request: bool,
+    /// Also auto-review draft PRs. The adapter's own PRs are drafts, so this
+    /// defaults to off; an explicit review label still works on drafts.
+    #[serde(default)]
+    pub include_drafts: bool,
+    /// Adapter-authored instruction forwarded as the brief's audit_instruction.
+    pub audit_instruction: Option<String>,
+    /// Per-repo overrides keyed "owner/name".
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, RepoReviewOverride>,
+}
+
+/// Per-repo override of the global [`ReviewConfig`]; unset fields inherit.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RepoReviewOverride {
+    pub pull_request: Option<bool>,
+    pub include_drafts: Option<bool>,
+    pub familiar: Option<String>,
+    pub audit_instruction: Option<String>,
+}
+
+impl ReviewConfig {
+    fn overrides(&self, repo: &str) -> Option<&RepoReviewOverride> {
+        self.repos.get(repo)
+    }
+
+    pub fn pull_request_enabled(&self, repo: &str) -> bool {
+        self.overrides(repo)
+            .and_then(|o| o.pull_request)
+            .unwrap_or(self.pull_request)
+    }
+
+    pub fn drafts_included(&self, repo: &str) -> bool {
+        self.overrides(repo)
+            .and_then(|o| o.include_drafts)
+            .unwrap_or(self.include_drafts)
+    }
+
+    pub fn reviewer(&self, repo: &str) -> Option<&str> {
+        self.overrides(repo)
+            .and_then(|o| o.familiar.as_deref())
+            .or(self.familiar.as_deref())
+    }
+
+    pub fn audit_instruction_for(&self, repo: &str) -> Option<String> {
+        self.overrides(repo)
+            .and_then(|o| o.audit_instruction.clone())
+            .or_else(|| self.audit_instruction.clone())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -203,6 +264,32 @@ impl Config {
             }
         }
 
+        // ── Review policy ───────────────────────────────────────────────
+        let known_ids: std::collections::HashSet<&str> =
+            self.familiars.iter().map(|f| f.id.as_str()).collect();
+        let mut check_reviewer = |scope: &str, reviewer: Option<&str>| match reviewer {
+            Some(id) if known_ids.contains(id) => {}
+            Some(id) => out.push(Diagnostic::error(
+                "review.familiar",
+                format!("{scope} resolves to '{id}', which matches no configured familiar id."),
+            )),
+            None => out.push(Diagnostic::error(
+                "review.familiar",
+                format!("{scope} is enabled but no reviewer familiar is set."),
+            )),
+        };
+        if self.review.pull_request {
+            check_reviewer("the pull_request review lane", self.review.familiar.as_deref());
+        }
+        for (repo, o) in &self.review.repos {
+            if o.pull_request == Some(true) {
+                check_reviewer(
+                    &format!("the pull_request review override for '{repo}'"),
+                    o.familiar.as_deref().or(self.review.familiar.as_deref()),
+                );
+            }
+        }
+
         out
     }
 }
@@ -279,6 +366,9 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         }
         "familiars[].trigger_labels" => {
             "Add labels such as coven:fix if this familiar should run from labels, or rely on assignment/mentions only."
+        }
+        "review.familiar" => {
+            "Set review.familiar (or the repo override's familiar) to the id of a configured [[familiars]] block."
         }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
@@ -377,6 +467,7 @@ mod tests {
             github,
             worker,
             familiars,
+            review: ReviewConfig::default(),
         }
     }
 
@@ -411,6 +502,83 @@ mod tests {
             .filter(|d| d.is_error())
             .map(|d| d.field.as_str())
             .collect()
+    }
+
+    #[test]
+    fn review_policy_resolves_repo_overrides() {
+        let policy = ReviewConfig {
+            familiar: Some("cody".to_string()),
+            pull_request: true,
+            include_drafts: false,
+            audit_instruction: Some("global".to_string()),
+            repos: std::collections::HashMap::from([(
+                "OpenCoven/quiet".to_string(),
+                RepoReviewOverride {
+                    pull_request: Some(false),
+                    include_drafts: Some(true),
+                    familiar: Some("nova".to_string()),
+                    audit_instruction: None,
+                },
+            )]),
+        };
+
+        assert!(policy.pull_request_enabled("OpenCoven/loud"));
+        assert!(!policy.pull_request_enabled("OpenCoven/quiet"));
+        assert!(!policy.drafts_included("OpenCoven/loud"));
+        assert!(policy.drafts_included("OpenCoven/quiet"));
+        assert_eq!(policy.reviewer("OpenCoven/loud"), Some("cody"));
+        assert_eq!(policy.reviewer("OpenCoven/quiet"), Some("nova"));
+        assert_eq!(
+            policy.audit_instruction_for("OpenCoven/quiet").as_deref(),
+            Some("global")
+        );
+    }
+
+    #[test]
+    fn review_policy_defaults_to_disabled() {
+        let policy = ReviewConfig::default();
+        assert!(!policy.pull_request_enabled("OpenCoven/any"));
+        assert!(policy.reviewer("OpenCoven/any").is_none());
+        assert!(!policy.drafts_included("OpenCoven/any"));
+    }
+
+    #[test]
+    fn doctor_flags_review_enabled_without_known_familiar() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.review.pull_request = true;
+        cfg.review.familiar = Some("ghost".to_string());
+
+        let diags = cfg.check();
+        assert!(
+            errors(&diags).contains(&"review.familiar"),
+            "diags: {diags:?}"
+        );
+
+        // A known familiar id resolves cleanly.
+        cfg.review.familiar = Some("cody".to_string());
+        assert!(errors(&cfg.check()).is_empty());
+
+        // The lane enabled with no reviewer at all is also an error.
+        cfg.review.familiar = None;
+        assert!(errors(&cfg.check()).contains(&"review.familiar"));
     }
 
     #[test]
