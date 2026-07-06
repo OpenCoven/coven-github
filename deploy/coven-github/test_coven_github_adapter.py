@@ -20,7 +20,13 @@ class HostedAdapterTests(unittest.TestCase):
         for text in ("@cody please review", "Please review, @Cody.", "(@cody)"):
             self.assertTrue(adapter.mentioned(text, policy), text)
 
-        for text in ("@codybot please review", "email me at x@cody.example", "prefix@cody"):
+        for text in (
+            "@codybot please review",
+            "@cody_bot please review",
+            "@cody/team please review",
+            "email me at x@cody.example",
+            "prefix@cody",
+        ):
             self.assertFalse(adapter.mentioned(text, policy), text)
 
     def test_prepare_review_context_rejects_stale_pr_head_evidence(self):

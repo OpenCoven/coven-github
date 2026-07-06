@@ -247,7 +247,7 @@ def mentioned(text, policy):
         login = str(username).strip()
         if not login:
             continue
-        pattern = r"(?<![A-Za-z0-9_.+-])@{}(?![A-Za-z0-9-])".format(
+        pattern = r"(?<![A-Za-z0-9_.+-])@{}(?![A-Za-z0-9_/-])".format(
             re.escape(login)
         )
         if re.search(pattern, normalized, flags=re.IGNORECASE):
