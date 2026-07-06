@@ -48,7 +48,7 @@ flowchart LR
 Worker rules:
 
 - Create one workspace per task.
-- Pass only the installation token required for that repository.
+- Pass the agent only a `contents:write` token scoped to that repository; orchestration and publication authority stay in the adapter.
 - Clean up workspaces after task completion or failure.
 - Enforce timeout and retry limits.
 - Persist failure states before cleanup.
@@ -57,13 +57,22 @@ See [Container Isolation](container-isolation.md) for the production isolation t
 
 ## Token Handling
 
-The session brief is **tokenless**: it carries read context only and never embeds an installation token or a credentialed `clone_url`. Git authentication is injected into the `coven-code` child process out-of-band through the `COVEN_GIT_TOKEN` environment variable, which is never written to `session-brief.json` or any durable artifact. GitHub write authority (comments, Check Runs, branches, PRs) stays with the adapter behind its publication gate; the agent emits a result envelope and the adapter publishes. A serialization test fails if the brief ever serializes an `auth`/`token` field or an `x-access-token` clone URL.
+The session brief is **tokenless**: it carries read context only and never embeds an installation token or a credentialed `clone_url`. A serialization test fails if the brief ever serializes an `auth`/`token` field or an `x-access-token` clone URL, and the worker refuses to write a brief containing a live token value.
+
+Per task, the adapter mints **three separately-scoped installation tokens**, each constrained to the single target repository:
+
+| Role | Permissions | Held by | Used for |
+|---|---|---|---|
+| Orchestration | `contents:read`, `checks:write`, `issues:write`, `pull_requests:read` | adapter | ref resolution, Check Run lifecycle, progress and needs-input comments |
+| Agent git | `contents:write` | `coven-code` child (via `COVEN_GIT_TOKEN` env, never JSON) | clone/fetch and pushing the working branch — the contract's only permitted agent-side GitHub write |
+| Publication | `contents:read`, `issues:write`, `pull_requests:write` | adapter, minted **after** the result envelope passes contract validation | opening the draft PR and the PR-opened comment |
+
+Every free-text field of the result envelope is scanned and redacted (live token values, GitHub token patterns, `x-access-token` URLs) before it reaches the task store, comments, PR bodies, or Check Run output. Error strings embedded in published comments and Check Run summaries pass through the same redaction.
 
 Remaining hardening targets:
 
-- Prefer `GIT_ASKPASS` / credential-helper injection over a plain env var so the token never appears in child process listings.
-- Avoid writing installation tokens to durable task stores.
-- Redact tokens in logs, Check Runs, issue comments, PR bodies, and task APIs.
+- Contract v3: move the branch push into the adapter so the agent token can drop to read-only entirely (coordinated with coven-code).
+- Prefer `GIT_ASKPASS` / credential-helper injection over a plain env var (a contract change; the env channel is locked in contract v2).
 - Refresh installation tokens through a single token manager with cache expiry.
 
 ## Tenant Data

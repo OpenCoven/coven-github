@@ -50,6 +50,11 @@ session brief, the result envelope, the clone URL, logs, or any durable
 artifact. The 1-hour token TTL is the adapter's concern; the runtime treats the
 token as opaque and valid for the session.
 
+The adapter scopes this token to `contents: write` on the target repository
+only (issue #4): it carries no issues, pull-request, or checks authority. This
+narrows the credential without changing its shape, channel, or use, so it is a
+non-breaking clarification within contract v2.
+
 > **Drift note (supersedes `COVEN-GITHUB.md`):** earlier spec prose referenced
 > `GIT_ASKPASS` / `GIT_TOKEN` and an `auth.token` field embedded in the brief.
 > Those are **removed**. The brief is tokenless (issue #4) and the only git
