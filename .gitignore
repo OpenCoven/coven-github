@@ -4,3 +4,4 @@ keys/
 *.pem
 .env
 .DS_Store
+.comux*
