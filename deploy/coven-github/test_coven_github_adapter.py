@@ -29,6 +29,29 @@ class HostedAdapterTests(unittest.TestCase):
         ):
             self.assertFalse(adapter.mentioned(text, policy), text)
 
+    def test_route_signed_delivery_returns_500_when_webhook_secret_missing(self):
+        adapter = load_adapter()
+
+        result = adapter.route_signed_delivery(
+            {
+                "X-GitHub-Event": "ping",
+                "X-GitHub-Delivery": "delivery-1",
+                "X-Hub-Signature-256": "sha256=deadbeef",
+            },
+            b"{}",
+            lambda *_args, **_kwargs: None,
+            webhook_secret="",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "status": 500,
+                "error": "GITHUB_WEBHOOK_SECRET is required",
+            },
+        )
+
     def test_prepare_review_context_rejects_stale_pr_head_evidence(self):
         adapter = load_adapter()
 
