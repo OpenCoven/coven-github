@@ -90,6 +90,82 @@ fn hosted_review_session_brief_deserializes_optional_context() {
 }
 
 #[test]
+fn session_brief_without_contract_version_is_rejected() {
+    let raw = r#"{
+        "trigger": "issue_assigned",
+        "repo": {
+            "owner": "OpenCoven",
+            "name": "coven-github",
+            "clone_url": "https://github.com/OpenCoven/coven-github.git",
+            "default_branch": "main"
+        },
+        "task": {
+            "kind": "fix_issue",
+            "issue_number": 119,
+            "issue_title": "Review contract",
+            "issue_body": "Tighten the contract."
+        },
+        "familiar": {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": null,
+            "skills": []
+        },
+        "workspace": {
+            "root": "/tmp/coven"
+        }
+    }"#;
+
+    let error = serde_json::from_str::<SessionBrief>(raw)
+        .expect_err("v2 brief without contract_version must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing field `contract_version`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn session_brief_with_unsupported_contract_version_is_rejected() {
+    let raw = r#"{
+        "contract_version": "1",
+        "trigger": "issue_assigned",
+        "repo": {
+            "owner": "OpenCoven",
+            "name": "coven-github",
+            "clone_url": "https://github.com/OpenCoven/coven-github.git",
+            "default_branch": "main"
+        },
+        "task": {
+            "kind": "fix_issue",
+            "issue_number": 119,
+            "issue_title": "Review contract",
+            "issue_body": "Tighten the contract."
+        },
+        "familiar": {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": null,
+            "skills": []
+        },
+        "workspace": {
+            "root": "/tmp/coven"
+        }
+    }"#;
+
+    let error = serde_json::from_str::<SessionBrief>(raw).expect_err("v1 brief must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported session brief contract_version 1"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn golden_result_deserializes_into_adapter_type() {
     let raw = fixture("result.example.json");
     let result: SessionResult =

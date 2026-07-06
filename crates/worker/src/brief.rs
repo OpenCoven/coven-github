@@ -6,8 +6,18 @@ use std::path::Path;
 use coven_github_api::{Task, TaskKind, HEADLESS_CONTRACT_VERSION};
 use coven_github_config::FamiliarConfig;
 
-fn default_contract_version() -> String {
-    HEADLESS_CONTRACT_VERSION.to_string()
+fn deserialize_contract_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = String::deserialize(deserializer)?;
+    if version != HEADLESS_CONTRACT_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported session brief contract_version {}; expected {}",
+            version, HEADLESS_CONTRACT_VERSION
+        )));
+    }
+    Ok(version)
 }
 
 /// The session-brief.json schema injected into coven-code --headless.
@@ -20,7 +30,7 @@ fn default_contract_version() -> String {
 pub struct SessionBrief {
     /// Contract major version this brief is written against. See
     /// `docs/headless-contract.md`.
-    #[serde(default = "default_contract_version")]
+    #[serde(deserialize_with = "deserialize_contract_version")]
     pub contract_version: String,
     pub trigger: String,
     pub repo: RepoBrief,

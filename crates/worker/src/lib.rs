@@ -518,15 +518,36 @@ fn validate_result_contract(result: &SessionResult) -> Result<()> {
             coven_github_api::HEADLESS_CONTRACT_VERSION
         );
     }
-    if matches!(
+    let is_review_mode = matches!(
         result.review.mode,
         ReviewMode::PullRequest | ReviewMode::ReviewComment
-    ) && result.review.evidence_status == ReviewEvidenceStatus::NotApplicable
-    {
-        anyhow::bail!(
-            "review evidence_status not_applicable is invalid for {:?}",
-            result.review.mode
-        );
+    );
+    if is_review_mode {
+        if result.review.evidence_status == ReviewEvidenceStatus::NotApplicable {
+            anyhow::bail!(
+                "review evidence_status not_applicable is invalid for {:?}",
+                result.review.mode
+            );
+        }
+        if result.review.evidence_status != ReviewEvidenceStatus::Missing
+            && result.review.reviewed_files.is_empty()
+        {
+            anyhow::bail!(
+                "reviewed_files is required for review mode {:?}",
+                result.review.mode
+            );
+        }
+        if result.review.findings.is_empty()
+            && result
+                .review
+                .no_findings_reason
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            anyhow::bail!("no_findings_reason is required when review findings are empty");
+        }
     }
     if result.review.mode == ReviewMode::None
         && result.review.evidence_status != ReviewEvidenceStatus::NotApplicable
@@ -720,6 +741,52 @@ mod result_tests {
             .expect_err("review result must reject not_applicable evidence");
         assert!(
             format!("{error:#}").contains("review evidence_status not_applicable is invalid"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_review_without_reviewed_files() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-review-files-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":[],"supporting_files":[],"findings":[{"severity":"low","file":"src/lib.rs","line":null,"title":"t","body":"b","recommendation":null}],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("review result must reject missing reviewed_files");
+        assert!(
+            format!("{error:#}").contains("reviewed_files is required"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_empty_review_without_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-review-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":"   ","limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("empty review result must require a reason");
+        assert!(
+            format!("{error:#}").contains("no_findings_reason is required"),
             "unexpected error: {error:#}"
         );
 
