@@ -7,3 +7,4 @@ keys/
 deploy/coven-github/.coven-github-private-key.pem
 deploy/coven-github/coven-github-policy.json
 deploy/coven-github/coven-github-state/
+.comux*
