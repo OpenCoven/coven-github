@@ -166,6 +166,169 @@ fn session_brief_with_unsupported_contract_version_is_rejected() {
 }
 
 #[test]
+fn session_brief_rejects_unknown_fields() {
+    let fixtures = [
+        (
+            "extra_root",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                },
+                "extra_root": true
+            }"#,
+        ),
+        (
+            "extra_repo",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main",
+                    "extra_repo": true
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                }
+            }"#,
+        ),
+        (
+            "extra_task",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract.",
+                    "extra_task": true
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                }
+            }"#,
+        ),
+        (
+            "extra_familiar",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": [],
+                    "extra_familiar": true
+                },
+                "workspace": {
+                    "root": "/tmp/coven"
+                }
+            }"#,
+        ),
+        (
+            "extra_workspace",
+            r#"{
+                "contract_version": "2",
+                "trigger": "issue_assigned",
+                "repo": {
+                    "owner": "OpenCoven",
+                    "name": "coven-github",
+                    "clone_url": "https://github.com/OpenCoven/coven-github.git",
+                    "default_branch": "main"
+                },
+                "task": {
+                    "kind": "fix_issue",
+                    "issue_number": 119,
+                    "issue_title": "Review contract",
+                    "issue_body": "Tighten the contract."
+                },
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": null,
+                    "skills": []
+                },
+                "workspace": {
+                    "root": "/tmp/coven",
+                    "extra_workspace": true
+                }
+            }"#,
+        ),
+    ];
+
+    for (field, raw) in fixtures {
+        let error = match serde_json::from_str::<SessionBrief>(raw) {
+            Ok(_) => panic!("brief with {field} must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown field"),
+            "unexpected error for {field}: {message}"
+        );
+    }
+}
+
+#[test]
 fn golden_result_deserializes_into_adapter_type() {
     let raw = fixture("result.example.json");
     let result: SessionResult =

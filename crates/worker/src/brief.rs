@@ -27,6 +27,7 @@ where
 /// write authority (comments, Check Runs, branches, PRs) stays with the adapter
 /// behind its publication gate. See issue #4.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionBrief {
     /// Contract major version this brief is written against. See
     /// `docs/headless-contract.md`.
@@ -44,6 +45,7 @@ pub struct SessionBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoBrief {
     pub owner: String,
     pub name: String,
@@ -52,7 +54,7 @@ pub struct RepoBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskBrief {
     FixIssue {
         issue_number: u64,
@@ -71,6 +73,7 @@ pub enum TaskBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FamiliarBrief {
     pub id: String,
     pub display_name: String,
@@ -79,6 +82,7 @@ pub struct FamiliarBrief {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBrief {
     pub root: String,
 }
