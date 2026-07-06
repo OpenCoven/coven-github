@@ -518,6 +518,15 @@ fn validate_result_contract(result: &SessionResult) -> Result<()> {
             coven_github_api::HEADLESS_CONTRACT_VERSION
         );
     }
+    if result.status == SessionStatus::Success && result.exit_reason.is_some() {
+        anyhow::bail!("result exit_reason must be null when status is success");
+    }
+    if result.status != SessionStatus::Success && result.exit_reason.is_none() {
+        anyhow::bail!(
+            "result exit_reason is required when status is {:?}",
+            result.status
+        );
+    }
     let is_review_mode = matches!(
         result.review.mode,
         ReviewMode::PullRequest | ReviewMode::ReviewComment
@@ -718,6 +727,52 @@ mod result_tests {
             .expect_err("missing contract_version result must be rejected");
         assert!(
             format!("{error:#}").contains("missing field `contract_version`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_success_with_exit_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-success-exit-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":"infra_error"}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("success result must reject non-null exit_reason");
+        assert!(
+            format!("{error:#}").contains("must be null when status is success"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_result_rejects_failure_without_exit_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-failure-exit-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"contract_version":"2","status":"failure","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("non-success result must require exit_reason");
+        assert!(
+            format!("{error:#}").contains("exit_reason is required"),
             "unexpected error: {error:#}"
         );
 

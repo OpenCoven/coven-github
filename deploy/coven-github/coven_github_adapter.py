@@ -643,6 +643,7 @@ def validate_result_contract(result):
         raise ValueError("unsupported result contract_version {}".format(result.get("contract_version")))
     if result.get("status") not in RESULT_STATUSES:
         raise ValueError("unsupported result status {}".format(result.get("status")))
+    status = result.get("status")
     validate_commits(result.get("commits"))
     validate_string_array(result.get("files_changed"), "result.files_changed")
     if not isinstance(result.get("summary"), str):
@@ -659,6 +660,10 @@ def validate_result_contract(result):
         None,
     ):
         raise ValueError("unsupported result exit_reason {}".format(result.get("exit_reason")))
+    if status == "success" and result.get("exit_reason") is not None:
+        raise ValueError("result.exit_reason must be null when status is success")
+    if status != "success" and result.get("exit_reason") is None:
+        raise ValueError("result.exit_reason is required when status is {}".format(status))
 
     review = result.get("review")
     if not isinstance(review, dict):
@@ -687,6 +692,7 @@ def validate_result_contract(result):
     validate_string_array(review.get("supporting_files"), "result.review.supporting_files")
     validate_findings(review.get("findings"))
     validate_tests_run(review.get("tests_run"))
+    require_optional_string(review.get("no_findings_reason"), "result.review.no_findings_reason")
     validate_string_array(review.get("limitations"), "result.review.limitations")
 
     if mode in ("pull_request", "review_comment"):

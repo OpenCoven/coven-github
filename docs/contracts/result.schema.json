@@ -152,5 +152,33 @@
       "type": ["string", "null"],
       "enum": ["test_failure", "ambiguous_spec", "git_conflict", "infra_error", null]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "success" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "exit_reason": { "const": null }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "enum": ["failure", "partial", "needs_input"] } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "exit_reason": {
+            "type": "string",
+            "enum": ["test_failure", "ambiguous_spec", "git_conflict", "infra_error"]
+          }
+        },
+        "required": ["exit_reason"]
+      }
+    }
+  ]
 }
