@@ -114,6 +114,9 @@ pub fn build(
         // adapter-initiated review lane rides on pr_review_comment plus
         // review_context until native pull_request/push triggers land in v3.
         TaskKind::ReviewPullRequest { .. } => "pr_review_comment",
+        // CommandReply is executed adapter-side before briefing (issue #13);
+        // this arm is a safe fallback, not an expected path.
+        TaskKind::CommandReply { .. } => "issue_mention",
     };
 
     let task_brief = match &task.kind {
@@ -141,6 +144,10 @@ pub fn build(
         } => TaskBrief::RespondToMention {
             issue_number: *issue_number,
             comment_body: comment_body.clone(),
+        },
+        TaskKind::CommandReply { issue_number, body } => TaskBrief::RespondToMention {
+            issue_number: *issue_number,
+            comment_body: body.clone(),
         },
         TaskKind::ReviewPullRequest {
             pr_number,
@@ -223,6 +230,7 @@ mod tests {
                 issue_title: "Fix auth".to_string(),
                 issue_body: "Body".to_string(),
             },
+            commander: None,
         }
     }
 
@@ -233,12 +241,10 @@ mod tests {
             repo_owner: "OpenCoven".to_string(),
             repo_name: "coven-code".to_string(),
             familiar_id: "cody".to_string(),
+            commander: None,
             kind: TaskKind::ReviewPullRequest {
                 pr_number: 88,
                 pr_title: "Add spell compiler cache".to_string(),
-                head_ref: "feat/spell-cache".to_string(),
-                head_sha: "abc123".to_string(),
-                base_ref: "main".to_string(),
                 reason: "synchronize".to_string(),
             },
         }

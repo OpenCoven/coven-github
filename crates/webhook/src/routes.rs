@@ -139,6 +139,7 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
+                commander: None,
                 kind: TaskKind::FixIssue {
                     issue_number: e.issue_number,
                     issue_title: e.issue_title,
@@ -160,6 +161,7 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
+                commander: None,
                 kind: TaskKind::FixIssue {
                     issue_number: e.issue_number,
                     issue_title: e.issue_title,
@@ -197,6 +199,7 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
+                commander: None,
                 kind,
             })
         }
@@ -214,6 +217,7 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
+                commander: None,
                 kind: TaskKind::AddressReviewComment {
                     pr_number: e.pr_number,
                     comment_body: e.review_body,
@@ -233,6 +237,7 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
+                commander: None,
                 kind: TaskKind::AddressReviewComment {
                     pr_number: e.pr_number,
                     comment_body: e.comment_body,
@@ -281,12 +286,10 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                 repo_owner: e.repo_owner,
                 repo_name: e.repo_name,
                 familiar_id: familiar.id.clone(),
+                commander: None,
                 kind: TaskKind::ReviewPullRequest {
                     pr_number: e.pr_number,
                     pr_title: e.pr_title,
-                    head_ref: e.head_ref,
-                    head_sha: e.head_sha,
-                    base_ref: e.base_ref,
                     reason: e.action,
                 },
             })
@@ -631,13 +634,9 @@ mod review_lane_tests {
         assert_eq!(task.familiar_id, "cody");
         match task.kind {
             TaskKind::ReviewPullRequest {
-                pr_number,
-                head_sha,
-                reason,
-                ..
+                pr_number, reason, ..
             } => {
                 assert_eq!(pr_number, 88);
-                assert_eq!(head_sha, "abc123");
                 assert_eq!(reason, "opened");
             }
             other => panic!("expected ReviewPullRequest, got {other:?}"),
@@ -653,10 +652,7 @@ mod review_lane_tests {
             .expect("synchronize should create a review task");
 
         match task.kind {
-            TaskKind::ReviewPullRequest {
-                head_sha, reason, ..
-            } => {
-                assert_eq!(head_sha, "f00dface");
+            TaskKind::ReviewPullRequest { reason, .. } => {
                 assert_eq!(reason, "synchronize");
             }
             other => panic!("expected ReviewPullRequest, got {other:?}"),

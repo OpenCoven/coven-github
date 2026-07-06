@@ -792,6 +792,7 @@ fn task_title(kind: &TaskKind) -> String {
             pr_title,
             ..
         } => format!("Review PR #{pr_number}: {pr_title}"),
+        TaskKind::CommandReply { issue_number, .. } => format!("Reply on #{issue_number}"),
     }
 }
 
@@ -829,7 +830,9 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
                 head_sha: refs.head_sha,
             })
         }
-        TaskKind::FixIssue { .. } | TaskKind::RespondToMention { .. } => {
+        TaskKind::FixIssue { .. }
+        | TaskKind::RespondToMention { .. }
+        | TaskKind::CommandReply { .. } => {
             let head_sha = repo::get_branch_sha_with_base_url(
                 api_base_url,
                 token,
@@ -851,6 +854,7 @@ fn task_issue_number(kind: &TaskKind) -> Option<u64> {
     match kind {
         TaskKind::FixIssue { issue_number, .. } => Some(*issue_number),
         TaskKind::RespondToMention { issue_number, .. } => Some(*issue_number),
+        TaskKind::CommandReply { issue_number, .. } => Some(*issue_number),
         // PR-scoped tasks post no issue-thread comments; review results travel
         // via the Check Run (publication gates are issue #11).
         TaskKind::AddressReviewComment { .. } | TaskKind::ReviewPullRequest { .. } => None,
@@ -1604,6 +1608,7 @@ exit 0
             repo_owner: "OpenCoven".to_string(),
             repo_name: "demo".to_string(),
             familiar_id: "cody".to_string(),
+            commander: None,
             kind: TaskKind::FixIssue {
                 issue_number: 42,
                 issue_title: "t".to_string(),
@@ -1737,12 +1742,10 @@ mod supersession_tests {
             repo_owner: "OpenCoven".to_string(),
             repo_name: "demo".to_string(),
             familiar_id: "cody".to_string(),
+            commander: None,
             kind: TaskKind::ReviewPullRequest {
                 pr_number: 88,
                 pr_title: "t".to_string(),
-                head_ref: "feat/x".to_string(),
-                head_sha: "old".to_string(),
-                base_ref: "main".to_string(),
                 reason: "synchronize".to_string(),
             },
         };

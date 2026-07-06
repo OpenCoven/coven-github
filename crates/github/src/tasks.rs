@@ -146,6 +146,9 @@ fn task_list_item(task: &Task, familiar_name: &str) -> TaskListItem {
             pr_title,
             ..
         } => (*pr_number, format!("Review PR #{pr_number}: {pr_title}")),
+        TaskKind::CommandReply { issue_number, .. } => {
+            (*issue_number, format!("Reply on #{issue_number}"))
+        }
     };
 
     TaskListItem {
@@ -185,6 +188,7 @@ mod tests {
                 issue_title: "Fix auth".to_string(),
                 issue_body: "Body".to_string(),
             },
+            commander: None,
         }
     }
 
