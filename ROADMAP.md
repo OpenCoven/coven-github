@@ -77,6 +77,57 @@ Native GitHub "blocked by" relationships gate these issues; the sequencing track
 
 `#2 → #4 → #10 → #13 → #19` — durable queue → auth split → review triggers → command protocol → reference demo.
 
+```mermaid
+flowchart LR
+  classDef spine fill:#b91c1c,color:#fff,stroke:#7f1d1d,stroke-width:2px;
+  classDef gtm   fill:#334155,color:#fff,stroke:#1e293b;
+
+  subgraph W0["Wave 0 · foundation"]
+    I2["#2 Durable queue + idempotency"]
+    I16["#16 Landing + waitlist"]
+    I17["#17 Pricing tiers"]
+  end
+  subgraph W1["Wave 1 · unblocked by #2"]
+    I4["#4 Read/write auth split"]
+    I3["#3 Tenant task-API auth"]
+    I5["#5 Worker isolation"]
+    I8["#8 Check Run head SHA"]
+    I9["#9 Repo default branch"]
+    I11["#11 Structured output + gates"]
+    I14["#14 Branch Gardener"]
+  end
+  subgraph W2["Wave 2"]
+    I10["#10 Review triggers"]
+    I6["#6 Memory governance"]
+    I7["#7 Familiar routing"]
+    I15["#15 Usage metering"]
+    I12["#12 Audit + retention"]
+  end
+  subgraph W3["Wave 3"]
+    I13["#13 Command protocol"]
+    I18["#18 Cave dashboard"]
+  end
+  subgraph W4["Wave 4"]
+    I19["#19 ClawSweeper demo"]
+  end
+
+  I2 --> I3 & I4 & I5 & I8 & I9 & I11 & I14
+  I4 --> I10
+  I3 --> I6 & I7 & I15
+  I5 --> I12
+  I10 --> I13
+  I3 --> I18
+  I12 --> I18
+  I13 --> I19
+  I8 -.feeds.-> I11
+  I9 -.feeds.-> I11
+
+  class I2,I4,I10,I13,I19 spine;
+  class I16,I17 gtm;
+```
+
+Legend: red = critical path `#2 → #4 → #10 → #13 → #19` · slate = GTM (no code dependencies) · dashed = grooming "feeds" (not a native blocked-by edge).
+
 Build waves (topological):
 
 - **Wave 0 — foundation:** #2 unblocks all of M2/M3/M4. #16 and #17 are parallelizable with no code dependencies.
