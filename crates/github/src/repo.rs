@@ -276,3 +276,66 @@ mod tests {
         assert_eq!(body.base.sha, "basesha");
     }
 }
+
+/// Fetches the repository permission level GitHub reports for a user:
+/// `admin`, `write`, `read`, or `none` (`maintain`/`triage` map onto these in
+/// the legacy `permission` field). Used to gate maintainer commands (#13);
+/// only requires the always-granted metadata scope.
+pub async fn get_collaborator_permission_with_base_url(
+    api_base_url: &str,
+    installation_token: &str,
+    owner: &str,
+    name: &str,
+    username: &str,
+) -> Result<String> {
+    let client = client()?;
+    let response = send_json(
+        &client,
+        api_base_url,
+        installation_token,
+        collaborator_permission_request(owner, name, username),
+    )
+    .await?;
+    let body: CollaboratorPermission = response.json().await?;
+    Ok(body.permission)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CollaboratorPermission {
+    permission: String,
+}
+
+fn collaborator_permission_request(owner: &str, name: &str, username: &str) -> GitHubRequest {
+    GitHubRequest {
+        method: "GET",
+        path: format!("/repos/{owner}/{name}/collaborators/{username}/permission"),
+        body: serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn collaborator_permission_request_targets_permission_endpoint() {
+        let request = collaborator_permission_request("octo", "repo", "hexadecimal-cat");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            "/repos/octo/repo/collaborators/hexadecimal-cat/permission"
+        );
+    }
+
+    #[test]
+    fn collaborator_permission_extracts_the_legacy_permission_field() {
+        let body: CollaboratorPermission = serde_json::from_value(json!({
+            "permission": "write",
+            "role_name": "maintain",
+            "user": { "login": "hexadecimal-cat" }
+        }))
+        .unwrap();
+        assert_eq!(body.permission, "write");
+    }
+}
