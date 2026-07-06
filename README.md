@@ -98,8 +98,7 @@ Implemented lanes:
 |---|---|
 | Issue assigned to bot user (`@cody`) | Agent picks up issue, opens PR |
 | `coven:` label applied to issue | Same as above |
-| `@cody` mention in issue comment | Agent responds / iterates |
-| PR review comment `@cody fix:` | Agent addresses review feedback |
+| Maintainer command in a comment (`@cody <command>`) | See the command table below |
 | PR opened / synchronize / reopened / ready_for_review | Automatic hosted review when the `[review]` policy enables the lane (drafts skipped by default; newer pushes supersede queued reviews of the same PR) |
 | Review label applied to a PR | Explicit per-PR review opt-in — works even with the automatic lane off, including drafts |
 
@@ -108,8 +107,31 @@ Planned lanes:
 | Trigger | Status |
 |---|---|
 | Push / commit-range review | `push` events are parsed and typed with fixtures today; execution needs a PR-less task kind, which ships with headless contract v3 |
-| Mention command protocol (re-run, deepen, fix) | Issue #13 |
 | Advisory / blocking publication gates | Issue #11 |
+
+## Maintainer commands
+
+A mention only acts when it is the **first token of the comment**, followed by a
+command verb — `@cody review`, `@cody fix: the lint is failing`. Casual
+mentions mid-sentence trigger nothing, and an unknown verb in command position
+gets a clarification reply instead of launching work. Every command except
+`status` requires **write access** to the repository; the familiar's own
+comments never re-trigger it.
+
+| Command | On an issue | On a PR |
+|---|---|---|
+| `review` | Clarification (needs a PR) | Hosted review of the PR |
+| `fix [text]` | Fix the issue (opens a PR) | Address the feedback in the comment |
+| `deepen` | Clarification | Re-review with a wider lens (supporting files, tests) |
+| `retry` | Re-run the fix lane | Re-run the review |
+| `cancel` | Clarification (PR reviews only) | Cancel queued reviews for the PR (in-flight work finishes) |
+| `remember` / `forget` | Acknowledged; persistence lands with the memory governance contract (#6) | Same |
+| `status` | Current task state for this thread | Same |
+
+Each familiar keeps **one marker-backed status comment per issue/PR**, edited
+in place through the task lifecycle (working → done / needs input / failed),
+with links to the Check Run, PR, and Cave session — repeated runs never stack
+duplicate comments.
 
 ---
 
@@ -122,7 +144,8 @@ Planned lanes:
 | Webhook HMAC validation | Implemented | Rejects unsigned or invalid GitHub webhook payloads. |
 | Issue assignment trigger | Implemented | Routes matching bot assignees to configured familiars. |
 | Label trigger | Implemented | Routes configured `trigger_labels` such as `coven:fix`. |
-| Issue / PR mention trigger | Implemented | Ignores familiar bot self-comments to avoid loops. |
+| Maintainer command protocol | Implemented | Typed `@familiar <verb>` grammar; casual mentions ignored; write-access gate; self-comments never re-trigger. |
+| Marker-backed status comments | Implemented | One edited-in-place status surface per issue/PR; no duplicate bot comments. |
 | PR lifecycle review trigger | Implemented | Policy-gated auto-review on opened/synchronize/reopened/ready_for_review plus label opt-in; familiar-authored PRs are never auto-reviewed. |
 | Push / commit review trigger | Partial | Events parsed and typed with fixtures; execution lane needs headless contract v3. |
 | GitHub App installation tokens | Implemented | Mints installation access tokens from the App private key. |
