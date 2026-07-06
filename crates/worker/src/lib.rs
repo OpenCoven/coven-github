@@ -7,8 +7,9 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use coven_github_api::{
-    check_run, installation, pr, repo, tasks::TaskStore, ReviewEvidenceStatus, ReviewMode,
-    SessionResult, SessionStatus, Task, TaskKind, DEFAULT_API_BASE_URL,
+    check_run, installation, installation::TokenRole, pr, repo, tasks::TaskStore,
+    ReviewEvidenceStatus, ReviewMode, SessionResult, SessionStatus, Task, TaskKind,
+    DEFAULT_API_BASE_URL,
 };
 use coven_github_config::{Config, FamiliarConfig};
 
@@ -68,18 +69,21 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
     // failed so it stays visible in Cave, then propagate.
     let prepared = async {
         let private_key = std::fs::read_to_string(&config.github.private_key_path)?;
-        let token = installation::get_token_with_base_url(
-            api_base_url,
-            config.github.app_id,
-            &private_key,
-            task.installation_id,
-        )
-        .await?;
+        let minter = Minter::App {
+            api_base_url: api_base_url.to_string(),
+            app_id: config.github.app_id,
+            private_key,
+            installation_id: task.installation_id,
+            repo_name: task.repo_name.clone(),
+        };
+        // Adapter-held orchestration authority: resolve refs, drive the Check
+        // Run, post progress comments. The agent never sees this token.
+        let orchestration = minter.mint(TokenRole::Orchestration).await?;
 
         // Resolve target refs and base branch from live GitHub state. Check Runs
         // must attach to an immutable commit SHA, and PRs must target the repo's
         // actual base branch rather than a hardcoded "main".
-        let targets = resolve_targets(api_base_url, &token, &task).await?;
+        let targets = resolve_targets(api_base_url, &orchestration, &task).await?;
 
         // Create Check Run against the resolved head SHA. From this point on the
         // Check Run MUST reach a terminal conclusion on every code path — a flaky
@@ -89,7 +93,7 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         let details_url = cave_session_url(config, &task.id);
         let check_id = check_run::create_with_base_url(
             api_base_url,
-            &token,
+            &orchestration,
             &task.repo_owner,
             &task.repo_name,
             &targets.head_sha,
@@ -97,11 +101,11 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
             Some(details_url.as_str()),
         )
         .await?;
-        Ok::<_, anyhow::Error>((token, targets, check_id))
+        Ok::<_, anyhow::Error>((minter, orchestration, targets, check_id))
     }
     .await;
 
-    let (token, targets, check_id) = match prepared {
+    let (minter, orchestration, targets, check_id) = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
             error!(task_id = %task.id, "pre-flight failed before check run: {e:#}");
@@ -125,7 +129,8 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         config,
         &task,
         familiar,
-        &token,
+        &minter,
+        &orchestration,
         api_base_url,
         &targets,
         &workspace,
@@ -145,7 +150,7 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
                 .await;
             if let Err(e) = check_run::complete_with_base_url(
                 api_base_url,
-                &token,
+                &orchestration,
                 &task.repo_owner,
                 &task.repo_name,
                 check_id,
@@ -163,13 +168,15 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
             task_store.mark_failed(&task.id).await;
             if let Err(ce) = check_run::complete_with_base_url(
                 api_base_url,
-                &token,
+                &orchestration,
                 &task.repo_owner,
                 &task.repo_name,
                 check_id,
                 check_run::CheckConclusion::Failure,
                 "Error",
-                &format!("Task failed: {e}"),
+                // Error chains can embed response bodies; scrub token-shaped
+                // strings before they reach the published Check Run summary.
+                &redact::redact(&format!("Task failed: {e}"), &[&orchestration]),
             )
             .await
             {
@@ -187,6 +194,42 @@ struct Published {
     opened_pr: Option<u64>,
 }
 
+/// Mints repo-scoped installation tokens for one task. Tests substitute
+/// `Fixed` so publication paths run without GitHub App credentials.
+pub(crate) enum Minter {
+    App {
+        api_base_url: String,
+        app_id: u64,
+        private_key: String,
+        installation_id: u64,
+        repo_name: String,
+    },
+}
+
+impl Minter {
+    async fn mint(&self, role: TokenRole) -> Result<String> {
+        match self {
+            Minter::App {
+                api_base_url,
+                app_id,
+                private_key,
+                installation_id,
+                repo_name,
+            } => {
+                installation::get_scoped_token_with_base_url(
+                    api_base_url,
+                    *app_id,
+                    private_key,
+                    *installation_id,
+                    repo_name,
+                    role,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// Provisions the workspace, runs coven-code with the retry policy, and publishes
 /// the outcome (PR + comments). Returns `Err` only for failures that should mark
 /// the task — and complete the Check Run — as failed: workspace/brief I/O errors
@@ -198,7 +241,8 @@ async fn run_and_publish(
     config: &Config,
     task: &Task,
     familiar: &FamiliarConfig,
-    token: &str,
+    minter: &Minter,
+    orchestration: &str,
     api_base_url: &str,
     targets: &ResolvedTargets,
     workspace: &Path,
@@ -209,7 +253,14 @@ async fn run_and_publish(
     let brief = brief::build(task, familiar, workspace, &targets.default_branch);
     let brief_path = workspace.join("session-brief.json");
     let result_path = workspace.join("result.json");
-    tokio::fs::write(&brief_path, serde_json::to_string_pretty(&brief)?).await?;
+    let brief_json = serde_json::to_string_pretty(&brief)?;
+    // Belt-and-braces on top of the serialization guard test: refuse to hand
+    // the agent a brief that somehow embeds a live credential.
+    anyhow::ensure!(
+        !redact::contains_live_token(&brief_json, &[orchestration]),
+        "session brief contained a live token; refusing to write it"
+    );
+    tokio::fs::write(&brief_path, brief_json).await?;
 
     // Best-effort "starting" comment — a flaky comment API call must not abort
     // the task or orphan the Check Run.
@@ -217,7 +268,7 @@ async fn run_and_publish(
         let start_msg = starting_comment(config, familiar, &task.id);
         if let Err(e) = pr::post_comment_with_base_url(
             api_base_url,
-            token,
+            orchestration,
             &task.repo_owner,
             &task.repo_name,
             issue_number,
@@ -232,7 +283,7 @@ async fn run_and_publish(
     // Best-effort progress transition; the check is completed regardless below.
     if let Err(e) = check_run::update_with_base_url(
         api_base_url,
-        token,
+        orchestration,
         &task.repo_owner,
         &task.repo_name,
         check_id,
@@ -245,65 +296,58 @@ async fn run_and_publish(
         warn!(task_id = %task.id, "failed to mark check in progress: {e:#}");
     }
 
+    // The agent's only credential: contents:write on the target repo, minted
+    // immediately before spawn and injected via COVEN_GIT_TOKEN (never JSON).
+    let agent_git = minter.mint(TokenRole::AgentGit).await?;
+
     // Run coven-code. Only retry-safe failures (exit 2, timeout, signal) are
     // retried; exit 1 (gave up) and exit 3 (needs input) are terminal.
-    let result = run_session(
+    let mut result = run_session(
         config,
         &brief_path,
         &result_path,
-        token,
+        &agent_git,
         config.worker.max_retries,
     )
     .await?;
+
+    // Scrub token values and token-shaped strings from the envelope before
+    // anything downstream persists or publishes it (task store, comments,
+    // PR body, Check Run output).
+    redact::sanitize_result(&mut result, &[orchestration, &agent_git]);
 
     // Publish according to the terminal disposition of the result.
     let disp = disposition(&result);
     let mut opened_pr = None;
     if disp.open_pr {
         if let Some(branch) = &result.branch {
-            match pr::open_pull_request_with_base_url(
-                api_base_url,
-                token,
-                &task.repo_owner,
-                &task.repo_name,
-                branch,
-                &targets.base_ref,
-                &pr_title(&result, task),
-                &result.pr_body,
-                true, // draft
-            )
-            .await
-            {
-                Ok(pr_num) => {
-                    opened_pr = Some(pr_num);
-                    if let Some(issue_number) = task_issue_number(&task.kind) {
-                        let msg = pr_opened_comment(config, &task.id, pr_num);
-                        if let Err(e) = pr::post_comment_with_base_url(
-                            api_base_url,
-                            token,
-                            &task.repo_owner,
-                            &task.repo_name,
-                            issue_number,
-                            &msg,
-                        )
-                        .await
-                        {
-                            warn!(task_id = %task.id, "failed to post PR comment: {e:#}");
-                        }
-                    }
+            // Write authority for publication is minted only now — after the
+            // envelope passed contract validation and sanitization (issue #4).
+            match minter.mint(TokenRole::Publication).await {
+                Ok(publication) => {
+                    opened_pr = open_draft_pr(
+                        config,
+                        task,
+                        api_base_url,
+                        &publication,
+                        targets,
+                        &result,
+                        branch,
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    // The branch is already pushed; the PR just didn't open.
-                    // Surface it rather than failing the whole task, so the work
-                    // isn't lost from the user's view.
-                    warn!(task_id = %task.id, "failed to open PR: {e:#}");
+                    warn!(task_id = %task.id, "failed to mint publication token: {e:#}");
                     if let Some(issue_number) = task_issue_number(&task.kind) {
-                        let msg = format!(
-                            "I pushed `{branch}` but could not open the PR automatically: {e}. Open the branch manually or check the App's pull-request permission."
+                        let msg = redact::redact(
+                            &format!(
+                                "I pushed `{branch}` but could not obtain publication credentials to open the PR: {e}"
+                            ),
+                            &[orchestration],
                         );
                         let _ = pr::post_comment_with_base_url(
                             api_base_url,
-                            token,
+                            orchestration,
                             &task.repo_owner,
                             &task.repo_name,
                             issue_number,
@@ -322,7 +366,7 @@ async fn run_and_publish(
             let msg = format!("I need input before I can continue:\n\n{}", result.summary);
             if let Err(e) = pr::post_comment_with_base_url(
                 api_base_url,
-                token,
+                orchestration,
                 &task.repo_owner,
                 &task.repo_name,
                 issue_number,
@@ -336,6 +380,76 @@ async fn run_and_publish(
     }
 
     Ok(Published { result, opened_pr })
+}
+
+/// Opens the draft PR and posts the PR-opened comment with post-validation
+/// publication authority. Best-effort: failures are surfaced on the issue
+/// rather than failing the task, since the branch is already pushed.
+async fn open_draft_pr(
+    config: &Config,
+    task: &Task,
+    api_base_url: &str,
+    publication: &str,
+    targets: &ResolvedTargets,
+    result: &SessionResult,
+    branch: &str,
+) -> Option<u64> {
+    match pr::open_pull_request_with_base_url(
+        api_base_url,
+        publication,
+        &task.repo_owner,
+        &task.repo_name,
+        branch,
+        &targets.base_ref,
+        &pr_title(result, task),
+        &result.pr_body,
+        true, // draft
+    )
+    .await
+    {
+        Ok(pr_num) => {
+            if let Some(issue_number) = task_issue_number(&task.kind) {
+                let msg = pr_opened_comment(config, &task.id, pr_num);
+                if let Err(e) = pr::post_comment_with_base_url(
+                    api_base_url,
+                    publication,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    issue_number,
+                    &msg,
+                )
+                .await
+                {
+                    warn!(task_id = %task.id, "failed to post PR comment: {e:#}");
+                }
+            }
+            Some(pr_num)
+        }
+        Err(e) => {
+            // The branch is already pushed; the PR just didn't open. Surface it
+            // rather than failing the whole task, so the work isn't lost from
+            // the user's view.
+            warn!(task_id = %task.id, "failed to open PR: {e:#}");
+            if let Some(issue_number) = task_issue_number(&task.kind) {
+                let msg = redact::redact(
+                    &format!(
+                        "I pushed `{branch}` but could not open the PR automatically: {e}. Open the branch manually or check the App's pull-request permission."
+                    ),
+                    &[publication],
+                );
+                let _ = pr::post_comment_with_base_url(
+                    api_base_url,
+                    publication,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    issue_number,
+                    &msg,
+                )
+                .await;
+            }
+            None
+        }
+    }
 }
 
 /// Terminal disposition of a completed session, derived purely from the result.
