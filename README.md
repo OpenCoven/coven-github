@@ -90,7 +90,9 @@ For deeper system, sequence, state, security-boundary, and hosted deployment dia
 
 ---
 
-## Triggers (V1)
+## Triggers
+
+Implemented lanes:
 
 | Trigger | Action |
 |---|---|
@@ -98,6 +100,16 @@ For deeper system, sequence, state, security-boundary, and hosted deployment dia
 | `coven:` label applied to issue | Same as above |
 | `@cody` mention in issue comment | Agent responds / iterates |
 | PR review comment `@cody fix:` | Agent addresses review feedback |
+| PR opened / synchronize / reopened / ready_for_review | Automatic hosted review when the `[review]` policy enables the lane (drafts skipped by default; newer pushes supersede queued reviews of the same PR) |
+| Review label applied to a PR | Explicit per-PR review opt-in — works even with the automatic lane off, including drafts |
+
+Planned lanes:
+
+| Trigger | Status |
+|---|---|
+| Push / commit-range review | `push` events are parsed and typed with fixtures today; execution needs a PR-less task kind, which ships with headless contract v3 |
+| Mention command protocol (re-run, deepen, fix) | Issue #13 |
+| Advisory / blocking publication gates | Issue #11 |
 
 ---
 
@@ -111,6 +123,8 @@ For deeper system, sequence, state, security-boundary, and hosted deployment dia
 | Issue assignment trigger | Implemented | Routes matching bot assignees to configured familiars. |
 | Label trigger | Implemented | Routes configured `trigger_labels` such as `coven:fix`. |
 | Issue / PR mention trigger | Implemented | Ignores familiar bot self-comments to avoid loops. |
+| PR lifecycle review trigger | Implemented | Policy-gated auto-review on opened/synchronize/reopened/ready_for_review plus label opt-in; familiar-authored PRs are never auto-reviewed. |
+| Push / commit review trigger | Partial | Events parsed and typed with fixtures; execution lane needs headless contract v3. |
 | GitHub App installation tokens | Implemented | Mints installation access tokens from the App private key. |
 | Check Run creation and completion | Partial | Creates and updates Check Runs against the resolved target head SHA; stale-ref revalidation before publish is still planned. |
 | Headless execution contract | Locked (v1) | Brief, result envelope, exit codes, and git-auth channel are pinned in [`docs/headless-contract.md`](docs/headless-contract.md) with JSON Schemas, golden fixtures, and a conformance test. |
