@@ -6,6 +6,11 @@ The hosted tier should monetize managed reliability and familiar continuity, whi
 
 See [Architecture Diagrams](docs/architecture.md) for the hosted vs self-hosted deployment diagram and trust-boundary map.
 
+The lightweight TypeScript webhook deployment bundle now lives in
+[`OpenCoven/coven-github-webhook`](https://github.com/OpenCoven/coven-github-webhook).
+It uses this repo's GitHub App manifest and headless contract, then maps
+installation/repository IDs to familiar routes through a local JSON policy.
+
 ## Hosted Flow
 
 ```mermaid

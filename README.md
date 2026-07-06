@@ -84,6 +84,7 @@ For deeper system, sequence, state, security-boundary, and hosted deployment dia
 | `crates/worker` | this repo | Task runner: spawns coven-code, streams progress, posts Check Runs |
 | `crates/github` | this repo | GitHub API client: installations, Check Runs, PRs, comments |
 | `crates/config` | this repo | Familiar config, installation registry, model routing |
+| `coven-github-webhook` | [OpenCoven/coven-github-webhook](https://github.com/OpenCoven/coven-github-webhook) | TypeScript deployment bundle for the hosted/self-hostable webhook entrypoint |
 | `coven-code` | [OpenCoven/coven-code](https://github.com/OpenCoven/coven-code) | Execution runtime (headless mode) |
 | `CovenCave` | [OpenCoven/coven-cave](https://github.com/OpenCoven/coven-cave) | Oversight UI |
 
@@ -146,6 +147,11 @@ Prefer containers? A multi-stage [`Dockerfile`](Dockerfile) and
 
 See [docs/self-hosting.md](docs/self-hosting.md) for GitHub App registration, permissions, smoke tests, and troubleshooting. For a minimal familiar route, start from [`examples/familiar-github-starter`](examples/familiar-github-starter/).
 
+For a lightweight TypeScript deployment entrypoint that follows this app
+contract, use
+[`OpenCoven/coven-github-webhook`](https://github.com/OpenCoven/coven-github-webhook)
+with its `config/example-policy.json` and connection guide.
+
 ---
 
 ## Sponsor / Hosted Tier
@@ -159,6 +165,7 @@ See [Hosted OpenCoven](HOSTED.md) and [Hosted vs self-hosted](docs/hosted-vs-sel
 ## Related
 
 - [coven-code](https://github.com/OpenCoven/coven-code) — execution runtime
+- [coven-github-webhook](https://github.com/OpenCoven/coven-github-webhook) — TypeScript webhook deployment bundle
 - [coven-cave](https://github.com/OpenCoven/coven-cave) — oversight UI
 - [cast-codes](https://github.com/OpenCoven/cast-codes) — local IDE with CastAgent
 

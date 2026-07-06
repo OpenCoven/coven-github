@@ -2,6 +2,13 @@
 
 This guide walks you through registering a GitHub App and running `coven-github` on your own infrastructure.
 
+If you want the lightweight TypeScript deployment bundle instead of the Rust
+service entrypoint, use
+[`OpenCoven/coven-github-webhook`](https://github.com/OpenCoven/coven-github-webhook)
+after completing the GitHub App registration steps below. Its connection guide
+uses this repo's manifest and maps installation/repository IDs into
+`config/example-policy.json`.
+
 ## Prerequisites
 
 - Rust toolchain (`rustup`)
