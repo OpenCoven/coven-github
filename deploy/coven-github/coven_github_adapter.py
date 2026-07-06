@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -241,9 +242,15 @@ def delivery_record(delivery_id, event_name, payload):
 
 
 def mentioned(text, policy):
-    normalized = (text or "").lower()
+    normalized = text or ""
     for username in policy.get("bot_usernames") or []:
-        if "@" + username.lower() in normalized:
+        login = str(username).strip()
+        if not login:
+            continue
+        pattern = r"(?<![A-Za-z0-9_.+-])@{}(?![A-Za-z0-9-])".format(
+            re.escape(login)
+        )
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
             return True
     return False
 
@@ -1109,6 +1116,23 @@ def prepare_review_context(task, workspace, token, env, attempt_dir):
         "stdout": "HEAD={}\n{}".format(head["stdout"].strip(), status["stdout"].strip()),
         "stderr": head["stderr"] + status["stderr"],
     }))
+    if head["returncode"] != 0:
+        raise RuntimeError(
+            "failed to read checked-out PR #{} HEAD: {}".format(pr_number, head["stderr"])
+        )
+
+    workspace_head_sha = head["stdout"].strip()
+    metadata_head_sha = str(((pr.get("head") or {}).get("sha")) or "").strip()
+    if not workspace_head_sha:
+        raise RuntimeError("checked-out PR #{} HEAD was empty".format(pr_number))
+    if metadata_head_sha and workspace_head_sha != metadata_head_sha:
+        raise RuntimeError(
+            "checked-out PR #{} HEAD {} does not match GitHub metadata head {}".format(
+                pr_number,
+                workspace_head_sha,
+                metadata_head_sha,
+            )
+        )
 
     return {
         "kind": "pull_request",
@@ -1118,7 +1142,7 @@ def prepare_review_context(task, workspace, token, env, attempt_dir):
         "checkout": {
             "fetch_returncode": fetch["returncode"],
             "checkout_returncode": checkout["returncode"],
-            "workspace_head_sha": head["stdout"].strip(),
+            "workspace_head_sha": workspace_head_sha,
             "workspace_status": status["stdout"].strip(),
         },
     }
