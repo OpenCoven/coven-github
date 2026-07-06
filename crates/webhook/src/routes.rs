@@ -103,6 +103,15 @@ pub async fn handle_webhook(
     // 4. Route event → task.
     if let Some(task) = event_to_task(&state, event) {
         let task_id = task.id.clone();
+        // Register auto-reviews BEFORE enqueueing so the worker can never
+        // dequeue a task that a newer event has already superseded (#10).
+        if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+            let repo = format!("{}/{}", task.repo_owner, task.repo_name);
+            state
+                .task_store
+                .register_pr_review(&repo, *pr_number, &task_id)
+                .await;
+        }
         if state.task_tx.try_send(task).is_err() {
             warn!(task_id, "task queue full — dropping task");
         } else {
@@ -232,8 +241,61 @@ fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
             })
         }
 
-        // Routed through the review policy in the next change (issue #10).
-        GitHubEvent::PullRequestChanged(_) | GitHubEvent::Push(_) => None,
+        GitHubEvent::PullRequestChanged(e) => {
+            // Loop prevention: never auto-review PRs authored by our own
+            // familiars — the adapter's draft PRs would otherwise re-trigger.
+            if state
+                .config
+                .familiars
+                .iter()
+                .any(|f| f.bot_username == e.author_login)
+            {
+                return None;
+            }
+            let repo = format!("{}/{}", e.repo_owner, e.repo_name);
+            let policy = &state.config.review;
+            let familiar = if e.action == "labeled" {
+                // A review label is an explicit per-PR opt-in: it works even
+                // when the automatic lane is off, and on drafts — the same
+                // contract as issue trigger labels.
+                let label = e.label_name.as_deref()?;
+                state
+                    .config
+                    .familiars
+                    .iter()
+                    .find(|f| f.trigger_labels.iter().any(|t| t == label))?
+            } else {
+                if !policy.pull_request_enabled(&repo) {
+                    return None;
+                }
+                if e.draft && !policy.drafts_included(&repo) {
+                    return None;
+                }
+                let reviewer = policy.reviewer(&repo)?;
+                state.config.familiars.iter().find(|f| f.id == reviewer)?
+            };
+
+            Some(Task {
+                id: uuid::Uuid::new_v4().to_string(),
+                installation_id: e.installation_id,
+                repo_owner: e.repo_owner,
+                repo_name: e.repo_name,
+                familiar_id: familiar.id.clone(),
+                kind: TaskKind::ReviewPullRequest {
+                    pr_number: e.pr_number,
+                    pr_title: e.pr_title,
+                    head_ref: e.head_ref,
+                    head_sha: e.head_sha,
+                    base_ref: e.base_ref,
+                    reason: e.action,
+                },
+            })
+        }
+
+        // Push review needs a PR-less task kind — a contract v3 lane. The
+        // event is parsed and typed so fixtures and policy land now; routing
+        // activates with the v3 brief (issue #10).
+        GitHubEvent::Push(_) => None,
 
         // `ping` is acknowledged at the handler; it never produces a task.
         GitHubEvent::Ping | GitHubEvent::Unsupported { .. } => None,
@@ -278,7 +340,11 @@ mod tests {
     use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
     use std::{path::PathBuf, sync::Arc};
 
-    fn app_state() -> AppState {
+    pub(crate) fn app_state() -> AppState {
+        app_state_with_review(coven_github_config::ReviewConfig::default())
+    }
+
+    pub(crate) fn app_state_with_review(review: coven_github_config::ReviewConfig) -> AppState {
         let (task_tx, _task_rx) = tokio::sync::mpsc::channel(1);
         AppState {
             config: Arc::new(Config {
@@ -305,9 +371,9 @@ mod tests {
                     bot_username: "coven-cody[bot]".to_string(),
                     model: None,
                     skills: vec![],
-                    trigger_labels: vec!["coven:fix".to_string()],
+                    trigger_labels: vec!["coven:fix".to_string(), "coven:review".to_string()],
                 }],
-                review: coven_github_config::ReviewConfig::default(),
+                review,
             }),
             task_tx,
             task_store: TaskStore::default(),
@@ -519,5 +585,168 @@ mod tests {
         assert!(!mentions("mail user@coven-cody.example", "coven-cody[bot]"));
         // Mention at end of string still matches.
         assert!(mentions("over to you @coven-cody", "coven-cody[bot]"));
+    }
+}
+
+#[cfg(test)]
+mod review_lane_tests {
+    use super::tests::{app_state, app_state_with_review};
+    use super::*;
+    use coven_github_api::PrChangedEvent;
+    use coven_github_config::ReviewConfig;
+
+    fn review_on() -> ReviewConfig {
+        ReviewConfig {
+            familiar: Some("cody".to_string()),
+            pull_request: true,
+            include_drafts: false,
+            audit_instruction: None,
+            repos: std::collections::HashMap::new(),
+        }
+    }
+
+    fn pr_event(action: &str) -> PrChangedEvent {
+        PrChangedEvent {
+            installation_id: 123,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            pr_number: 88,
+            pr_title: "Add spell compiler cache".to_string(),
+            action: action.to_string(),
+            label_name: None,
+            head_ref: "feat/spell-cache".to_string(),
+            head_sha: "abc123".to_string(),
+            base_ref: "main".to_string(),
+            author_login: "octocat".to_string(),
+            draft: false,
+        }
+    }
+
+    #[test]
+    fn pr_opened_routes_to_review_when_lane_enabled() {
+        let state = app_state_with_review(review_on());
+        let task = event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened")))
+            .expect("enabled lane should create a review task");
+
+        assert_eq!(task.familiar_id, "cody");
+        match task.kind {
+            TaskKind::ReviewPullRequest {
+                pr_number,
+                head_sha,
+                reason,
+                ..
+            } => {
+                assert_eq!(pr_number, 88);
+                assert_eq!(head_sha, "abc123");
+                assert_eq!(reason, "opened");
+            }
+            other => panic!("expected ReviewPullRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_synchronize_carries_event_time_head() {
+        let state = app_state_with_review(review_on());
+        let mut event = pr_event("synchronize");
+        event.head_sha = "f00dface".to_string();
+        let task = event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+            .expect("synchronize should create a review task");
+
+        match task.kind {
+            TaskKind::ReviewPullRequest {
+                head_sha, reason, ..
+            } => {
+                assert_eq!(head_sha, "f00dface");
+                assert_eq!(reason, "synchronize");
+            }
+            other => panic!("expected ReviewPullRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_opened_is_ignored_when_lane_disabled() {
+        let state = app_state();
+        assert!(
+            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).is_none()
+        );
+    }
+
+    #[test]
+    fn familiar_authored_prs_are_never_auto_reviewed() {
+        // The adapter's own draft PRs must not re-trigger reviews (loop guard).
+        let state = app_state_with_review(review_on());
+        let mut event = pr_event("opened");
+        event.author_login = "coven-cody[bot]".to_string();
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).is_none());
+    }
+
+    #[test]
+    fn draft_prs_are_skipped_unless_policy_includes_them() {
+        let state = app_state_with_review(review_on());
+        let mut event = pr_event("opened");
+        event.draft = true;
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event.clone())).is_none());
+
+        let mut inclusive = review_on();
+        inclusive.include_drafts = true;
+        let state = app_state_with_review(inclusive);
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).is_some());
+    }
+
+    #[test]
+    fn per_repo_override_disables_the_lane() {
+        let mut review = review_on();
+        review.repos.insert(
+            "OpenCoven/coven-code".to_string(),
+            coven_github_config::RepoReviewOverride {
+                pull_request: Some(false),
+                include_drafts: None,
+                familiar: None,
+                audit_instruction: None,
+            },
+        );
+        let state = app_state_with_review(review);
+        assert!(
+            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).is_none()
+        );
+    }
+
+    #[test]
+    fn review_label_is_an_explicit_opt_in_even_with_lane_off_and_draft() {
+        // No [review] policy at all — the label alone routes, like issue labels.
+        let state = app_state();
+        let mut event = pr_event("labeled");
+        event.label_name = Some("coven:review".to_string());
+        event.draft = true;
+        let task = event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+            .expect("review label should opt the PR in");
+        assert_eq!(task.familiar_id, "cody");
+        assert!(matches!(task.kind, TaskKind::ReviewPullRequest { .. }));
+    }
+
+    #[test]
+    fn unknown_labels_do_not_trigger_review() {
+        let state = app_state_with_review(review_on());
+        let mut event = pr_event("labeled");
+        event.label_name = Some("help wanted".to_string());
+        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).is_none());
+    }
+
+    #[test]
+    fn push_events_produce_no_task_until_contract_v3() {
+        let state = app_state_with_review(review_on());
+        let event = GitHubEvent::Push(coven_github_api::PushEvent {
+            installation_id: 123,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            branch: Some("main".to_string()),
+            before_sha: "aaa".to_string(),
+            after_sha: "bbb".to_string(),
+            deleted: false,
+            forced: false,
+            pusher_login: "octocat".to_string(),
+            commit_count: 2,
+        });
+        assert!(event_to_task(&state, event).is_none());
     }
 }
