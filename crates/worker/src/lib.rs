@@ -15,6 +15,7 @@ use coven_github_config::{Config, FamiliarConfig};
 
 pub mod brief;
 pub mod redact;
+pub mod status_comment;
 
 /// Base unit for exponential backoff between retry-safe coven-code attempts.
 /// Attempt `n` sleeps `RETRY_BACKOFF_BASE * 2^n` (so 2s, 4s, … in production).
@@ -50,12 +51,6 @@ pub async fn run(
 }
 
 async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Result<()> {
-    let familiar = config
-        .familiars
-        .iter()
-        .find(|f| f.id == task.familiar_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown familiar: {}", task.familiar_id))?;
-
     // A newer PR event may have superseded this queued review; skip silently
     // before spending any GitHub calls on it (issue #10).
     if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
@@ -69,29 +64,97 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         }
     }
 
-    info!(task_id = %task.id, familiar = %familiar.id, "starting task");
+    let api_base_url = config
+        .github
+        .api_base_url
+        .as_deref()
+        .unwrap_or(DEFAULT_API_BASE_URL);
+    let private_key = std::fs::read_to_string(&config.github.private_key_path)?;
+    let minter = Minter::App {
+        api_base_url: api_base_url.to_string(),
+        app_id: config.github.app_id,
+        private_key,
+        installation_id: task.installation_id,
+        repo_name: task.repo_name.clone(),
+    };
+    execute_task_with_minter(config, task_store, task, &minter).await
+}
+
+/// Pre-flight outcome: ready to work, or declined at the permission gate.
+enum Prepared {
+    Ready {
+        orchestration: String,
+        targets: ResolvedTargets,
+        check_id: u64,
+    },
+    Declined {
+        orchestration: String,
+    },
+}
+
+/// Task execution past minter construction; tests inject `Minter::Fixed`.
+async fn execute_task_with_minter(
+    config: &Config,
+    task_store: TaskStore,
+    task: Task,
+    minter: &Minter,
+) -> Result<()> {
+    let familiar = config
+        .familiars
+        .iter()
+        .find(|f| f.id == task.familiar_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown familiar: {}", task.familiar_id))?;
     let api_base_url = config
         .github
         .api_base_url
         .as_deref()
         .unwrap_or(DEFAULT_API_BASE_URL);
 
+    // Command replies are adapter-only (issue #13): update the status surface
+    // and stop — no coven-code session, no Check Run, no task-store entry.
+    if let TaskKind::CommandReply { issue_number, body } = &task.kind {
+        let orchestration = minter.mint(TokenRole::Orchestration).await?;
+        let marker =
+            status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, *issue_number);
+        status_comment::upsert(
+            api_base_url,
+            &orchestration,
+            &task.repo_owner,
+            &task.repo_name,
+            *issue_number,
+            &marker,
+            body,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    info!(task_id = %task.id, familiar = %familiar.id, "starting task");
+
     // Pre-flight: installation token, ref resolution, and Check Run creation.
     // These run *before* the Check Run exists, so a failure here can't orphan a
     // check — but it would otherwise make the task vanish silently. Record it as
     // failed so it stays visible in Cave, then propagate.
     let prepared = async {
-        let private_key = std::fs::read_to_string(&config.github.private_key_path)?;
-        let minter = Minter::App {
-            api_base_url: api_base_url.to_string(),
-            app_id: config.github.app_id,
-            private_key,
-            installation_id: task.installation_id,
-            repo_name: task.repo_name.clone(),
-        };
         // Adapter-held orchestration authority: resolve refs, drive the Check
         // Run, post progress comments. The agent never sees this token.
         let orchestration = minter.mint(TokenRole::Orchestration).await?;
+
+        // Maintainer permission gate (issue #13): command-initiated work needs
+        // write access on the repo before the adapter spends anything on it.
+        if let Some(commander) = &task.commander {
+            let permission = repo::get_collaborator_permission_with_base_url(
+                api_base_url,
+                &orchestration,
+                &task.repo_owner,
+                &task.repo_name,
+                commander,
+            )
+            .await?;
+            if !matches!(permission.as_str(), "admin" | "maintain" | "write") {
+                return Ok(Prepared::Declined { orchestration });
+            }
+        }
 
         // Resolve target refs and base branch from live GitHub state. Check Runs
         // must attach to an immutable commit SHA, and PRs must target the repo's
@@ -114,12 +177,50 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
             Some(details_url.as_str()),
         )
         .await?;
-        Ok::<_, anyhow::Error>((minter, orchestration, targets, check_id))
+        Ok::<_, anyhow::Error>(Prepared::Ready {
+            orchestration,
+            targets,
+            check_id,
+        })
     }
     .await;
 
-    let (minter, orchestration, targets, check_id) = match prepared {
-        Ok(prepared) => prepared,
+    let (orchestration, targets, check_id) = match prepared {
+        Ok(Prepared::Ready {
+            orchestration,
+            targets,
+            check_id,
+        }) => (orchestration, targets, check_id),
+        Ok(Prepared::Declined { orchestration }) => {
+            // Below-write commander: decline on the status surface, do no work.
+            info!(task_id = %task.id, "declining command from a commander without write access");
+            if let Some(number) = surface_number(&task.kind) {
+                let marker = status_comment::marker(
+                    &familiar.id,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                );
+                let body = format!(
+                    "Status: declined\n\nMaintainer commands need write access to {}/{}.",
+                    task.repo_owner, task.repo_name
+                );
+                if let Err(e) = status_comment::upsert(
+                    api_base_url,
+                    &orchestration,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                    &marker,
+                    &body,
+                )
+                .await
+                {
+                    warn!(task_id = %task.id, "failed to post decline: {e:#}");
+                }
+            }
+            return Ok(());
+        }
         Err(e) => {
             error!(task_id = %task.id, "pre-flight failed before check run: {e:#}");
             task_store
@@ -142,7 +243,7 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         config,
         &task,
         familiar,
-        &minter,
+        minter,
         &orchestration,
         api_base_url,
         &targets,
@@ -161,6 +262,30 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
             task_store
                 .mark_complete(&task.id, &repo, &published.result, published.opened_pr)
                 .await;
+            // Terminal state on the marker-backed status surface (issue #13).
+            if let Some(number) = surface_number(&task.kind) {
+                let marker = status_comment::marker(
+                    &familiar.id,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                );
+                let body =
+                    final_status_body(config, &task.id, &published.result, published.opened_pr);
+                if let Err(e) = status_comment::upsert(
+                    api_base_url,
+                    &orchestration,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                    &marker,
+                    &body,
+                )
+                .await
+                {
+                    warn!(task_id = %task.id, "failed to upsert final status: {e:#}");
+                }
+            }
             if let Err(e) = check_run::complete_with_base_url(
                 api_base_url,
                 &orchestration,
@@ -179,6 +304,31 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         Err(e) => {
             error!(task_id = %task.id, "session failed: {e:#}");
             task_store.mark_failed(&task.id).await;
+            if let Some(number) = surface_number(&task.kind) {
+                let marker = status_comment::marker(
+                    &familiar.id,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                );
+                let body = redact::redact(
+                    &format!("Status: failed\n\nTask failed: {e}"),
+                    &[&orchestration],
+                );
+                if let Err(ce) = status_comment::upsert(
+                    api_base_url,
+                    &orchestration,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                    &marker,
+                    &body,
+                )
+                .await
+                {
+                    warn!(task_id = %task.id, "failed to upsert failure status: {ce:#}");
+                }
+            }
             if let Err(ce) = check_run::complete_with_base_url(
                 api_base_url,
                 &orchestration,
@@ -273,7 +423,9 @@ async fn run_and_publish(
     // Hosted reviews carry tokenless changed-file context so the runtime can
     // prove coverage (issue #10); other task kinds brief without it.
     let review = match &task.kind {
-        TaskKind::ReviewPullRequest { pr_number, .. } => {
+        TaskKind::ReviewPullRequest {
+            pr_number, reason, ..
+        } => {
             let files = repo::get_pull_request_files_with_base_url(
                 api_base_url,
                 orchestration,
@@ -282,11 +434,21 @@ async fn run_and_publish(
                 *pr_number,
             )
             .await?;
+            let mut audit = config
+                .review
+                .audit_instruction_for(&format!("{}/{}", task.repo_owner, task.repo_name));
+            // A `deepen` command widens the lens beyond the changed set.
+            if reason == "command:deepen" {
+                let depth = "Perform a deep review: inspect supporting files beyond the \
+                             changed set and verify behavior with tests where possible.";
+                audit = Some(match audit {
+                    Some(existing) => format!("{existing}\n\n{depth}"),
+                    None => depth.to_string(),
+                });
+            }
             Some(brief::ReviewContext {
                 files,
-                audit_instruction: config
-                    .review
-                    .audit_instruction_for(&format!("{}/{}", task.repo_owner, task.repo_name)),
+                audit_instruction: audit,
             })
         }
         _ => None,
@@ -309,21 +471,25 @@ async fn run_and_publish(
     );
     tokio::fs::write(&brief_path, brief_json).await?;
 
-    // Best-effort "starting" comment — a flaky comment API call must not abort
-    // the task or orphan the Check Run.
-    if let Some(issue_number) = task_issue_number(&task.kind) {
+    // Best-effort status surface (issue #13): one marker-backed comment per
+    // target, edited in place — a flaky comment API call must not abort the
+    // task or orphan the Check Run.
+    if let Some(number) = surface_number(&task.kind) {
+        let marker =
+            status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
         let start_msg = starting_comment(config, familiar, &task.id);
-        if let Err(e) = pr::post_comment_with_base_url(
+        if let Err(e) = status_comment::upsert(
             api_base_url,
             orchestration,
             &task.repo_owner,
             &task.repo_name,
-            issue_number,
+            number,
+            &marker,
             &start_msg,
         )
         .await
         {
-            warn!(task_id = %task.id, "failed to post starting comment: {e:#}");
+            warn!(task_id = %task.id, "failed to upsert status comment: {e:#}");
         }
     }
 
@@ -373,8 +539,8 @@ async fn run_and_publish(
             match minter.mint(TokenRole::Publication).await {
                 Ok(publication) => {
                     opened_pr = open_draft_pr(
-                        config,
                         task,
+                        familiar,
                         api_base_url,
                         &publication,
                         targets,
@@ -385,19 +551,26 @@ async fn run_and_publish(
                 }
                 Err(e) => {
                     warn!(task_id = %task.id, "failed to mint publication token: {e:#}");
-                    if let Some(issue_number) = task_issue_number(&task.kind) {
+                    if let Some(number) = surface_number(&task.kind) {
+                        let marker = status_comment::marker(
+                            &familiar.id,
+                            &task.repo_owner,
+                            &task.repo_name,
+                            number,
+                        );
                         let msg = redact::redact(
                             &format!(
-                                "I pushed `{branch}` but could not obtain publication credentials to open the PR: {e}"
+                                "Status: failed\n\nI pushed `{branch}` but could not obtain publication credentials to open the PR: {e}"
                             ),
                             &[orchestration],
                         );
-                        let _ = pr::post_comment_with_base_url(
+                        let _ = status_comment::upsert(
                             api_base_url,
                             orchestration,
                             &task.repo_owner,
                             &task.repo_name,
-                            issue_number,
+                            number,
+                            &marker,
                             &msg,
                         )
                         .await;
@@ -407,24 +580,8 @@ async fn run_and_publish(
         }
     }
 
-    // Needs-input: surface the familiar's clarifying question on the issue/PR.
-    if result.status == SessionStatus::NeedsInput {
-        if let Some(issue_number) = task_issue_number(&task.kind) {
-            let msg = format!("I need input before I can continue:\n\n{}", result.summary);
-            if let Err(e) = pr::post_comment_with_base_url(
-                api_base_url,
-                orchestration,
-                &task.repo_owner,
-                &task.repo_name,
-                issue_number,
-                &msg,
-            )
-            .await
-            {
-                warn!(task_id = %task.id, "failed to post clarifying comment: {e:#}");
-            }
-        }
-    }
+    // Terminal state (done / needs input / failed) lands on the status surface
+    // from execute_task's outcome handling.
 
     Ok(Published { result, opened_pr })
 }
@@ -433,8 +590,8 @@ async fn run_and_publish(
 /// publication authority. Best-effort: failures are surfaced on the issue
 /// rather than failing the task, since the branch is already pushed.
 async fn open_draft_pr(
-    config: &Config,
     task: &Task,
+    familiar: &FamiliarConfig,
     api_base_url: &str,
     publication: &str,
     targets: &ResolvedTargets,
@@ -454,42 +611,33 @@ async fn open_draft_pr(
     )
     .await
     {
-        Ok(pr_num) => {
-            if let Some(issue_number) = task_issue_number(&task.kind) {
-                let msg = pr_opened_comment(config, &task.id, pr_num);
-                if let Err(e) = pr::post_comment_with_base_url(
-                    api_base_url,
-                    publication,
-                    &task.repo_owner,
-                    &task.repo_name,
-                    issue_number,
-                    &msg,
-                )
-                .await
-                {
-                    warn!(task_id = %task.id, "failed to post PR comment: {e:#}");
-                }
-            }
-            Some(pr_num)
-        }
+        // The final status upsert in execute_task announces the opened PR.
+        Ok(pr_num) => Some(pr_num),
         Err(e) => {
             // The branch is already pushed; the PR just didn't open. Surface it
             // rather than failing the whole task, so the work isn't lost from
             // the user's view.
             warn!(task_id = %task.id, "failed to open PR: {e:#}");
-            if let Some(issue_number) = task_issue_number(&task.kind) {
+            if let Some(number) = surface_number(&task.kind) {
+                let marker = status_comment::marker(
+                    &familiar.id,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                );
                 let msg = redact::redact(
                     &format!(
-                        "I pushed `{branch}` but could not open the PR automatically: {e}. Open the branch manually or check the App's pull-request permission."
+                        "Status: failed\n\nI pushed `{branch}` but could not open the PR automatically: {e}. Open the branch manually or check the App's pull-request permission."
                     ),
                     &[publication],
                 );
-                let _ = pr::post_comment_with_base_url(
+                let _ = status_comment::upsert(
                     api_base_url,
                     publication,
                     &task.repo_owner,
                     &task.repo_name,
-                    issue_number,
+                    number,
+                    &marker,
                     &msg,
                 )
                 .await;
@@ -759,18 +907,41 @@ fn starting_comment(config: &Config, familiar: &FamiliarConfig, task_id: &str) -
     )
 }
 
-fn pr_opened_comment(config: &Config, task_id: &str, pr_number: u64) -> String {
-    format!(
-        "PR #{pr_number} opened.\n\nSession: {}",
-        cave_session_url(config, task_id)
-    )
+/// Terminal body for the marker-backed status surface.
+fn final_status_body(
+    config: &Config,
+    task_id: &str,
+    result: &SessionResult,
+    opened_pr: Option<u64>,
+) -> String {
+    let session = cave_session_url(config, task_id);
+    match result.status {
+        SessionStatus::NeedsInput => format!(
+            "Status: needs input\n\n{}\n\nReply on this thread to continue. Session: {session}",
+            result.summary
+        ),
+        SessionStatus::Failure => format!(
+            "Status: failed\n\n{}\n\nSession: {session}",
+            result.summary
+        ),
+        SessionStatus::Success | SessionStatus::Partial => match opened_pr {
+            Some(pr_number) => format!(
+                "Status: done\n\n{}\n\nPR #{pr_number} opened. Session: {session}",
+                result.summary
+            ),
+            None => format!(
+                "Status: done\n\n{}\n\nSession: {session}",
+                result.summary
+            ),
+        },
+    }
 }
 
 fn pr_title(result: &SessionResult, task: &Task) -> String {
     format!(
         "{} (#{} via Coven)",
         result.summary,
-        task_issue_number(&task.kind).unwrap_or(0)
+        surface_number(&task.kind).unwrap_or(0)
     )
 }
 
@@ -850,14 +1021,15 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
     }
 }
 
-fn task_issue_number(kind: &TaskKind) -> Option<u64> {
+/// The issue/PR conversation number a task's status surface lives on. PR
+/// conversation comments ride the issues API, so PR numbers work directly.
+fn surface_number(kind: &TaskKind) -> Option<u64> {
     match kind {
-        TaskKind::FixIssue { issue_number, .. } => Some(*issue_number),
-        TaskKind::RespondToMention { issue_number, .. } => Some(*issue_number),
-        TaskKind::CommandReply { issue_number, .. } => Some(*issue_number),
-        // PR-scoped tasks post no issue-thread comments; review results travel
-        // via the Check Run (publication gates are issue #11).
-        TaskKind::AddressReviewComment { .. } | TaskKind::ReviewPullRequest { .. } => None,
+        TaskKind::FixIssue { issue_number, .. }
+        | TaskKind::RespondToMention { issue_number, .. }
+        | TaskKind::CommandReply { issue_number, .. } => Some(*issue_number),
+        TaskKind::AddressReviewComment { pr_number, .. }
+        | TaskKind::ReviewPullRequest { pr_number, .. } => Some(*pr_number),
     }
 }
 
@@ -1283,13 +1455,31 @@ mod disposition_tests {
             "starting comment should be calm operator copy, not decorative chrome: {started}"
         );
 
-        let opened = pr_opened_comment(&config, "task-42", 17);
-        assert!(opened.contains("PR #17 opened"));
-        assert!(opened.contains("https://cave.example.test/sessions/task-42"));
+        let result = SessionResult {
+            contract_version: HEADLESS_CONTRACT_VERSION.to_string(),
+            status: SessionStatus::Success,
+            branch: Some("cody/fix".to_string()),
+            commits: vec![],
+            files_changed: vec![],
+            summary: "Fixed the auth refresh.".to_string(),
+            pr_body: "body".to_string(),
+            review: ReviewResult::none(),
+            exit_reason: None,
+        };
+        let done = final_status_body(&config, "task-42", &result, Some(17));
+        assert!(done.starts_with("Status: done"));
+        assert!(done.contains("PR #17 opened"));
+        assert!(done.contains("https://cave.example.test/sessions/task-42"));
         assert!(
-            !opened.contains('✅') && !opened.contains('→'),
-            "PR comment should stay concise and actionable: {opened}"
+            !done.contains('✅') && !done.contains('→'),
+            "status body should stay concise and actionable: {done}"
         );
+
+        let mut needs_input = result.clone();
+        needs_input.status = SessionStatus::NeedsInput;
+        let waiting = final_status_body(&config, "task-42", &needs_input, None);
+        assert!(waiting.starts_with("Status: needs input"));
+        assert!(waiting.contains("Reply on this thread"));
     }
 }
 
@@ -1538,6 +1728,11 @@ mod publication_tests {
     #[tokio::test]
     async fn publication_uses_post_validation_token_and_leaks_nothing() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/repos/OpenCoven/demo/issues/42/comments"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
@@ -1685,13 +1880,11 @@ exit 0
             auth_of("/repos/OpenCoven/demo/check-runs/7", "PATCH"),
             vec![format!("Bearer {ORCHESTRATION}")]
         );
-        // Starting comment (orchestration), then PR-opened comment (publication).
+        // One marker-backed status comment, posted with orchestration authority;
+        // the terminal status edit happens in execute_task, not here.
         assert_eq!(
             auth_of("/repos/OpenCoven/demo/issues/42/comments", "POST"),
-            vec![
-                format!("Bearer {ORCHESTRATION}"),
-                format!("Bearer {PUBLICATION}"),
-            ]
+            vec![format!("Bearer {ORCHESTRATION}")]
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1761,6 +1954,218 @@ mod supersession_tests {
         assert!(
             task_store.list().await.is_empty(),
             "a skipped review must not surface as a task in Cave"
+        );
+    }
+}
+
+#[cfg(test)]
+mod command_and_marker_tests {
+    use super::*;
+    use coven_github_api::installation::TokenRole;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORCHESTRATION: &str = "ghs_orchestration0000000000000000000000";
+
+    fn fixed_minter() -> Minter {
+        Minter::Fixed(HashMap::from([(
+            TokenRole::Orchestration,
+            ORCHESTRATION.to_string(),
+        )]))
+    }
+
+    fn config(api_base_url: String) -> Config {
+        Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("/nonexistent/never-read.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: Some(api_base_url),
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                // Would fail loudly if any of these paths spawned a session.
+                coven_code_bin: PathBuf::from("/nonexistent/coven-code"),
+                workspace_root: PathBuf::from("/nonexistent/workspaces"),
+                timeout_secs: 1,
+                max_retries: 0,
+            },
+            familiars: vec![FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec![],
+            }],
+            review: coven_github_config::ReviewConfig::default(),
+        }
+    }
+
+    fn task(kind: TaskKind, commander: Option<&str>) -> Task {
+        Task {
+            id: "task-cmd".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: commander.map(str::to_string),
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn command_reply_upserts_without_spawning_coven_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        execute_task_with_minter(
+            &config(server.uri()),
+            TaskStore::default(),
+            task(
+                TaskKind::CommandReply {
+                    issue_number: 42,
+                    body: "Tasks for OpenCoven/demo#42: none".to_string(),
+                },
+                None,
+            ),
+            &fixed_minter(),
+        )
+        .await
+        .expect("command reply should post cleanly");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("reply should be posted");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(
+            body.contains("<!-- coven:cody:OpenCoven/demo#42 -->"),
+            "reply must carry the marker: {body}"
+        );
+        assert!(body.contains("Tasks for OpenCoven/demo#42"));
+        // No Check Run, no session, no other GitHub calls.
+        assert_eq!(requests.len(), 2, "GET comments + POST comment only");
+    }
+
+    #[tokio::test]
+    async fn existing_marker_comment_is_edited_in_place() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "id": 5, "body": "unrelated first comment", "user": { "login": "octocat" } },
+                { "id": 7, "body": "<!-- coven:cody:OpenCoven/demo#42 -->\nStatus: working", "user": { "login": "coven-cody[bot]" } }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/OpenCoven/demo/issues/comments/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        execute_task_with_minter(
+            &config(server.uri()),
+            TaskStore::default(),
+            task(
+                TaskKind::CommandReply {
+                    issue_number: 42,
+                    body: "Status: done".to_string(),
+                },
+                None,
+            ),
+            &fixed_minter(),
+        )
+        .await
+        .expect("upsert should edit in place");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let patch = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .expect("existing marker comment must be edited, not duplicated");
+        let body = String::from_utf8_lossy(&patch.body);
+        assert!(body.contains("Status: done"));
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "POST"),
+            "no duplicate comment may be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn below_write_commander_is_declined_before_any_work() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/collaborators/drive-by/permission"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"permission": "read"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let store = TaskStore::default();
+        execute_task_with_minter(
+            &config(server.uri()),
+            store.clone(),
+            task(
+                TaskKind::FixIssue {
+                    issue_number: 42,
+                    issue_title: "t".to_string(),
+                    issue_body: "b".to_string(),
+                },
+                Some("drive-by"),
+            ),
+            &fixed_minter(),
+        )
+        .await
+        .expect("a declined command is not an error");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("check-runs")),
+            "no Check Run may be created for a declined command"
+        );
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("decline should land on the status surface");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(
+            body.contains("Status: declined"),
+            "decline body: {body}"
+        );
+        assert!(
+            store.list().await.is_empty(),
+            "declined commands must not surface as tasks"
         );
     }
 }
