@@ -391,7 +391,7 @@ fn disposition(result: &SessionResult) -> Disposition {
 enum Attempt {
     /// The runtime exited 0/1/3 and wrote a parseable `result.json`. Terminal:
     /// the adapter acts on `status`/`exit_reason` and MUST NOT retry.
-    Completed(SessionResult),
+    Completed(Box<SessionResult>),
     /// Exit 2, timeout, kill-by-signal, an unexpected exit code, or a spawn/read
     /// failure. Retry-safe per the contract.
     RetrySafe(anyhow::Error),
@@ -430,7 +430,7 @@ async fn run_session_with_backoff(
     let mut attempts = 0u32;
     loop {
         match run_coven_code(config, brief_path, result_path, git_token).await {
-            Attempt::Completed(result) => return Ok(result),
+            Attempt::Completed(result) => return Ok(*result),
             Attempt::RetrySafe(e) if attempts < max_retries => {
                 attempts += 1;
                 warn!("coven-code attempt {attempts} hit a retry-safe failure ({e:#}), retrying…");
@@ -488,7 +488,7 @@ async fn run_coven_code(
         // exit codes; if it isn't, the runtime misbehaved — fall back to a
         // retry-safe failure rather than silently losing the task.
         Some(code @ (0 | 1 | 3)) => match read_result(result_path).await {
-            Ok(result) => Attempt::Completed(result),
+            Ok(result) => Attempt::Completed(Box::new(result)),
             Err(e) => Attempt::RetrySafe(anyhow::anyhow!(
                 "coven-code exited {code} but result.json was unusable: {e}"
             )),

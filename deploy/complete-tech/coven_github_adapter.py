@@ -27,6 +27,20 @@ COVEN_CODE_BIN = os.environ.get("COVEN_CODE_BIN", "coven-code").strip() or "cove
 COVEN_CODE_MODEL = os.environ.get("COVEN_CODE_MODEL", "gpt-5.5").strip()
 
 
+def env_int(name, default, minimum=0, maximum=10):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+MAX_REVIEW_FIX_LOOPS = env_int("COVEN_REVIEW_FIX_LOOPS", 0, minimum=0, maximum=5)
+
+
 def account_home():
     try:
         import pwd
@@ -456,7 +470,7 @@ def write_askpass(work_dir):
     return script
 
 
-def session_brief(task, workspace, review_context=None):
+def session_brief(task, workspace, review_context=None, extra_audit_instruction=None):
     owner, name = (task["repository"] or "/").split("/", 1)
     brief = {
         "contract_version": "2",
@@ -473,12 +487,120 @@ def session_brief(task, workspace, review_context=None):
     }
     if review_context:
         brief["review_context"] = review_context
-        brief["audit_instruction"] = (
+        instruction = (
             "This run is evidence-backed. Review the supplied PR metadata and "
             "changed-file patches in review_context before responding. Cite the "
             "specific changed files you inspected in the result summary."
         )
+        if extra_audit_instruction:
+            instruction = instruction + "\n\n" + extra_audit_instruction
+        brief["audit_instruction"] = instruction
     return brief
+
+
+def run_coven_code_cycle(
+    task,
+    workspace,
+    review_context,
+    attempt_dir,
+    env,
+    cycle,
+    extra_audit_instruction=None,
+):
+    suffix = "" if cycle == 0 else "-repair-{}".format(cycle)
+    brief_path = attempt_dir / "session-brief{}.json".format(suffix)
+    result_path = attempt_dir / "result{}.json".format(suffix)
+    run_path = attempt_dir / "run{}.json".format(suffix)
+
+    write_json_atomic(
+        brief_path,
+        session_brief(task, workspace, review_context, extra_audit_instruction),
+    )
+    run = run_command(
+        [
+            COVEN_CODE_BIN,
+            "--headless",
+            "--hosted-review",
+            "--provider",
+            "codex",
+            "--model",
+            COVEN_CODE_MODEL,
+            "--context",
+            str(brief_path),
+            "--output",
+            str(result_path),
+        ],
+        cwd=str(workspace),
+        env=env,
+        timeout=1800,
+    )
+    write_json_atomic(run_path, redacted_command_result(run))
+    result = read_json(result_path, None) if result_path.exists() else None
+    return {
+        "cycle": cycle,
+        "brief_path": brief_path,
+        "result_path": result_path,
+        "run_path": run_path,
+        "run": run,
+        "result": result,
+    }
+
+
+def review_findings(result):
+    if not result:
+        return []
+    review = result.get("review") or {}
+    mode = review.get("mode")
+    if mode not in ("pull_request", "review_comment"):
+        return []
+    return review.get("findings") or []
+
+
+def review_fix_instruction(findings, iteration, max_iterations):
+    lines = [
+        "Autofix review loop iteration {}/{}.".format(iteration, max_iterations),
+        "The previous hosted review returned structured findings. Fix the findings below, run the relevant checks you can run safely, then perform another bounded review of the updated code using the required review sections.",
+        "If a finding cannot be fixed safely, leave a clear limitation and explain the remaining blocker. Do not merely restate the findings.",
+        "",
+        "Findings to fix:",
+    ]
+    for index, finding in enumerate(findings[:10], start=1):
+        location = finding.get("file") or "unknown file"
+        if finding.get("line") is not None:
+            location = "{}:{}".format(location, finding.get("line"))
+        lines.append(
+            "{}. [{}] `{}` {}".format(
+                index,
+                finding.get("severity") or "unknown",
+                location,
+                finding.get("title") or "Untitled finding",
+            )
+        )
+        body = (finding.get("body") or "").strip()
+        if body:
+            lines.append("   Body: {}".format(body[:1200]))
+        recommendation = (finding.get("recommendation") or "").strip()
+        if recommendation:
+            lines.append("   Recommendation: {}".format(recommendation[:1200]))
+    if len(findings) > 10:
+        lines.append("Only the first 10 findings are listed; inspect the prior result for the full set.")
+    return "\n".join(lines)
+
+
+def task_with_repair_request(task, instruction):
+    copy = json.loads(json.dumps(task))
+    task_data = copy.get("task") or {}
+    explicit_request = (
+        "\n\nPlease fix the review findings from the previous hosted review cycle. "
+        "After fixing them, rerun relevant checks and produce another structured review.\n\n"
+        + instruction
+    )
+    if "comment_body" in task_data:
+        task_data["comment_body"] = (task_data.get("comment_body") or "") + explicit_request
+    elif "issue_body" in task_data:
+        task_data["issue_body"] = (task_data.get("issue_body") or "") + explicit_request
+    copy["task"] = task_data
+    return copy
 
 
 def run_task(task_id, debug):
@@ -544,13 +666,6 @@ def run_task(task_id, debug):
             task["review_evidence"] = review_evidence(review_context, review_context_path, task)
             write_json_atomic(path, task)
 
-        brief_path = attempt_dir / "session-brief.json"
-        result_path = attempt_dir / "result.json"
-        write_json_atomic(brief_path, session_brief(task, workspace, review_context))
-        task["session_brief_path"] = str(brief_path)
-        task["session_brief_sha256"] = file_sha256(brief_path)
-        write_json_atomic(path, task)
-
         if not command_exists(COVEN_CODE_BIN):
             return fail_task(
                 path,
@@ -559,28 +674,17 @@ def run_task(task_id, debug):
                 "COVEN_CODE_BIN is not available on the host: {}".format(COVEN_CODE_BIN),
             )
 
-        run = run_command(
-            [
-                COVEN_CODE_BIN,
-                "--headless",
-                "--hosted-review",
-                "--provider",
-                "codex",
-                "--model",
-                COVEN_CODE_MODEL,
-                "--context",
-                str(brief_path),
-                "--output",
-                str(result_path),
-            ],
-            cwd=str(workspace),
-            env=env,
-            timeout=1800,
-        )
-        write_json_atomic(attempt_dir / "run.json", redacted_command_result(run))
+        cycle_result = run_coven_code_cycle(task, workspace, review_context, attempt_dir, env, 0)
+        brief_path = cycle_result["brief_path"]
+        result_path = cycle_result["result_path"]
+        run = cycle_result["run"]
+        task["session_brief_path"] = str(brief_path)
+        task["session_brief_sha256"] = file_sha256(brief_path)
         task["runtime_exit_code"] = run["returncode"]
         task["result_path"] = str(result_path)
-        if not result_path.exists():
+        write_json_atomic(path, task)
+
+        if cycle_result["result"] is None:
             return fail_task(
                 path,
                 task,
@@ -589,6 +693,58 @@ def run_task(task_id, debug):
                     run["returncode"], run["stderr"]
                 ),
             )
+
+        final_cycle = cycle_result
+        loop_records = []
+        for iteration in range(1, MAX_REVIEW_FIX_LOOPS + 1):
+            findings = review_findings(final_cycle["result"])
+            if not findings:
+                break
+            instruction = review_fix_instruction(findings, iteration, MAX_REVIEW_FIX_LOOPS)
+            repair_task = task_with_repair_request(task, instruction)
+            repair_cycle = run_coven_code_cycle(
+                repair_task,
+                workspace,
+                review_context,
+                attempt_dir,
+                env,
+                iteration,
+                instruction,
+            )
+            remaining = review_findings(repair_cycle["result"])
+            loop_records.append(
+                {
+                    "iteration": iteration,
+                    "input_findings": len(findings),
+                    "runtime_exit_code": repair_cycle["run"]["returncode"],
+                    "result_path": str(repair_cycle["result_path"]),
+                    "result_status": (repair_cycle["result"] or {}).get("status"),
+                    "remaining_findings": len(remaining),
+                }
+            )
+            task["review_fix_loops"] = loop_records
+            task["runtime_exit_code"] = repair_cycle["run"]["returncode"]
+            task["result_path"] = str(repair_cycle["result_path"])
+            task["updated_at"] = utc_now()
+            write_json_atomic(path, task)
+
+            if repair_cycle["result"] is None:
+                return fail_task(
+                    path,
+                    task,
+                    "result_missing",
+                    "review repair loop {} exited {} without writing result.json: {}".format(
+                        iteration,
+                        repair_cycle["run"]["returncode"],
+                        repair_cycle["run"]["stderr"],
+                    ),
+                )
+            final_cycle = repair_cycle
+
+        result_path = final_cycle["result_path"]
+        run = final_cycle["run"]
+        task["runtime_exit_code"] = run["returncode"]
+        task["result_path"] = str(result_path)
         task["state"] = "completed" if run["returncode"] in (0, 1, 3) else "failed"
         task["updated_at"] = utc_now()
         publish_result_if_configured(task, result_path, token)
@@ -784,6 +940,7 @@ def publication_comment_body(task, result):
     ]
     if pr_body.strip() and pr_body.strip() != summary.strip():
         parts.extend(["", pr_body.strip()])
+    parts.extend(review_fix_loop_lines(task))
     parts.extend(["", "### Evidence"])
     if evidence:
         changed_files = evidence.get("changed_files") or []
@@ -812,6 +969,30 @@ def publication_comment_body(task, result):
         ]
     )
     return "\n".join(parts)
+
+
+def review_fix_loop_lines(task):
+    loops = task.get("review_fix_loops") or []
+    if not loops:
+        return []
+
+    lines = ["", "### Review fix loop"]
+    for loop in loops:
+        lines.append(
+            "- Iteration {iteration}: input findings {input_findings}, result `{result_status}`, remaining findings {remaining_findings}.".format(
+                iteration=loop.get("iteration"),
+                input_findings=loop.get("input_findings"),
+                result_status=loop.get("result_status") or "unknown",
+                remaining_findings=loop.get("remaining_findings"),
+            )
+        )
+    if loops and loops[-1].get("remaining_findings", 0):
+        lines.append(
+            "- Loop stopped after {} configured iteration(s); unresolved findings remain.".format(
+                len(loops)
+            )
+        )
+    return lines
 
 
 def structured_review_lines(review):
