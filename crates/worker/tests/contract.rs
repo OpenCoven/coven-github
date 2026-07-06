@@ -75,6 +75,7 @@ fn result_without_contract_version_defaults_to_current() {
             "mode": "none",
             "evidence_status": "not_applicable",
             "reviewed_files": [],
+            "supporting_files": [],
             "findings": [],
             "tests_run": [],
             "no_findings_reason": null,

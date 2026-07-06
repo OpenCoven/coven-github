@@ -829,7 +829,7 @@ mod process_tests {
     /// A minimal contract-valid result.json with the given status/exit_reason.
     fn result_json(status: &str, exit_reason: &str) -> String {
         format!(
-            r#"{{"contract_version":"2","status":"{status}","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]}},"exit_reason":{exit_reason}}}"#
+            r#"{{"contract_version":"2","status":"{status}","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]}},"exit_reason":{exit_reason}}}"#
         )
     }
 
