@@ -41,6 +41,10 @@ def env_int(name, default, minimum=0, maximum=10):
 
 
 MAX_REVIEW_FIX_LOOPS = env_int("COVEN_REVIEW_FIX_LOOPS", 0, minimum=0, maximum=5)
+TERMINAL_RESULT_EXIT_CODES = {0, 1, 3}
+RESULT_STATUSES = {"success", "failure", "partial", "needs_input"}
+REVIEW_MODES = {"none", "pull_request", "review_comment"}
+REVIEW_EVIDENCE_STATUSES = {"not_applicable", "complete", "partial", "missing"}
 
 
 def account_home():
@@ -543,6 +547,66 @@ def write_askpass(work_dir):
     return script
 
 
+def validate_result_contract(result):
+    if not isinstance(result, dict):
+        raise ValueError("result.json must be a JSON object")
+
+    for field in ("contract_version", "status", "commits", "files_changed", "summary", "pr_body", "review"):
+        if field not in result:
+            raise ValueError("result.json missing required field {}".format(field))
+
+    if result.get("contract_version") != "2":
+        raise ValueError("unsupported result contract_version {}".format(result.get("contract_version")))
+    if result.get("status") not in RESULT_STATUSES:
+        raise ValueError("unsupported result status {}".format(result.get("status")))
+    if not isinstance(result.get("commits"), list):
+        raise ValueError("result.commits must be an array")
+    if not isinstance(result.get("files_changed"), list):
+        raise ValueError("result.files_changed must be an array")
+    if not isinstance(result.get("summary"), str):
+        raise ValueError("result.summary must be a string")
+    if not isinstance(result.get("pr_body"), str):
+        raise ValueError("result.pr_body must be a string")
+
+    review = result.get("review")
+    if not isinstance(review, dict):
+        raise ValueError("result.review must be an object")
+    for field in (
+        "mode",
+        "evidence_status",
+        "reviewed_files",
+        "supporting_files",
+        "findings",
+        "tests_run",
+        "no_findings_reason",
+        "limitations",
+    ):
+        if field not in review:
+            raise ValueError("result.review missing required field {}".format(field))
+
+    mode = review.get("mode")
+    evidence_status = review.get("evidence_status")
+    if mode not in REVIEW_MODES:
+        raise ValueError("unsupported review mode {}".format(mode))
+    if evidence_status not in REVIEW_EVIDENCE_STATUSES:
+        raise ValueError("unsupported review evidence_status {}".format(evidence_status))
+
+    for field in ("reviewed_files", "supporting_files", "findings", "tests_run", "limitations"):
+        if not isinstance(review.get(field), list):
+            raise ValueError("result.review.{} must be an array".format(field))
+
+    if mode in ("pull_request", "review_comment"):
+        if evidence_status == "not_applicable":
+            raise ValueError("review evidence_status not_applicable is invalid for {}".format(mode))
+        if evidence_status != "missing" and not review.get("reviewed_files"):
+            raise ValueError("reviewed_files is required for review mode {}".format(mode))
+        no_findings_reason = review.get("no_findings_reason")
+        if not review.get("findings") and not (
+            isinstance(no_findings_reason, str) and no_findings_reason.strip()
+        ):
+            raise ValueError("no_findings_reason is required when review findings are empty")
+
+
 def session_brief(task, workspace, review_context=None, extra_audit_instruction=None):
     owner, name = (task["repository"] or "/").split("/", 1)
     brief = {
@@ -608,7 +672,15 @@ def run_coven_code_cycle(
         timeout=1800,
     )
     write_json_atomic(run_path, redacted_command_result(run))
-    result = read_json(result_path, None) if result_path.exists() else None
+    result = None
+    result_error = None
+    if result_path.exists():
+        try:
+            result = read_json(result_path, None)
+            validate_result_contract(result)
+        except Exception as exc:
+            result_error = str(exc)
+            result = None
     return {
         "cycle": cycle,
         "brief_path": brief_path,
@@ -616,6 +688,7 @@ def run_coven_code_cycle(
         "run_path": run_path,
         "run": run,
         "result": result,
+        "result_error": result_error,
     }
 
 
@@ -757,14 +830,25 @@ def run_task(task_id, debug):
         task["result_path"] = str(result_path)
         write_json_atomic(path, task)
 
-        if cycle_result["result"] is None:
+        if run["returncode"] not in TERMINAL_RESULT_EXIT_CODES:
             return fail_task(
                 path,
                 task,
-                "result_missing",
-                "coven-code exited {} without writing result.json: {}".format(
+                "runtime_non_terminal",
+                "coven-code exited {} before a terminal result could be used: {}".format(
                     run["returncode"], run["stderr"]
                 ),
+            )
+        if cycle_result["result"] is None:
+            reason = "result_invalid" if cycle_result.get("result_error") else "result_missing"
+            detail = cycle_result.get("result_error") or "coven-code exited {} without writing result.json: {}".format(
+                run["returncode"], run["stderr"]
+            )
+            return fail_task(
+                path,
+                task,
+                reason,
+                detail,
             )
 
         final_cycle = cycle_result
@@ -784,6 +868,32 @@ def run_task(task_id, debug):
                 iteration,
                 instruction,
             )
+            if repair_cycle["run"]["returncode"] not in TERMINAL_RESULT_EXIT_CODES:
+                return fail_task(
+                    path,
+                    task,
+                    "runtime_non_terminal",
+                    "review repair loop {} exited {} before a terminal result could be used: {}".format(
+                        iteration,
+                        repair_cycle["run"]["returncode"],
+                        repair_cycle["run"]["stderr"],
+                    ),
+                )
+            if repair_cycle["result"] is None:
+                reason = "result_invalid" if repair_cycle.get("result_error") else "result_missing"
+                detail = repair_cycle.get("result_error") or (
+                    "review repair loop {} exited {} without writing result.json: {}".format(
+                        iteration,
+                        repair_cycle["run"]["returncode"],
+                        repair_cycle["run"]["stderr"],
+                    )
+                )
+                return fail_task(
+                    path,
+                    task,
+                    reason,
+                    detail,
+                )
             remaining = review_findings(repair_cycle["result"])
             loop_records.append(
                 {
@@ -800,18 +910,6 @@ def run_task(task_id, debug):
             task["result_path"] = str(repair_cycle["result_path"])
             task["updated_at"] = utc_now()
             write_json_atomic(path, task)
-
-            if repair_cycle["result"] is None:
-                return fail_task(
-                    path,
-                    task,
-                    "result_missing",
-                    "review repair loop {} exited {} without writing result.json: {}".format(
-                        iteration,
-                        repair_cycle["run"]["returncode"],
-                        repair_cycle["run"]["stderr"],
-                    ),
-                )
             final_cycle = repair_cycle
 
         result_path = final_cycle["result_path"]

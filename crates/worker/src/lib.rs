@@ -673,6 +673,29 @@ mod result_tests {
     }
 
     #[tokio::test]
+    async fn read_result_rejects_missing_contract_version() {
+        let path = std::env::temp_dir().join(format!(
+            "coven-github-result-missing-version-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#,
+        )
+        .expect("result fixture should be written");
+
+        let error = read_result(&path)
+            .await
+            .expect_err("missing contract_version result must be rejected");
+        assert!(
+            format!("{error:#}").contains("missing field `contract_version`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn read_result_rejects_not_applicable_evidence_for_review_modes() {
         let path = std::env::temp_dir().join(format!(
             "coven-github-result-review-evidence-{}.json",

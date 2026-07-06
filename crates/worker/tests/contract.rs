@@ -112,9 +112,7 @@ fn golden_result_deserializes_into_adapter_type() {
 }
 
 #[test]
-fn result_without_contract_version_defaults_to_current() {
-    // Backward compatibility: a runtime that predates the version field still
-    // parses, and is treated as the current major version.
+fn result_without_contract_version_is_rejected() {
     let raw = r#"{
         "status": "failure",
         "branch": null,
@@ -134,10 +132,15 @@ fn result_without_contract_version_defaults_to_current() {
         },
         "exit_reason": "ambiguous_spec"
     }"#;
-    let result: SessionResult = serde_json::from_str(raw).expect("legacy result must parse");
-    assert_eq!(result.contract_version, HEADLESS_CONTRACT_VERSION);
-    assert_eq!(result.status, SessionStatus::Failure);
-    assert_eq!(result.exit_reason, Some(ExitReason::AmbiguousSpec));
+    let error = serde_json::from_str::<SessionResult>(raw)
+        .expect_err("v2 result without contract_version must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing field `contract_version`"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

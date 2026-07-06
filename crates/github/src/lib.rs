@@ -14,9 +14,6 @@ pub const DEFAULT_API_BASE_URL: &str = "https://api.github.com";
 /// speaks. See `docs/headless-contract.md`. Bump only on breaking changes.
 pub const HEADLESS_CONTRACT_VERSION: &str = "2";
 
-fn default_contract_version() -> String {
-    HEADLESS_CONTRACT_VERSION.to_string()
-}
 const GITHUB_API_VERSION: &str = "2026-03-10";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,10 +173,8 @@ pub enum TaskKind {
 /// Structured result envelope written by coven-code --headless.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SessionResult {
-    /// Contract major version. Defaults to the current version when a runtime
-    /// omits it, but conformant producers MUST emit it. See
+    /// Contract major version. Conformant producers MUST emit it. See
     /// `docs/headless-contract.md`.
-    #[serde(default = "default_contract_version")]
     pub contract_version: String,
     pub status: SessionStatus,
     pub branch: Option<String>,
