@@ -204,6 +204,8 @@ pub(crate) enum Minter {
         installation_id: u64,
         repo_name: String,
     },
+    #[cfg(test)]
+    Fixed(std::collections::HashMap<TokenRole, String>),
 }
 
 impl Minter {
@@ -226,6 +228,11 @@ impl Minter {
                 )
                 .await
             }
+            #[cfg(test)]
+            Minter::Fixed(tokens) => tokens
+                .get(&role)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no fixed token for role {role:?}")),
         }
     }
 }
@@ -1446,6 +1453,191 @@ mod process_tests {
 
         let attempt = run_coven_code(&config, &brief, &result, "tok").await;
         assert!(matches!(attempt, Attempt::RetrySafe(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod publication_tests {
+    use super::*;
+    use coven_github_api::installation::TokenRole;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORCHESTRATION: &str = "ghs_orchestration0000000000000000000000";
+    const AGENT_GIT: &str = "ghs_agentgit0000000000000000000000000000";
+    const PUBLICATION: &str = "ghs_publication0000000000000000000000000";
+
+    fn fixed_minter() -> Minter {
+        Minter::Fixed(HashMap::from([
+            (TokenRole::Orchestration, ORCHESTRATION.to_string()),
+            (TokenRole::AgentGit, AGENT_GIT.to_string()),
+            (TokenRole::Publication, PUBLICATION.to_string()),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn publication_uses_post_validation_token_and_leaks_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/OpenCoven/demo/check-runs/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/pulls"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"number": 17})),
+            )
+            .mount(&server)
+            .await;
+
+        // Fake coven-code: records the git token it was handed, then emits a
+        // result that tries to leak that token through free-text fields.
+        let script = r#"#!/usr/bin/env bash
+printf '%s' "$COVEN_GIT_TOKEN" > "$(dirname "$5")/seen-token"
+cat > "$5" <<EOF
+{"contract_version":"2","status":"success","branch":"cody/fix-42","commits":[{"sha":"a1","message":"msg $COVEN_GIT_TOKEN"}],"files_changed":[],"summary":"done $COVEN_GIT_TOKEN","pr_body":"body $COVEN_GIT_TOKEN","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}
+EOF
+exit 0
+"#;
+        let root =
+            std::env::temp_dir().join(format!("coven-github-pub-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test dir should be created");
+        let script_path = root.join("fake-coven-code.sh");
+        fs::write(&script_path, script).expect("script should be written");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("script should be executable");
+
+        let familiar = FamiliarConfig {
+            id: "cody".to_string(),
+            display_name: "Cody".to_string(),
+            bot_username: "coven-cody[bot]".to_string(),
+            model: None,
+            skills: vec![],
+            trigger_labels: vec![],
+        };
+        let config = Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("private.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: Some(server.uri()),
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: script_path,
+                workspace_root: root.clone(),
+                timeout_secs: 30,
+                max_retries: 0,
+            },
+            familiars: vec![familiar.clone()],
+        };
+        let task = Task {
+            id: "task-pub".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+            },
+        };
+        let targets = ResolvedTargets {
+            default_branch: "main".to_string(),
+            base_ref: "main".to_string(),
+            head_sha: "abc123".to_string(),
+        };
+        let workspace = root.join("ws");
+
+        let published = run_and_publish(
+            &config,
+            &task,
+            &familiar,
+            &fixed_minter(),
+            ORCHESTRATION,
+            &server.uri(),
+            &targets,
+            &workspace,
+            7,
+        )
+        .await
+        .expect("publication should succeed");
+
+        assert_eq!(published.opened_pr, Some(17));
+
+        // The agent received exactly the AgentGit-scoped token.
+        let seen = fs::read_to_string(workspace.join("seen-token"))
+            .expect("fake coven-code should record its token");
+        assert_eq!(seen, AGENT_GIT);
+
+        // The sanitized envelope carries no live token values.
+        assert!(!published.result.summary.contains(AGENT_GIT));
+        assert!(published.result.summary.contains(redact::REDACTED));
+        assert!(!published.result.pr_body.contains(AGENT_GIT));
+
+        // No outgoing GitHub payload contains any token value…
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(!requests.is_empty());
+        for request in &requests {
+            let body = String::from_utf8_lossy(&request.body);
+            for token in [ORCHESTRATION, AGENT_GIT, PUBLICATION] {
+                assert!(
+                    !body.contains(token),
+                    "{} {} leaked a token: {body}",
+                    request.method,
+                    request.url
+                );
+            }
+        }
+        // …and each endpoint was called with the authority its phase allows.
+        let auth_of = |p: &str, m: &str| -> Vec<String> {
+            requests
+                .iter()
+                .filter(|r| r.url.path() == p && r.method.as_str() == m)
+                .map(|r| {
+                    r.headers
+                        .get("authorization")
+                        .expect("authorization header present")
+                        .to_str()
+                        .expect("ascii header")
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(
+            auth_of("/repos/OpenCoven/demo/pulls", "POST"),
+            vec![format!("Bearer {PUBLICATION}")]
+        );
+        assert_eq!(
+            auth_of("/repos/OpenCoven/demo/check-runs/7", "PATCH"),
+            vec![format!("Bearer {ORCHESTRATION}")]
+        );
+        // Starting comment (orchestration), then PR-opened comment (publication).
+        assert_eq!(
+            auth_of("/repos/OpenCoven/demo/issues/42/comments", "POST"),
+            vec![
+                format!("Bearer {ORCHESTRATION}"),
+                format!("Bearer {PUBLICATION}"),
+            ]
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -36,3 +36,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 toml = "0.8"
+wiremock = "0.6"
