@@ -11,7 +11,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
-use coven_github_api::{tasks::TaskStore, GitHubEvent, Task, TaskKind};
+use coven_github_api::tasks::TaskListStatus;
+use coven_github_api::{GitHubEvent, Task, TaskKind};
 use coven_github_config::Config;
 use coven_github_store::{Delivery, Recorded, Routing, Store};
 
@@ -20,24 +21,41 @@ use crate::{
     events::{parse_event, WebhookPayload},
     verify_signature,
 };
-use coven_github_api::tasks::TaskListStatus;
 
 /// Shared application state passed to route handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: std::sync::Arc<Config>,
-    /// Channel for dispatching tasks to the worker pool.
-    pub task_tx: tokio::sync::mpsc::Sender<Task>,
-    pub task_store: TaskStore,
-    /// Durable deliveries + tasks (issue #2). Deliveries are recorded — and
-    /// deduplicated — here before GitHub is told the webhook succeeded.
+    /// Durable deliveries + task queue (issue #2). Deliveries are recorded —
+    /// and deduplicated — here before GitHub is told the webhook succeeded;
+    /// the worker claims queued tasks from the same store.
     pub store: Store,
+    /// Wake-up signal to the worker pool after a task row is enqueued.
+    pub notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// Display names by familiar id — the store holds ids; names are config's.
+fn familiar_names(config: &Config) -> std::collections::HashMap<String, String> {
+    config
+        .familiars
+        .iter()
+        .map(|f| (f.id.clone(), f.display_name.clone()))
+        .collect()
 }
 
 /// GET /api/github/tasks — current task state for CovenCave polling.
 pub async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
-    let tasks = state.task_store.list().await;
-    Json(json!({ "ok": true, "tasks": tasks })).into_response()
+    match state.store.cave_list(familiar_names(&state.config)).await {
+        Ok(tasks) => Json(json!({ "ok": true, "tasks": tasks })).into_response(),
+        Err(e) => {
+            error!("task list unavailable: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "task list unavailable"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// POST /webhook — GitHub webhook receiver.
@@ -168,21 +186,11 @@ pub async fn handle_webhook(
                 }
                 Err(e) => return storage_unavailable(e),
             }
-            let task_id = task.id.clone();
-            // Register auto-reviews BEFORE enqueueing so the worker can never
-            // dequeue a task that a newer event has already superseded (#10).
-            if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
-                let repo = format!("{}/{}", task.repo_owner, task.repo_name);
-                state
-                    .task_store
-                    .register_pr_review(&repo, *pr_number, &task_id)
-                    .await;
-            }
-            if state.task_tx.try_send(task).is_err() {
-                warn!(task_id, "task queue full — dropping task");
-            } else {
-                info!(task_id, "task enqueued");
-            }
+            // The tasks table IS the queue: enqueueing is the durable insert
+            // above (with supersession tombstones applied in-transaction);
+            // this only wakes the claim loop. No channel, no drop path.
+            info!(task_id = %task.id, "task enqueued");
+            state.notify.notify_one();
         }
         None => {
             if let Err(e) = state
@@ -468,12 +476,16 @@ async fn command_task(
             // Tombstone queued reviews for this PR. In-flight work is not
             // interrupted (documented limitation); the next review command or
             // PR event re-arms the lane.
-            state
-                .task_store
-                .register_pr_review(&repo, s.number, &format!("cancelled:{}", uuid::Uuid::new_v4()))
-                .await;
+            let cancelled = state
+                .store
+                .cancel_queued(&format!("{repo}#{}", s.number))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("cancel could not reach the store: {e:#}");
+                    0
+                });
             reply(format!(
-                "Cancelled queued reviews for PR #{}. Work already running will finish; `@{} review` re-arms the lane.",
+                "Cancelled {cancelled} queued review(s) for PR #{}. Work already running will finish; `@{} review` re-arms the lane.",
                 s.number,
                 familiar.bot_username.trim_end_matches("[bot]")
             ))
@@ -485,7 +497,14 @@ async fn command_task(
                 .to_string(),
         ),
         Command::Status => {
-            let items = state.task_store.list().await;
+            let items = state
+                .store
+                .cave_list(familiar_names(&state.config))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("status could not reach the store: {e:#}");
+                    Vec::new()
+                });
             let mut lines: Vec<String> = items
                 .iter()
                 .filter(|t| t.repo == repo && t.issue_number == s.number)
@@ -521,6 +540,7 @@ fn verb(command: &Command) -> &'static str {
 
 fn status_label(status: &TaskListStatus) -> &'static str {
     match status {
+        TaskListStatus::Queued => "queued",
         TaskListStatus::Running => "running",
         TaskListStatus::Review => "awaiting review",
         TaskListStatus::Done => "done",
@@ -541,7 +561,6 @@ mod tests {
     }
 
     pub(crate) fn app_state_with_review(review: coven_github_config::ReviewConfig) -> AppState {
-        let (task_tx, _task_rx) = tokio::sync::mpsc::channel(1);
         AppState {
             config: Arc::new(Config {
                 server: ServerConfig {
@@ -572,10 +591,28 @@ mod tests {
                 review,
                 storage: coven_github_config::StorageConfig::default(),
             }),
-            task_tx,
-            task_store: TaskStore::default(),
             store: Store::open_in_memory().expect("in-memory store"),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Enqueues a durable task row the way the webhook path would.
+    pub(crate) async fn seed_task(state: &AppState, delivery_id: &str, task: &Task) {
+        state
+            .store
+            .record_delivery(
+                coven_github_store::Delivery {
+                    delivery_id: delivery_id.to_string(),
+                    event: "test".to_string(),
+                    action: None,
+                    installation_id: Some(task.installation_id),
+                    repo: Some(format!("{}/{}", task.repo_owner, task.repo_name)),
+                    payload_hash: "h".to_string(),
+                },
+                coven_github_store::Routing::Task(task),
+            )
+            .await
+            .expect("seed task");
     }
 
     #[tokio::test]
@@ -1061,26 +1098,35 @@ mod command_routing_tests {
     #[tokio::test]
     async fn cancel_command_tombstones_queued_reviews_and_acknowledges() {
         let state = app_state();
-        state
-            .task_store
-            .register_pr_review("OpenCoven/coven-code", 88, "task-queued")
-            .await;
+        let queued = Task {
+            id: "task-queued".to_string(),
+            installation_id: 123,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "coven-code".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "t".to_string(),
+                reason: "opened".to_string(),
+            },
+        };
+        super::tests::seed_task(&state, "dl-cancel", &queued).await;
 
         let task = event_to_task(&state, pr_comment("@coven-cody cancel"))
             .await
             .expect("cancel should acknowledge");
 
-        assert!(
-            !state
-                .task_store
-                .is_current_pr_review("OpenCoven/coven-code", 88, "task-queued")
-                .await,
+        let states = state.store.task_states().await.expect("states");
+        assert_eq!(
+            states,
+            vec![("task-queued".to_string(), "superseded".to_string())],
             "queued review must be superseded by the cancel tombstone"
         );
         match task.kind {
             TaskKind::CommandReply { issue_number, body } => {
                 assert_eq!(issue_number, 88);
-                assert!(body.contains("Cancelled queued reviews"));
+                assert!(body.contains("Cancelled 1 queued review"));
             }
             other => panic!("expected CommandReply, got {other:?}"),
         }
@@ -1117,7 +1163,7 @@ mod command_routing_tests {
                 reason: "opened".to_string(),
             },
         };
-        state.task_store.mark_running(&tracked, "Cody", None).await;
+        super::tests::seed_task(&state, "dl-status", &tracked).await;
 
         let task = event_to_task(&state, pr_comment("@coven-cody status"))
             .await
@@ -1125,7 +1171,7 @@ mod command_routing_tests {
         match task.kind {
             TaskKind::CommandReply { body, .. } => {
                 assert!(body.contains("Review PR #88"), "status body: {body}");
-                assert!(body.contains("running"), "status body: {body}");
+                assert!(body.contains("queued"), "status body: {body}");
             }
             other => panic!("expected CommandReply, got {other:?}"),
         }
@@ -1227,11 +1273,7 @@ mod delivery_idempotency_tests {
 
     #[tokio::test]
     async fn redelivered_delivery_id_never_dispatches_twice() {
-        let (task_tx, mut task_rx) = tokio::sync::mpsc::channel(8);
-        let state = AppState {
-            task_tx,
-            ..app_state()
-        };
+        let state = app_state();
         let body = assigned_payload();
 
         let (status, json) =
@@ -1245,20 +1287,18 @@ mod delivery_idempotency_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["duplicate"], true);
 
-        // Exactly one durable task row and one dispatched task.
+        // Exactly one durable task row — the queue IS the table, so a second
+        // row is what "dispatching twice" would mean.
         let states = state.store.task_states().await.unwrap();
         assert_eq!(states.len(), 1, "one durable task: {states:?}");
         assert_eq!(states[0].1, "queued");
-        let first = task_rx.try_recv().expect("first delivery dispatches");
-        assert!(matches!(first.kind, TaskKind::FixIssue { issue_number: 42, .. }));
-        assert!(
-            task_rx.try_recv().is_err(),
-            "the redelivery must not dispatch"
-        );
 
         // The delivery record ties the id to the routed task.
         let routing = state.store.delivery_routing("dl-1").await.unwrap();
-        assert_eq!(routing.as_deref(), Some(format!("task:{}", first.id).as_str()));
+        assert_eq!(
+            routing.as_deref(),
+            Some(format!("task:{}", states[0].0).as_str())
+        );
     }
 
     #[tokio::test]
