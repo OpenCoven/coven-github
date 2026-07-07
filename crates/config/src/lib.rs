@@ -13,6 +13,31 @@ pub struct Config {
     /// Automatic review trigger policy. Absent section = all lanes off.
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Durable state (SQLite) location. Absent section = the default path.
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+/// Durable task-store configuration (issue #2).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageConfig {
+    /// Path to the SQLite database file for durable adapter state. Its parent
+    /// directory is created on first run; mount it on a persistent volume so
+    /// task state survives restarts.
+    #[serde(default = "default_storage_path")]
+    pub path: PathBuf,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            path: default_storage_path(),
+        }
+    }
+}
+
+fn default_storage_path() -> PathBuf {
+    PathBuf::from("data/coven-github.db")
 }
 
 /// Automatic review trigger policy (issue #10). Lanes default to off.
@@ -290,6 +315,32 @@ impl Config {
             }
         }
 
+        // ── Durable storage ─────────────────────────────────────────────
+        // The DB file itself is created on first run; only the parent dir
+        // matters here. A parent that exists as a non-directory is fatal; a
+        // missing parent is fine (Store::open creates it).
+        match self.storage.path.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => {}
+            Some(parent) => match std::fs::metadata(parent) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => out.push(Diagnostic::error(
+                    "storage.path",
+                    format!(
+                        "storage directory '{}' exists but is not a directory.",
+                        parent.display()
+                    ),
+                )),
+                Err(_) => out.push(Diagnostic::warning(
+                    "storage.path",
+                    format!(
+                        "storage directory '{}' does not exist yet — it will be created on first run.",
+                        parent.display()
+                    ),
+                )),
+            },
+            None => {}
+        }
+
         out
     }
 }
@@ -369,6 +420,9 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         }
         "review.familiar" => {
             "Set review.familiar (or the repo override's familiar) to the id of a configured [[familiars]] block."
+        }
+        "storage.path" => {
+            "Point storage.path at a file on a writable, persistent volume (its parent directory is created on first run)."
         }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
@@ -468,6 +522,7 @@ mod tests {
             worker,
             familiars,
             review: ReviewConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 
@@ -531,6 +586,48 @@ mod tests {
         assert_eq!(
             policy.audit_instruction_for("OpenCoven/quiet").as_deref(),
             Some("global")
+        );
+    }
+
+    #[test]
+    fn storage_defaults_to_the_data_dir_path() {
+        assert_eq!(
+            StorageConfig::default().path,
+            PathBuf::from("data/coven-github.db")
+        );
+    }
+
+    #[test]
+    fn doctor_flags_storage_parent_that_is_a_file() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        // Make a plain file, then point the DB path *inside* it — its parent is
+        // a file, which can never hold a database.
+        let not_a_dir = dir.join("blocker");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.storage.path = not_a_dir.join("coven-github.db");
+
+        assert!(
+            errors(&cfg.check()).contains(&"storage.path"),
+            "diags: {:?}",
+            cfg.check()
         );
     }
 

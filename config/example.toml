@@ -19,6 +19,12 @@ workspace_root = "/tmp/coven-github-tasks"    # Ephemeral workspace root
 timeout_secs = 600  # 10 minutes per task
 max_retries = 2     # Retries for infra errors (exit code 2)
 
+[storage]
+# Durable adapter state (SQLite): webhook-delivery idempotency and the task
+# queue. Mount its directory on a persistent volume so state survives restarts
+# (issue #2). The parent directory is created on first run.
+path = "data/coven-github.db"
+
 # ── Familiar configuration ──────────────────────────────────────────────────
 # Add one [[familiars]] block per familiar you want to expose as a GitHub bot.
 

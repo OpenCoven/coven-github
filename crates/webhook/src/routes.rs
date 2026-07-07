@@ -485,6 +485,7 @@ mod tests {
                     trigger_labels: vec!["coven:fix".to_string(), "coven:review".to_string()],
                 }],
                 review,
+                storage: coven_github_config::StorageConfig::default(),
             }),
             task_tx,
             task_store: TaskStore::default(),
