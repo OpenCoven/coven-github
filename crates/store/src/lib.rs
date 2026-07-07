@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Handle to the durable store. Cheap to clone; all clones share one writer
 /// connection.
@@ -480,6 +480,32 @@ pub struct UsageRow {
     pub runtime_secs: u64,
 }
 
+/// The purchased plan for one account (billing entitlements). Written from
+/// `marketplace_purchase` webhook events; resolved per installation through
+/// `installation_accounts`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPlan {
+    pub account_id: u64,
+    pub account_login: String,
+    /// The raw marketplace plan name, kept for audit.
+    pub plan_name: String,
+    /// Parsed tier id: `starter` | `team` | `dedicated` | `unknown`.
+    pub tier: String,
+    /// `active` | `trial` | `cancelled`.
+    pub state: String,
+    /// Where the plan record came from: `marketplace` | `manual`.
+    pub source: String,
+    pub updated_at: String,
+}
+
+impl AccountPlan {
+    /// Whether this plan currently entitles service.
+    pub fn entitled(&self) -> bool {
+        matches!(self.state.as_str(), "active" | "trial")
+    }
+}
+
 /// One task-lifecycle audit event for the Cave dashboard (issue #18).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -640,6 +666,142 @@ impl Store {
                 |row| row.get(0),
             )?;
             Ok(count)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Upsert the purchased plan for one account (billing entitlements).
+    pub async fn set_account_plan(&self, plan: AccountPlan) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO account_plans
+                   (account_id, account_login, plan_name, tier, state, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(account_id) DO UPDATE SET
+                   account_login = excluded.account_login,
+                   plan_name     = excluded.plan_name,
+                   tier          = excluded.tier,
+                   state         = excluded.state,
+                   source        = excluded.source,
+                   updated_at    = excluded.updated_at",
+                params![
+                    plan.account_id,
+                    plan.account_login,
+                    plan.plan_name,
+                    plan.tier,
+                    plan.state,
+                    plan.source,
+                    now_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Upsert the account behind one installation (from `installation`
+    /// webhook events) so installation → plan can be resolved.
+    pub async fn record_installation_account(
+        &self,
+        installation_id: u64,
+        account_id: u64,
+        account_login: &str,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let account_login = account_login.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO installation_accounts
+                   (installation_id, account_id, account_login, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(installation_id) DO UPDATE SET
+                   account_id    = excluded.account_id,
+                   account_login = excluded.account_login,
+                   updated_at    = excluded.updated_at",
+                params![installation_id, account_id, account_login, now_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// The purchased plan behind one installation, if its account is known
+    /// and has one. Returns cancelled plans too — callers check
+    /// [`AccountPlan::entitled`].
+    pub async fn plan_for_installation(
+        &self,
+        installation_id: u64,
+    ) -> Result<Option<AccountPlan>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let plan = conn
+                .query_row(
+                    "SELECT p.account_id, p.account_login, p.plan_name,
+                            p.tier, p.state, p.source, p.updated_at
+                     FROM account_plans p
+                     JOIN installation_accounts ia ON ia.account_id = p.account_id
+                     WHERE ia.installation_id = ?1",
+                    params![installation_id],
+                    |row| {
+                        Ok(AccountPlan {
+                            account_id: row.get(0)?,
+                            account_login: row.get(1)?,
+                            plan_name: row.get(2)?,
+                            tier: row.get(3)?,
+                            state: row.get(4)?,
+                            source: row.get(5)?,
+                            updated_at: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(plan)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// `installation id → tier` for every installation whose account holds an
+    /// entitled (active or trial) plan — the worker merges these into its
+    /// claim-time concurrency caps.
+    pub async fn entitled_installation_tiers(&self) -> Result<HashMap<u64, String>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT ia.installation_id, p.tier
+                 FROM installation_accounts ia
+                 JOIN account_plans p ON p.account_id = ia.account_id
+                 WHERE p.state IN ('active', 'trial')",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Forget which account an installation belonged to (delete-on-uninstall).
+    /// The account's plan survives: other installations may share it, and
+    /// cancellation arrives separately via `marketplace_purchase`.
+    pub async fn delete_installation_account(&self, installation_id: u64) -> Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let n = conn.execute(
+                "DELETE FROM installation_accounts WHERE installation_id = ?1",
+                params![installation_id],
+            )?;
+            Ok(n > 0)
         })
         .await
         .expect("store task panicked")
@@ -1151,6 +1313,36 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )
         .context("failed to apply schema v5")?;
+    }
+    if version < 6 {
+        // v6: billing entitlements (docs/pricing.md). Marketplace purchases
+        // key on the purchasing *account*; tenancy keys on the *installation*.
+        // `account_plans` holds one plan per account; `installation_accounts`
+        // maps installations to their account so intake and the worker can
+        // resolve installation → plan.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE account_plans (
+              account_id    INTEGER PRIMARY KEY,
+              account_login TEXT NOT NULL,
+              plan_name     TEXT NOT NULL,
+              tier          TEXT NOT NULL,
+              state         TEXT NOT NULL,
+              source        TEXT NOT NULL,
+              updated_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE installation_accounts (
+              installation_id INTEGER PRIMARY KEY,
+              account_id      INTEGER NOT NULL,
+              account_login   TEXT NOT NULL,
+              updated_at      TEXT NOT NULL
+            );
+            CREATE INDEX installation_accounts_account
+              ON installation_accounts(account_id);
+            "#,
+        )
+        .context("failed to apply schema v6")?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -2074,5 +2266,77 @@ mod metering_tests {
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].installation_id, 2);
         assert_eq!(scoped[0].completed, 0);
+    }
+}
+
+#[cfg(test)]
+mod entitlement_tests {
+    //! Billing entitlements: account plans and installation resolution.
+    use super::*;
+
+    fn plan(account_id: u64, tier: &str, state: &str) -> AccountPlan {
+        AccountPlan {
+            account_id,
+            account_login: "acme".into(),
+            plan_name: format!("Hosted {tier}"),
+            tier: tier.into(),
+            state: state.into(),
+            source: "marketplace".into(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_resolves_through_the_installation_account_mapping() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.plan_for_installation(7).await.unwrap(), None);
+
+        store.record_installation_account(7, 42, "acme").await.unwrap();
+        assert_eq!(store.plan_for_installation(7).await.unwrap(), None);
+
+        store.set_account_plan(plan(42, "team", "active")).await.unwrap();
+        let got = store.plan_for_installation(7).await.unwrap().expect("plan");
+        assert_eq!(got.tier, "team");
+        assert!(got.entitled());
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_the_plan_and_cancellation_removes_entitlement() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_installation_account(7, 42, "acme").await.unwrap();
+        store.set_account_plan(plan(42, "starter", "trial")).await.unwrap();
+        assert!(store.plan_for_installation(7).await.unwrap().unwrap().entitled());
+
+        store.set_account_plan(plan(42, "starter", "cancelled")).await.unwrap();
+        let got = store.plan_for_installation(7).await.unwrap().expect("kept for audit");
+        assert!(!got.entitled());
+    }
+
+    #[tokio::test]
+    async fn entitled_tiers_skip_cancelled_plans_and_unmapped_installations() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_installation_account(7, 42, "acme").await.unwrap();
+        store.record_installation_account(8, 43, "beta").await.unwrap();
+        store.set_account_plan(plan(42, "team", "active")).await.unwrap();
+        store.set_account_plan(plan(43, "starter", "cancelled")).await.unwrap();
+
+        let tiers = store.entitled_installation_tiers().await.unwrap();
+        assert_eq!(tiers.get(&7).map(String::as_str), Some("team"));
+        assert!(!tiers.contains_key(&8));
+    }
+
+    #[tokio::test]
+    async fn uninstall_forgets_the_mapping_but_keeps_the_account_plan() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_installation_account(7, 42, "acme").await.unwrap();
+        store.set_account_plan(plan(42, "team", "active")).await.unwrap();
+
+        assert!(store.delete_installation_account(7).await.unwrap());
+        assert!(!store.delete_installation_account(7).await.unwrap());
+        assert_eq!(store.plan_for_installation(7).await.unwrap(), None);
+
+        // Reinstall under the same account: the plan is still there.
+        store.record_installation_account(9, 42, "acme").await.unwrap();
+        assert!(store.plan_for_installation(9).await.unwrap().unwrap().entitled());
     }
 }

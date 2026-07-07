@@ -96,6 +96,18 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # [installations.repos."your-org/quiet"]
 # labels = false                  # only the label lane off
 
+# ── Billing entitlements (hosted, docs/pricing.md) ──────────────────────────
+# Marketplace purchases map plans to the same limit knobs automatically:
+# `marketplace_purchase` webhooks record the purchasing account's plan, and
+# `installation` events map installations to their account. Explicit
+# [installations.limits] values always win over plan defaults (Dedicated
+# contracts, operator overrides).
+# [billing]
+# require_plan = false            # true (hosted): installations with neither an
+#                                 # entitled plan (active/trial) nor an explicit
+#                                 # [[installations]] entry are recorded
+#                                 # ignored:no_plan — the monetization gate.
+
 # ── Automatic review policy ─────────────────────────────────────────────────
 # Hosted PR review lanes (issue #10). Push/commit review is parsed today and
 # ships with headless contract v3.

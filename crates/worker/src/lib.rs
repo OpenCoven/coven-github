@@ -38,7 +38,10 @@ pub async fn run(
 ) {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.worker.concurrency));
     // Per-installation concurrency caps (issue #15), applied at claim time.
-    let caps = config.concurrency_caps();
+    // Explicit TOML caps win; purchased plans supply tier defaults for the
+    // rest (billing entitlements), re-read each claim so plan changes apply
+    // without a restart.
+    let static_caps = config.concurrency_caps();
 
     loop {
         // Hold capacity BEFORE claiming so a claimed task is never parked
@@ -47,6 +50,23 @@ pub async fn run(
             Ok(permit) => permit,
             Err(_) => break,
         };
+        let mut caps = static_caps.clone();
+        match store.entitled_installation_tiers().await {
+            Ok(tiers) => {
+                for (installation, tier) in tiers {
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        caps.entry(installation)
+                    {
+                        let tier: coven_github_config::PlanTier =
+                            tier.parse().unwrap_or(coven_github_config::PlanTier::Unknown);
+                        if let Some(cap) = tier.limits().max_concurrent {
+                            slot.insert(cap);
+                        }
+                    }
+                }
+            }
+            Err(e) => error!("failed to load plan concurrency caps: {e:#}"),
+        }
         match store.claim_next(&caps).await {
             Ok(Some(task)) => {
                 let config = config.clone();
@@ -1915,6 +1935,7 @@ mod disposition_tests {
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         }
     }
 
@@ -2045,6 +2066,7 @@ mod process_tests {
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         }
     }
 
@@ -2317,6 +2339,7 @@ exit 0
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         };
         let task = Task {
             id: "task-pub".to_string(),
@@ -2552,6 +2575,7 @@ exit 0
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         };
         let task = Task {
             id: "task-stale".to_string(),
@@ -2696,6 +2720,7 @@ mod command_and_marker_tests {
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         }
     }
 
@@ -3797,6 +3822,7 @@ mod publication_gate_tests {
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         };
         let task = Task {
             id: "task-gates".to_string(),
@@ -4010,6 +4036,7 @@ exit 0
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         }
     }
 
@@ -4167,6 +4194,7 @@ mod cleanup_tests {
             gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
+            billing: Default::default(),
         };
         let task = Task {
             id: "task-cleanup".to_string(),

@@ -251,6 +251,7 @@ mod tests {
                 limits: InstallationLimits::default(),
                 repos: HashMap::new(),
             }],
+            billing: Default::default(),
         })
     }
 
