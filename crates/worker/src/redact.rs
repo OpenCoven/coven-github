@@ -230,6 +230,7 @@ mod tests {
                 limitations: vec![poison("limitation")],
             },
             exit_reason: None,
+            memory_used: None,
         };
 
         sanitize_result(&mut result, &[tok]);

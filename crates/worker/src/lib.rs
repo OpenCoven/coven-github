@@ -1606,6 +1606,7 @@ mod disposition_tests {
             pr_body: "body".to_string(),
             review: ReviewResult::none(),
             exit_reason: None,
+            memory_used: None,
         }
     }
 
@@ -1733,6 +1734,7 @@ mod disposition_tests {
             pr_body: "body".to_string(),
             review: ReviewResult::none(),
             exit_reason: None,
+            memory_used: None,
         };
         let done = final_status_body(&config, "task-42", &result, Some(17));
         assert!(done.starts_with("Status: done"));
