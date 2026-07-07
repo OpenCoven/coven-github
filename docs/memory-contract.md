@@ -311,14 +311,20 @@ values are sane.
 ## Phased PRs (coordinated with coven-code)
 
 1. **Contract + schemas.** This doc, plus the additive `memory_policy` /
-   `memory_used` schema fields and Rust types, landed in lockstep with the
-   coven-code side that accepts/emits them. No behavior yet.
+   `memory_used` schema fields and Rust types. **Done** (adapter side; the
+   coven-code side accepts/emits them independently).
 2. **Adapter policy + enforcement.** `[memory]` config, deny-by-default brief
-   stamping with trust gating, and result-envelope validation (reject
-   out-of-scope/unredacted/non-prefixed writes). Wires the #13 `remember` /
-   `forget` approval path.
-3. **Inspect / revoke.** Cave surface over prefix-addressable keys (needs #3);
-   `delete_on_uninstall`; retention expiry.
+   stamping with trust gating (incl. fork-PR never-write), and result-envelope
+   validation. **Done.**
+3. **Inspect / revoke.** Tenant-scoped `GET /api/github/memory` inspect over
+   prefix-addressable keys; `POST /api/github/memory/revoke` with adapter-side
+   enforcement (revoked keys refused on future reads/writes) plus a denial list
+   forwarded to the runtime; `delete_on_uninstall`; read citation on the review
+   surface. **Done**, except **retention expiry**, which needs a periodic sweep
+   (an operational enhancement, not a contract requirement) and remains a
+   follow-up.
 
-Each PR keeps `cargo check/clippy/test` green and lands separately mergeable;
-Phase 1's schema change is bilateral and MUST NOT ship on one side alone.
+The adapter side is complete. What is inherently bilateral — the runtime
+honoring the `denied` list and physically deleting revoked bytes — is the
+coven-code counterpart; the adapter's refusal is the standalone guarantee, so a
+revoked memory can never influence a review regardless of the runtime.
