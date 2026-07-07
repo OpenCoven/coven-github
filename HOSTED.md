@@ -49,7 +49,7 @@ flowchart LR
 | Hosted Team | Product/platform teams | Multi-familiar routing, audit log, usage controls, priority queue, team memory. |
 | Hosted Dedicated | Security-sensitive orgs | Dedicated workers, stronger retention controls, custom limits, SLA, onboarding support. |
 
-Launch with flat monthly tiers and task caps. Avoid pure usage billing until task duration and model-cost distribution are known.
+Launch with flat monthly tiers and task caps. Avoid pure usage billing until task duration and model-cost distribution are known. The concrete tier matrix, launch price proposal, and the enforcement mechanism behind every promised limit live in [docs/pricing.md](docs/pricing.md).
 
 ## Buyer Promise
 
