@@ -134,7 +134,12 @@
           "items": { "type": "string", "enum": ["repo", "tenant_shared", "familiar_global"] }
         },
         "approval_required": { "type": "boolean" },
-        "retention_days": { "type": ["integer", "null"] }
+        "retention_days": { "type": ["integer", "null"] },
+        "denied": {
+          "type": "array",
+          "description": "Revoked memory keys/prefixes the runtime must not read or surface (issue #6). The adapter also refuses them on the result.",
+          "items": { "type": "string" }
+        }
       }
     }
   }
