@@ -6,8 +6,8 @@ shipped. Native GitHub "blocked by" relationships encode the same edges; this
 doc is the readable projection and the status ledger.
 
 > **Status: the engineering spine and all of Waves 0–4 are shipped.** What
-> remains is one in-progress hygiene skill (#14) and the two GTM issues that
-> never had code dependencies (#16, #17). See [Current state](#current-state).
+> remains is one in-progress hygiene skill (#14) and the GTM landing page (#16);
+> pricing (#17) has landed. See [Current state](#current-state).
 
 ## Critical path (the spine) — ✅ complete
 
@@ -25,7 +25,7 @@ Legend: ✅ shipped · 🔧 in progress · 🔲 open (no code dependency).
 
 **Wave 0 — foundation (no blockers)**
 - ✅ **#2** Durable task queue + delivery idempotency — the root; unblocked all of M2/M3/M4
-- 🔲 #16 Landing page + beta waitlist · 🔲 #17 Pricing tiers *(GTM, parallelizable, no code deps)*
+- 🔲 #16 Landing page + beta waitlist · ✅ #17 Pricing tiers *(GTM, parallelizable, no code deps)*
 
 **Wave 1 — unblocked by #2**
 - ✅ #3 Tenant-scoped task API auth
@@ -86,7 +86,7 @@ flowchart LR
   I18["#18 Cave dashboard"]:::done
   I14["#14 Branch Gardener"]:::wip
   I16["#16 landing/waitlist"]:::gtm
-  I17["#17 pricing"]:::gtm
+  I17["#17 pricing"]:::done
 
   I2 --> I4 --> I10 --> I13 --> I19
   I2 --> I3 & I5 & I11 & I14
@@ -111,8 +111,8 @@ The moat → hosted-V1 engineering backlog is effectively complete:
 **Remaining:**
 
 - 🔧 **#14 Branch Gardener** — scheduled branch-hygiene skill; in progress.
-- 🔲 **#16 / #17 (GTM)** — landing page + beta waitlist, and pricing tiers; no
-  code dependencies, sequenced by go-to-market rather than the DAG.
+- 🔲 **#16 (GTM)** — landing page + beta waitlist; no code dependency, sequenced
+  by go-to-market rather than the DAG. Pricing (#17) has shipped.
 
 With the code DAG drained, sequencing is now driven by the hosted beta gates
 (see [HOSTED.md](../HOSTED.md)) and GTM rather than inter-issue blockers.

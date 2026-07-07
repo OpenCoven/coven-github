@@ -147,6 +147,7 @@ remains is sequenced by the hosted beta gates and go-to-market, not code
 dependencies:
 
 1. **#14 Branch Gardener** — the last scheduled-hygiene skill (in progress).
-2. **#16 / #17 (GTM)** — landing page + beta waitlist, and pricing tiers.
+2. **#16 (GTM)** — landing page + beta waitlist (pricing #17 has shipped —
+   see [docs/pricing.md](docs/pricing.md)).
 3. Harden toward the hosted beta gates in [HOSTED.md](HOSTED.md) and stand up
    the hosted control plane on top of the now-durable, tenant-scoped adapter.
