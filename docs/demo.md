@@ -51,6 +51,11 @@ to the issue — in Cody's voice. Asserted: one comment, edited in place to
 `Status: done`; Check Run concluded `success`; PR is a draft; three distinct
 token scopes minted.
 
+**Act 1b — webhook redelivery.** The same delivery (identical
+`X-GitHub-Delivery` id) arrives again — GitHub redelivers on retries and
+manual redelivery. The durable delivery record deduplicates it (issue #2).
+Asserted: zero additional API calls, no second Check Run, session, or PR.
+
 **Act 2 — casual mention.** "thanks @coven-cody, great work on this!" triggers
 *nothing*. Asserted: the audit trail did not grow by a single API call.
 

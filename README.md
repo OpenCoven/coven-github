@@ -161,7 +161,7 @@ duplicate comments.
 | `coven-code --headless` execution | Partial | Worker spawns headless sessions with a tokenless session brief and enforces task timeouts; result quality depends on the runtime. |
 | Pull request creation | Partial | Opens draft PRs from session results against the repository's resolved default/base branch. |
 | CovenCave task polling | Partial | In-memory task API exists for local oversight; hosted control-plane auth and persistence are planned. |
-| Durable queue / task store | Planned | Required for hosted reliability and restarts. |
+| Durable queue / task store | Partial | Deliveries are persisted and deduplicated by `X-GitHub-Delivery` before GitHub hears success, and every routed task gets a durable record ([design](docs/durable-task-store.md)); worker claims + restart recovery land next. |
 | Hosted tier | Planned | See [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md). |
 | Familiar trust contract | Planned | See [Familiar Contract](FAMILIAR-CONTRACT.md). |
 

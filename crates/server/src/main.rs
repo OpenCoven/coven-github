@@ -86,6 +86,14 @@ async fn main() -> Result<()> {
 
             let config = Arc::new(config);
 
+            // Durable deliveries + tasks (issue #2): open before serving so a
+            // broken storage path fails the boot, not the first delivery.
+            let store = coven_github_store::Store::open(&config.storage.path)?;
+            tracing::info!(
+                "durable store ready at {}",
+                config.storage.path.display()
+            );
+
             let (task_tx, task_rx) = mpsc::channel(256);
             let task_store = TaskStore::default();
 
@@ -101,6 +109,7 @@ async fn main() -> Result<()> {
                 config: config.clone(),
                 task_tx,
                 task_store,
+                store,
             };
 
             let app = Router::new()

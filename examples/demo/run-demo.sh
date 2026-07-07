@@ -8,6 +8,8 @@
 #
 #   1. issue assigned      -> scoped tokens, Check Run, status comment,
 #                             familiar-voice draft PR back to the issue
+#   1b. webhook redelivery  -> same X-GitHub-Delivery id: deduplicated
+#                             durably, zero additional work (issue #2)
 #   2. casual mention      -> ignored (no mutation at all)
 #   3. bot's own comment   -> ignored (self-trigger loop guard)
 #   4. unknown verb        -> clarification reply, edited in place
@@ -94,6 +96,9 @@ workspace_root = "$DEMO_DIR/tasks"
 timeout_secs = 120
 max_retries = 0
 
+[storage]
+path = "$DEMO_DIR/store.db"
+
 [[familiars]]
 id = "cody"
 display_name = "Cody"
@@ -120,6 +125,8 @@ disown "$STUB_PID" "$SERVER_PID"
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 # Signs a payload the way GitHub does and delivers it to the webhook endpoint.
+# Every delivery carries a unique X-GitHub-Delivery id — the adapter requires
+# it as the idempotency key (issue #2).
 send_event() { # $1=event type  $2=payload json
   local event="$1" payload="$2" sig
   sig="sha256=$(printf '%s' "$payload" \
@@ -128,6 +135,7 @@ send_event() { # $1=event type  $2=payload json
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV_URL/webhook" \
     -H "X-GitHub-Event: $event" \
     -H "X-Hub-Signature-256: $sig" \
+    -H "X-GitHub-Delivery: ${3:-demo-$(openssl rand -hex 8)}" \
     -H 'Content-Type: application/json' \
     -d "$payload")"
   [[ "$code" == "200" ]] || { echo "delivery of '$event' failed: HTTP $code" >&2; exit 1; }
@@ -216,7 +224,8 @@ PING_BODY='{"zen":"Keep it logically awesome.","hook_id":1}'
 for _ in $(seq 1 120); do
   sig="sha256=$(printf '%s' "$PING_BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')"
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV_URL/webhook" \
-    -H 'X-GitHub-Event: ping' -H "X-Hub-Signature-256: $sig" -d "$PING_BODY" || true)"
+    -H 'X-GitHub-Event: ping' -H "X-Hub-Signature-256: $sig" \
+    -H "X-GitHub-Delivery: demo-ready-$(openssl rand -hex 8)" -d "$PING_BODY" || true)"
   [[ "$code" == "200" ]] && break
   sleep 0.25
 done
@@ -227,7 +236,7 @@ note "webhook endpoint verified with a signed ping (HMAC path proven)"
 
 banner "ACT 1 — Issue assigned to the familiar: the full loop"
 note "octocat assigns $REPO_OWNER/$REPO_NAME#$ISSUE to @coven-cody"
-send_event issues "$(cat <<EOF
+ASSIGN_PAYLOAD="$(cat <<EOF
 {
   "action": "assigned",
   "issue": {
@@ -246,6 +255,7 @@ send_event issues "$(cat <<EOF
 }
 EOF
 )"
+send_event issues "$ASSIGN_PAYLOAD" "demo-assign-1"
 wait_for "len(s['pulls']) == 1" "draft PR opened back to the issue"
 wait_for "any(c['conclusion'] == 'success' for c in s['check_runs'])" \
   "Check Run completed: success"
@@ -263,6 +273,16 @@ assert_state "{t['role'] for t in s['tokens_minted']} == {'orchestration', 'agen
 note ""
 note "The one visible status surface on issue #$ISSUE:"
 show_status_comment
+
+banner "ACT 1b — GitHub redelivers the webhook: idempotent, no duplicate work"
+note "same X-GitHub-Delivery id delivered again (manual redelivery / retry)"
+BEFORE=$(audit_len)
+send_event issues "$ASSIGN_PAYLOAD" "demo-assign-1"
+sleep 2
+assert_state "s['audit_len'] == $BEFORE" \
+  "redelivery acknowledged without a single GitHub API call"
+assert_state "len(s['pulls']) == 1 and len(s['check_runs']) == 1" \
+  "no second session, Check Run, or PR — delivery id deduplicated durably"
 
 banner "ACT 2 — Casual mention: ignored, zero API calls"
 BEFORE=$(audit_len)

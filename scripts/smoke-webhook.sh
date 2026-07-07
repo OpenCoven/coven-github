@@ -5,6 +5,7 @@
 #   1. an unsigned request is rejected (401 missing signature)
 #   2. a request with a bad signature is rejected (401 invalid signature)
 #   3. a correctly HMAC-signed request is accepted (200 ok)
+#   4. a signed request without X-GitHub-Delivery is rejected (400)
 #
 # It signs with the same scheme GitHub uses (HMAC-SHA256, `sha256=` prefix), so
 # a green run proves the signature path end-to-end without a real delivery.
@@ -53,6 +54,12 @@ status "bad signature rejected" 401 \
 # 3. Valid signature → 200
 SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
 status "valid signature accepted" 200 \
+  -X POST -H 'X-GitHub-Event: ping' \
+  -H "X-GitHub-Delivery: smoke-$(openssl rand -hex 8)" \
+  -H "X-Hub-Signature-256: $SIG" -d "$BODY" "$URL"
+
+# 4. Valid signature but no delivery id → 400 (idempotency key required)
+status "missing delivery id rejected" 400 \
   -X POST -H 'X-GitHub-Event: ping' \
   -H "X-Hub-Signature-256: $SIG" -d "$BODY" "$URL"
 

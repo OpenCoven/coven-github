@@ -13,6 +13,29 @@ pub struct Config {
     /// Automatic review trigger policy. Absent section = all lanes off.
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Durable adapter state (issue #2). Absent section = default path.
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+/// Durable store location. See `docs/durable-task-store.md`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageConfig {
+    /// SQLite database path; parent directories are created at startup.
+    #[serde(default = "default_storage_path")]
+    pub path: PathBuf,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            path: default_storage_path(),
+        }
+    }
+}
+
+fn default_storage_path() -> PathBuf {
+    PathBuf::from("data/coven-github.db")
 }
 
 /// Automatic review trigger policy (issue #10). Lanes default to off.
@@ -264,6 +287,33 @@ impl Config {
             }
         }
 
+        // ── Storage ─────────────────────────────────────────────────────
+        if self.storage.path.is_dir() {
+            out.push(Diagnostic::error(
+                "storage.path",
+                format!(
+                    "'{}' is a directory — storage.path must be the SQLite database file itself.",
+                    self.storage.path.display()
+                ),
+            ));
+        } else if !self.storage.path.exists() {
+            // Startup creates the file and any missing parents; surface where
+            // it will land so operators mount/persist the right volume.
+            let parent = self
+                .storage
+                .path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            out.push(Diagnostic::warning(
+                "storage.path",
+                format!(
+                    "database does not exist yet — it will be created under '{parent}' at startup; make sure that path is on a persistent volume."
+                ),
+            ));
+        }
+
         // ── Review policy ───────────────────────────────────────────────
         let known_ids: std::collections::HashSet<&str> =
             self.familiars.iter().map(|f| f.id.as_str()).collect();
@@ -370,6 +420,9 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         "review.familiar" => {
             "Set review.familiar (or the repo override's familiar) to the id of a configured [[familiars]] block."
         }
+        "storage.path" => {
+            "Point storage.path at a writable SQLite file location on a persistent volume."
+        }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
 }
@@ -468,6 +521,7 @@ mod tests {
             worker,
             familiars,
             review: ReviewConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 

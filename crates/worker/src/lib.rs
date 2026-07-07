@@ -1513,6 +1513,7 @@ mod disposition_tests {
             },
             familiars: vec![],
             review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
         }
     }
 
@@ -1623,6 +1624,7 @@ mod process_tests {
                 trigger_labels: vec![],
             }],
             review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
         }
     }
 
@@ -1895,6 +1897,7 @@ exit 0
             },
             familiars: vec![familiar.clone()],
             review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
         };
         let task = Task {
             id: "task-pub".to_string(),
@@ -2027,6 +2030,7 @@ mod supersession_tests {
                 trigger_labels: vec![],
             }],
             review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
         };
         let task = Task {
             id: "task-old".to_string(),
@@ -2186,6 +2190,7 @@ exit 0
                 trigger_labels: vec![],
             }],
             review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
         };
         let task = Task {
             id: "task-stale".to_string(),
@@ -2303,6 +2308,7 @@ mod command_and_marker_tests {
                 trigger_labels: vec![],
             }],
             review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
         }
     }
 

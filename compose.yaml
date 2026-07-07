@@ -23,6 +23,9 @@ services:
       - ./keys:/keys:ro
       # Ephemeral per-task workspaces. Keep worker.workspace_root pointed here.
       - coven-workspaces:/tmp/coven-github-tasks
+      # Durable adapter state (webhook idempotency + task records). Point
+      # storage.path at /data/coven-github.db in local.toml.
+      - coven-data:/data
     environment:
       # Adjust log verbosity, e.g. RUST_LOG=coven_github=debug
       RUST_LOG: "coven_github=info"
@@ -30,3 +33,4 @@ services:
 
 volumes:
   coven-workspaces:
+  coven-data:

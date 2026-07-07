@@ -1,7 +1,7 @@
 # Durable task store and delivery idempotency — design (issue #2)
 
-Status: **proposed** — this document is the review surface for the design;
-implementation follows in phased PRs once it is agreed.
+Status: **accepted** — phase 1 (store crate + delivery idempotency) is
+implemented; phases 2–3 below are pending.
 
 ## Problem
 
