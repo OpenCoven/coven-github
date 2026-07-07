@@ -114,9 +114,11 @@ pub fn build(
         // adapter-initiated review lane rides on pr_review_comment plus
         // review_context until native pull_request/push triggers land in v3.
         TaskKind::ReviewPullRequest { .. } => "pr_review_comment",
-        // CommandReply is executed adapter-side before briefing (issue #13);
-        // this arm is a safe fallback, not an expected path.
+        // CommandReply and CancelReviews are executed adapter-side before
+        // briefing (issue #13); these arms are safe fallbacks, not expected
+        // paths.
         TaskKind::CommandReply { .. } => "issue_mention",
+        TaskKind::CancelReviews { .. } => "issue_mention",
     };
 
     let task_brief = match &task.kind {
@@ -148,6 +150,10 @@ pub fn build(
         TaskKind::CommandReply { issue_number, body } => TaskBrief::RespondToMention {
             issue_number: *issue_number,
             comment_body: body.clone(),
+        },
+        TaskKind::CancelReviews { pr_number } => TaskBrief::RespondToMention {
+            issue_number: *pr_number,
+            comment_body: format!("Cancel queued reviews for PR #{pr_number}."),
         },
         TaskKind::ReviewPullRequest {
             pr_number,

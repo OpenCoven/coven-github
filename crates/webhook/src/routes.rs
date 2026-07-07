@@ -405,8 +405,9 @@ struct CommandSurface<'a> {
     commander: &'a str,
 }
 
-/// Maps a typed maintainer command to a task. Work commands carry the
-/// commander for the worker's permission gate; replies carry none.
+/// Maps a typed maintainer command to a task. Work commands and gated
+/// acknowledgements (cancel, remember/forget) carry the commander for the
+/// worker's permission gate; clarifications and status replies carry none.
 async fn command_task(
     state: &AppState,
     familiar: &coven_github_config::FamiliarConfig,
@@ -472,29 +473,27 @@ async fn command_task(
             },
             commander,
         ),
-        Command::Cancel if s.on_pull_request => {
-            // Tombstone queued reviews for this PR. In-flight work is not
-            // interrupted (documented limitation); the next review command or
-            // PR event re-arms the lane.
-            let cancelled = state
-                .store
-                .cancel_queued(&format!("{repo}#{}", s.number))
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("cancel could not reach the store: {e:#}");
-                    0
-                });
-            reply(format!(
-                "Cancelled {cancelled} queued review(s) for PR #{}. Work already running will finish; `@{} review` re-arms the lane.",
-                s.number,
-                familiar.bot_username.trim_end_matches("[bot]")
-            ))
-        }
+        // Cancellation mutates queued work, so it rides a gated adapter task:
+        // the worker verifies the commander's write access before tombstoning
+        // anything (issue #13). In-flight work is not interrupted (documented
+        // limitation); the next review command or PR event re-arms the lane.
+        Command::Cancel if s.on_pull_request => make(
+            TaskKind::CancelReviews {
+                pr_number: s.number,
+            },
+            commander,
+        ),
         Command::Cancel => reply("`cancel` currently applies to queued pull-request reviews only.".to_string()),
-        Command::Remember { .. } | Command::Forget { .. } => reply(
-            "Noted, but memory persistence is not wired up yet — it lands with the hosted \
-             memory governance contract (#6). Nothing was stored or deleted."
-                .to_string(),
+        // Memory acknowledgements are gated too: only maintainers should hear
+        // how the familiar handles memory intents.
+        Command::Remember { .. } | Command::Forget { .. } => make(
+            TaskKind::CommandReply {
+                issue_number: s.number,
+                body: "Noted, but memory persistence is not wired up yet — it lands with the \
+                       hosted memory governance contract (#6). Nothing was stored or deleted."
+                    .to_string(),
+            },
+            commander,
         ),
         Command::Status => {
             let items = state
@@ -1096,7 +1095,7 @@ mod command_routing_tests {
     }
 
     #[tokio::test]
-    async fn cancel_command_tombstones_queued_reviews_and_acknowledges() {
+    async fn cancel_command_rides_a_gated_task_not_a_route_side_mutation() {
         let state = app_state();
         let queued = Task {
             id: "task-queued".to_string(),
@@ -1115,21 +1114,21 @@ mod command_routing_tests {
 
         let task = event_to_task(&state, pr_comment("@coven-cody cancel"))
             .await
-            .expect("cancel should acknowledge");
+            .expect("cancel should route");
 
+        // The route must NOT tombstone anything — the worker does, after the
+        // commander's write access is verified (issue #13).
         let states = state.store.task_states().await.expect("states");
         assert_eq!(
             states,
-            vec![("task-queued".to_string(), "superseded".to_string())],
-            "queued review must be superseded by the cancel tombstone"
+            vec![("task-queued".to_string(), "queued".to_string())],
+            "queued review must be untouched until the gate passes"
         );
         match task.kind {
-            TaskKind::CommandReply { issue_number, body } => {
-                assert_eq!(issue_number, 88);
-                assert!(body.contains("Cancelled 1 queued review"));
-            }
-            other => panic!("expected CommandReply, got {other:?}"),
+            TaskKind::CancelReviews { pr_number } => assert_eq!(pr_number, 88),
+            other => panic!("expected CancelReviews, got {other:?}"),
         }
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
     }
 
     #[tokio::test]
@@ -1138,6 +1137,9 @@ mod command_routing_tests {
         let task = event_to_task(&state, pr_comment("@coven-cody remember we ship Fridays"))
             .await
             .expect("remember should acknowledge");
+        // The acknowledgement is gated: it carries the commander so the
+        // worker verifies write access before replying (issue #13).
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
         match task.kind {
             TaskKind::CommandReply { body, .. } => {
                 assert!(body.contains("#6"));

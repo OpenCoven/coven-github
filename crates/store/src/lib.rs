@@ -303,14 +303,35 @@ impl Store {
     /// Tombstones every still-queued task for a supersession key (the
     /// maintainer `cancel` command). Returns how many were cancelled.
     pub async fn cancel_queued(&self, supersede_key: &str) -> Result<usize> {
+        self.supersede_queued(supersede_key, None).await
+    }
+
+    /// Post-gate supersession for a command-initiated review (issue #13):
+    /// once the worker has verified the commander's write access, older
+    /// queued reviews of the same PR yield to `current_task_id`.
+    pub async fn supersede_queued_except(
+        &self,
+        supersede_key: &str,
+        current_task_id: &str,
+    ) -> Result<usize> {
+        self.supersede_queued(supersede_key, Some(current_task_id.to_string()))
+            .await
+    }
+
+    async fn supersede_queued(
+        &self,
+        supersede_key: &str,
+        except_task_id: Option<String>,
+    ) -> Result<usize> {
         let conn = self.conn.clone();
         let key = supersede_key.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
             let n = conn.execute(
                 "UPDATE tasks SET state = 'superseded', updated_at = ?1
-                 WHERE supersede_key = ?2 AND state = 'queued'",
-                params![now_rfc3339(), key],
+                 WHERE supersede_key = ?2 AND state = 'queued'
+                   AND (?3 IS NULL OR id <> ?3)",
+                params![now_rfc3339(), key, except_task_id],
             )?;
             Ok(n)
         })
@@ -542,13 +563,19 @@ fn record_delivery_sync(
     if let Some(task) = task {
         let repo = format!("{}/{}", task.repo_owner, task.repo_name);
         let supersede_key = supersede_key(task);
-        if let Some(key) = &supersede_key {
-            // A newer review of the same PR supersedes anything still queued.
-            tx.execute(
-                "UPDATE tasks SET state = 'superseded', updated_at = ?1
-                 WHERE supersede_key = ?2 AND state = 'queued'",
-                params![now, key],
-            )?;
+        // Only adapter-initiated (auto) reviews may tombstone at insert.
+        // Command-initiated reviews carry a commander whose write access the
+        // worker has not yet verified — they supersede older queued reviews
+        // post-gate instead (issue #13), so a drive-by `review` comment can
+        // never displace legitimate queued work.
+        if task.commander.is_none() {
+            if let Some(key) = &supersede_key {
+                tx.execute(
+                    "UPDATE tasks SET state = 'superseded', updated_at = ?1
+                     WHERE supersede_key = ?2 AND state = 'queued'",
+                    params![now, key],
+                )?;
+            }
         }
         tx.execute(
             "INSERT INTO tasks
@@ -927,5 +954,89 @@ mod queue_tests {
         assert_eq!(items.len(), 1, "adapter replies are not Cave tasks");
         assert_eq!(items[0].id, "work");
         assert_eq!(items[0].status, TaskListStatus::Queued);
+    }
+}
+
+#[cfg(test)]
+mod command_gate_tests {
+    //! Insert-time supersession is an auto-review privilege; command reviews
+    //! wait for the worker's write-access gate (issue #13).
+    use super::*;
+
+    fn delivery(id: &str) -> Delivery {
+        Delivery {
+            delivery_id: id.to_string(),
+            event: "pull_request".to_string(),
+            action: Some("synchronize".to_string()),
+            installation_id: Some(1),
+            repo: Some("OpenCoven/demo".to_string()),
+            payload_hash: "h".to_string(),
+        }
+    }
+
+    fn review(id: &str, commander: Option<&str>) -> Task {
+        Task {
+            id: id.to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: commander.map(str::to_string),
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "t".to_string(),
+                reason: "synchronize".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn command_review_does_not_tombstone_at_insert() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .record_delivery(delivery("d1"), Routing::Task(&review("auto", None)))
+            .await
+            .expect("auto review");
+        // An unverified commander's review must not displace queued work.
+        store
+            .record_delivery(
+                delivery("d2"),
+                Routing::Task(&review("commanded", Some("drive-by"))),
+            )
+            .await
+            .expect("commanded review");
+
+        let states: HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["auto"], "queued", "insert-time tombstone is auto-only");
+        assert_eq!(states["commanded"], "queued");
+    }
+
+    #[tokio::test]
+    async fn post_gate_supersession_spares_the_current_task() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .record_delivery(delivery("d1"), Routing::Task(&review("older", None)))
+            .await
+            .expect("older review");
+        store
+            .record_delivery(
+                delivery("d2"),
+                Routing::Task(&review("commanded", Some("octocat"))),
+            )
+            .await
+            .expect("commanded review");
+
+        // The worker calls this once the commander passed the write gate.
+        let n = store
+            .supersede_queued_except("OpenCoven/demo#88", "commanded")
+            .await
+            .expect("supersede");
+        assert_eq!(n, 1);
+
+        let states: HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["older"], "superseded");
+        assert_eq!(states["commanded"], "queued", "the commanding task survives");
     }
 }
