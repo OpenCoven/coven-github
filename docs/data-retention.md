@@ -25,8 +25,9 @@ survives.
 | `audit_events` | Yes | `api_audit`, table states below | See [Audit events](#audit-events). |
 | `memory_activity` | Opt-in, retention-limited | `memory_activity` | Per-installation; see [issue #6](memory-contract.md). |
 | `logs` / `transcripts` | Not persisted by the adapter | — | Streamed/redacted only; durable transcripts are out of scope until opt-in retention is designed. |
-| `repo_checkout` | **Never** after task cleanup | ephemeral workspace | Workspace is deleted after every task. Container-isolated cleanup is issue #5. |
-| `tokens` / `secrets` | **Never** | — | The brief is tokenless (#4); results, comments, Check Runs, and stored fields are redacted. |
+| `repo_checkout` | **Never** after task cleanup | ephemeral workspace | The per-task workspace is deleted after every task (success or failure); the container backend also removes the container (`--rm`). A cleanup failure that would leave a checkout on disk is surfaced and audited (`workspace_cleanup_failed`), never swallowed. |
+| `container_logs` | **Not persisted** | — | The container backend (#5) captures no stdout/stderr into any store; only the redacted failure detail reaches `task_attempts.detail`. |
+| `tokens` / `secrets` | **Never** | — | The brief is tokenless (#4); the git token travels to the runtime by environment name only (never in argv or container-inspect output); results, comments, Check Runs, and stored fields are redacted. |
 
 ## Redaction
 
@@ -78,10 +79,19 @@ never logged or stored.
 | Memory | Operator-managed, off by default | Opt-in, per-installation, revocable |
 | Worker isolation | May run on host | Container-isolated per task (#5) |
 
+## Worker execution artifacts
+
+The worker runs each task in a per-task workspace, then deletes it — on every
+path, success or failure. In the container backend (#5) the task runs in a
+fresh container removed by `--rm` (and killed by name on timeout), with a
+read-only root, dropped capabilities, resource limits, and only the workspace
+mounted; the git token is forwarded by environment *name*, so it never enters
+argv or `docker inspect`. If workspace removal ever fails while the checkout is
+still on disk, the worker logs it loudly and records a `workspace_cleanup_failed`
+audit entry rather than silently leaving private code behind.
+
 ## Not yet covered
 
-- Container-scoped artifact handling — `repo_checkout` cleanup guarantees and
-  container log retention — lands with hosted worker isolation (#5).
 - A unified append-only audit-event log (the tables above already provide the
   equivalent records; a single stream is a possible future consolidation).
 - Durable, opt-in agent transcripts with their own redaction/retention policy.
