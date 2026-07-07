@@ -143,6 +143,13 @@ pub struct ReviewConfig {
     pub include_drafts: bool,
     /// Adapter-authored instruction forwarded as the brief's audit_instruction.
     pub audit_instruction: Option<String>,
+    /// Minimum finding severity that publishes (`info`, `low`, `medium`,
+    /// `high`, `critical`). Absent = every severity publishes (issue #11).
+    pub min_severity: Option<String>,
+    /// Where gated findings publish (issue #11): `check_run` (default),
+    /// `advisory_comment` (also on the status comment), or `request_changes`
+    /// (submit a PR review that requests changes when findings exist).
+    pub publish: Option<String>,
     /// Per-repo overrides keyed "owner/name".
     #[serde(default)]
     pub repos: std::collections::HashMap<String, RepoReviewOverride>,
@@ -155,6 +162,8 @@ pub struct RepoReviewOverride {
     pub include_drafts: Option<bool>,
     pub familiar: Option<String>,
     pub audit_instruction: Option<String>,
+    pub min_severity: Option<String>,
+    pub publish: Option<String>,
 }
 
 impl ReviewConfig {
@@ -184,6 +193,20 @@ impl ReviewConfig {
         self.overrides(repo)
             .and_then(|o| o.audit_instruction.clone())
             .or_else(|| self.audit_instruction.clone())
+    }
+
+    /// Minimum publishable severity for `repo` (raw string; issue #11).
+    pub fn min_severity_for(&self, repo: &str) -> Option<String> {
+        self.overrides(repo)
+            .and_then(|o| o.min_severity.clone())
+            .or_else(|| self.min_severity.clone())
+    }
+
+    /// Findings publication mode for `repo` (raw string; issue #11).
+    pub fn publish_for(&self, repo: &str) -> Option<String> {
+        self.overrides(repo)
+            .and_then(|o| o.publish.clone())
+            .or_else(|| self.publish.clone())
     }
 }
 
@@ -476,6 +499,40 @@ impl Config {
                 );
             }
         }
+        // Publication policy values are closed enums (issue #11): a typo would
+        // silently change what publishes, so doctor rejects unknown values.
+        let severities = ["info", "low", "medium", "high", "critical"];
+        let publish_modes = ["check_run", "advisory_comment", "request_changes"];
+        let mut check_policy = |scope: &str, min_severity: Option<&str>, publish: Option<&str>| {
+            if let Some(value) = min_severity {
+                if !severities.contains(&value.to_ascii_lowercase().as_str()) {
+                    out.push(Diagnostic::error(
+                        "review.min_severity",
+                        format!("{scope} has unknown min_severity '{value}' — use one of: {}.", severities.join(", ")),
+                    ));
+                }
+            }
+            if let Some(value) = publish {
+                if !publish_modes.contains(&value.to_ascii_lowercase().as_str()) {
+                    out.push(Diagnostic::error(
+                        "review.publish",
+                        format!("{scope} has unknown publish mode '{value}' — use one of: {}.", publish_modes.join(", ")),
+                    ));
+                }
+            }
+        };
+        check_policy(
+            "the [review] section",
+            self.review.min_severity.as_deref(),
+            self.review.publish.as_deref(),
+        );
+        for (repo, o) in &self.review.repos {
+            check_policy(
+                &format!("the review override for '{repo}'"),
+                o.min_severity.as_deref(),
+                o.publish.as_deref(),
+            );
+        }
 
         // ── Memory governance (issue #6) ────────────────────────────────
         // Memory is off by default; when an operator enables it anywhere,
@@ -584,6 +641,12 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         }
         "api.tenants[].token" => {
             "Generate long random tokens (e.g. openssl rand -hex 32) and keep each scope's token unique."
+        }
+        "review.min_severity" => {
+            "Set review.min_severity to one of: info, low, medium, high, critical."
+        }
+        "review.publish" => {
+            "Set review.publish to one of: check_run, advisory_comment, request_changes."
         }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
@@ -729,6 +792,8 @@ mod tests {
             pull_request: true,
             include_drafts: false,
             audit_instruction: Some("global".to_string()),
+            min_severity: Some("medium".to_string()),
+            publish: None,
             repos: std::collections::HashMap::from([(
                 "OpenCoven/quiet".to_string(),
                 RepoReviewOverride {
@@ -736,9 +801,26 @@ mod tests {
                     include_drafts: Some(true),
                     familiar: Some("nova".to_string()),
                     audit_instruction: None,
+                    min_severity: None,
+                    publish: Some("advisory_comment".to_string()),
                 },
             )]),
         };
+
+        // Publication policy inherits globally and overrides per repo (#11).
+        assert_eq!(
+            policy.min_severity_for("OpenCoven/loud").as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            policy.min_severity_for("OpenCoven/quiet").as_deref(),
+            Some("medium")
+        );
+        assert_eq!(policy.publish_for("OpenCoven/loud"), None);
+        assert_eq!(
+            policy.publish_for("OpenCoven/quiet").as_deref(),
+            Some("advisory_comment")
+        );
 
         assert!(policy.pull_request_enabled("OpenCoven/loud"));
         assert!(!policy.pull_request_enabled("OpenCoven/quiet"));

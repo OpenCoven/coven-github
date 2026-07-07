@@ -14,6 +14,7 @@ use coven_github_config::{Config, FamiliarConfig};
 use coven_github_store::{Store, Terminal, TerminalState};
 
 pub mod brief;
+pub mod findings;
 pub mod memory;
 pub mod redact;
 pub mod status_comment;
@@ -416,6 +417,60 @@ async fn execute_task_with_minter(
                 .finish(&task.id, terminal_of(&published))
                 .await
                 .ok();
+            // Findings pass the deterministic publication gates before any
+            // surface sees them (issue #11): scope, severity policy, dedupe.
+            // The digest always lands on the Check Run; policy can add the
+            // status comment (advisory) or a blocking PR review verdict.
+            let mut check_summary = published.result.summary.clone();
+            let mut advisory: Option<String> = None;
+            if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+                let repo_key = format!("{}/{}", task.repo_owner, task.repo_name);
+                let min_severity = config
+                    .review
+                    .min_severity_for(&repo_key)
+                    .as_deref()
+                    .and_then(findings::parse_severity);
+                let outcome = findings::gate(
+                    &published.result.review,
+                    &published.changed_files,
+                    min_severity,
+                );
+                let report = findings::render(&outcome);
+                check_summary = format!("{check_summary}\n\n{report}");
+                match config.review.publish_for(&repo_key).as_deref() {
+                    Some("advisory_comment") => advisory = Some(report),
+                    Some("request_changes") => {
+                        // Blocking verdicts need write authority: mint the
+                        // publication token only now, post-gates (issue #4).
+                        let verdict = if outcome.published.is_empty() {
+                            pr::ReviewVerdict::Comment
+                        } else {
+                            pr::ReviewVerdict::RequestChanges
+                        };
+                        match minter.mint(TokenRole::Publication).await {
+                            Ok(publication) => {
+                                if let Err(e) = pr::submit_review_with_base_url(
+                                    api_base_url,
+                                    &publication,
+                                    &task.repo_owner,
+                                    &task.repo_name,
+                                    *pr_number,
+                                    verdict,
+                                    &check_summary,
+                                )
+                                .await
+                                {
+                                    warn!(task_id = %task.id, "failed to submit PR review: {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(task_id = %task.id, "failed to mint publication token for review verdict: {e:#}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // Terminal state on the marker-backed status surface (issue #13).
             if let Some(number) = surface_number(&task.kind) {
                 let marker = status_comment::marker(
@@ -424,8 +479,11 @@ async fn execute_task_with_minter(
                     &task.repo_name,
                     number,
                 );
-                let body =
+                let mut body =
                     final_status_body(config, &task.id, &published.result, published.opened_pr);
+                if let Some(report) = &advisory {
+                    body = format!("{body}\n\n{report}");
+                }
                 if let Err(e) = status_comment::upsert(
                     api_base_url,
                     &orchestration,
@@ -448,7 +506,7 @@ async fn execute_task_with_minter(
                 check_id,
                 disp.conclusion,
                 disp.title,
-                &published.result.summary,
+                &check_summary,
             )
             .await
             {
@@ -519,6 +577,9 @@ async fn execute_task_with_minter(
 struct Published {
     result: SessionResult,
     opened_pr: Option<u64>,
+    /// PR changed-file list fetched from live GitHub state (review tasks) —
+    /// one input to the findings scope gate (issue #11).
+    changed_files: Vec<String>,
     /// Set when a PR review's head moved while the session ran (issue #8):
     /// the findings were computed against `reviewed_sha`, but the PR is now
     /// at `current_sha`. Publication must mark the task superseded instead of
@@ -761,6 +822,7 @@ async fn run_and_publish(
             return Ok(Published {
                 result,
                 opened_pr: None,
+                changed_files: Vec::new(),
                 stale: Some(StaleRefs {
                     reviewed_sha: targets.head_sha.clone(),
                     current_sha: refs.head_sha,
@@ -826,6 +888,7 @@ async fn run_and_publish(
     Ok(Published {
         result,
         opened_pr,
+        changed_files: review.map(|r| r.files).unwrap_or_default(),
         stale: None,
     })
 }
@@ -2816,5 +2879,245 @@ impl WithId for Task {
     fn with_id(mut self, id: &str) -> Self {
         self.id = id.to_string();
         self
+    }
+}
+
+#[cfg(test)]
+mod publication_gate_tests {
+    //! End-to-end proof of the findings publication gates (issue #11):
+    //! out-of-scope, duplicate, and below-threshold findings are withheld,
+    //! the digest is honest about it, and the `request_changes` /
+    //! `advisory_comment` policy modes route the verdict correctly.
+    use super::*;
+    use coven_github_api::installation::TokenRole;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORCHESTRATION: &str = "ghs_orchestration0000000000000000000000";
+    const AGENT_GIT: &str = "ghs_agentgit000000000000000000000000000";
+    const PUBLICATION: &str = "ghs_publication0000000000000000000000000";
+
+    fn fixed_minter() -> Minter {
+        Minter::Fixed(HashMap::from([
+            (TokenRole::Orchestration, ORCHESTRATION.to_string()),
+            (TokenRole::AgentGit, AGENT_GIT.to_string()),
+            (TokenRole::Publication, PUBLICATION.to_string()),
+        ]))
+    }
+
+    /// Review result with one publishable HIGH finding plus one duplicate,
+    /// one out-of-scope file, and one INFO nit for the threshold gate.
+    const RESULT_JSON: &str = r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"Reviewed the change.","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[{"severity":"high","file":"src/lib.rs","line":10,"title":"Off-by-one","body":"Loop bound skips the last element.","recommendation":null},{"severity":"high","file":"src/lib.rs","line":10,"title":"Off-by-one","body":"Loop bound skips the last element.","recommendation":null},{"severity":"critical","file":"secrets/vault.rs","line":null,"title":"Speculative","body":"Never consulted this file.","recommendation":null},{"severity":"info","file":"src/lib.rs","line":20,"title":"Nit","body":"Prefer a doc comment.","recommendation":null}],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}"#;
+
+    async fn run_review(policy: coven_github_config::ReviewConfig) -> Vec<wiremock::Request> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/pulls/88"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "head": { "ref": "feat/x", "sha": "stable-sha" },
+                "base": { "ref": "main", "sha": "base-sha" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/pulls/88/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "filename": "src/lib.rs" }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/check-runs"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 7})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/OpenCoven/demo/check-runs/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/88/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/88/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/pulls/88/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let script = format!("#!/usr/bin/env bash\ncat > \"$5\" <<'RESULT'\n{RESULT_JSON}\nRESULT\nexit 0\n");
+        let root =
+            std::env::temp_dir().join(format!("coven-github-gates-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test dir");
+        let script_path = root.join("fake-coven-code.sh");
+        fs::write(&script_path, script).expect("script written");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let config = Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("/nonexistent/never-read.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: Some(server.uri()),
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: script_path,
+                workspace_root: root.clone(),
+                timeout_secs: 30,
+                max_retries: 0,
+            },
+            familiars: vec![FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec![],
+            }],
+            review: policy,
+            storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
+        };
+        let task = Task {
+            id: "task-gates".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "t".to_string(),
+                reason: "synchronize".to_string(),
+            },
+        };
+
+        execute_task_with_minter(
+            &config,
+            Store::open_in_memory().expect("store"),
+            task,
+            &fixed_minter(),
+        )
+        .await
+        .expect("review must publish cleanly");
+
+        let requests = server.received_requests().await.expect("requests");
+        let _ = fs::remove_dir_all(root);
+        requests
+    }
+
+    fn policy(min_severity: Option<&str>, publish: Option<&str>) -> coven_github_config::ReviewConfig {
+        coven_github_config::ReviewConfig {
+            familiar: Some("cody".to_string()),
+            pull_request: true,
+            include_drafts: false,
+            audit_instruction: None,
+            min_severity: min_severity.map(str::to_string),
+            publish: publish.map(str::to_string),
+            repos: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_digest_lands_on_the_check_run_with_honest_counts() {
+        let requests = run_review(policy(Some("medium"), None)).await;
+        let terminal = requests
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "PATCH"
+                    && r.url.path() == "/repos/OpenCoven/demo/check-runs/7"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .next_back()
+            .expect("terminal check patch");
+        assert!(terminal.contains("Off-by-one"), "digest published: {terminal}");
+        assert!(
+            !terminal.contains("Speculative"),
+            "out-of-scope finding must be withheld: {terminal}"
+        );
+        assert!(
+            !terminal.contains("Prefer a doc comment"),
+            "below-threshold finding must be withheld: {terminal}"
+        );
+        assert!(
+            terminal.contains("3 finding(s) withheld"),
+            "withheld counts must be stated: {terminal}"
+        );
+        // Default mode: no PR review submitted, no advisory digest on comment.
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.url.path() == "/repos/OpenCoven/demo/pulls/88/reviews"),
+            "check_run mode must not submit a PR review"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_changes_mode_submits_a_blocking_review_with_write_authority() {
+        let requests = run_review(policy(None, Some("request_changes"))).await;
+        let review_post = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/pulls/88/reviews"
+            })
+            .expect("PR review must be submitted");
+        let body = String::from_utf8_lossy(&review_post.body);
+        assert!(body.contains("REQUEST_CHANGES"), "verdict: {body}");
+        assert!(body.contains("Off-by-one"), "digest in verdict body: {body}");
+        // The verdict is write-authority work: publication token, never
+        // orchestration (issue #4 boundary).
+        let auth = review_post
+            .headers
+            .get("authorization")
+            .expect("auth header")
+            .to_str()
+            .expect("ascii");
+        assert_eq!(auth, format!("Bearer {PUBLICATION}"));
+    }
+
+    #[tokio::test]
+    async fn advisory_mode_appends_the_digest_to_the_status_comment() {
+        let requests = run_review(policy(None, Some("advisory_comment"))).await;
+        let comment_bodies: Vec<String> = requests
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/88/comments"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert!(
+            comment_bodies
+                .iter()
+                .any(|b| b.contains("Status: done") && b.contains("Off-by-one")),
+            "advisory digest must ride the status comment: {comment_bodies:?}"
+        );
     }
 }

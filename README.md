@@ -113,7 +113,13 @@ Planned lanes:
 | Trigger | Status |
 |---|---|
 | Push / commit-range review | `push` events are parsed and typed with fixtures today; execution needs a PR-less task kind, which ships with headless contract v3 |
-| Advisory / blocking publication gates | Issue #11 |
+
+Review findings pass **deterministic publication gates** before any surface
+sees them: out-of-scope files (never consulted by the session), findings below
+the repo's `min_severity` policy, and duplicates are withheld — with the
+withheld counts stated in the digest. The `[review] publish` policy routes the
+gated digest to the Check Run (default), additionally to the status comment
+(`advisory_comment`), or as a blocking PR review verdict (`request_changes`).
 
 ## Maintainer commands
 

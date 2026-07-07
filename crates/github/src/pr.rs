@@ -265,6 +265,60 @@ fn update_comment_request(
     }
 }
 
+/// Verdict of an adapter-submitted PR review (issue #11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    /// Findings exist: block with requested changes.
+    RequestChanges,
+    /// Nothing actionable: a non-blocking comment review.
+    Comment,
+}
+
+impl ReviewVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
+            ReviewVerdict::Comment => "COMMENT",
+        }
+    }
+}
+
+/// Submits a pull request review with the given verdict and body
+/// (`request_changes` publication mode, issue #11).
+pub async fn submit_review_with_base_url(
+    api_base_url: &str,
+    installation_token: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+    verdict: ReviewVerdict,
+    body: &str,
+) -> Result<()> {
+    let client = client()?;
+    send_json(
+        &client,
+        api_base_url,
+        installation_token,
+        submit_review_request(repo_owner, repo_name, pr_number, verdict, body),
+    )
+    .await?;
+    Ok(())
+}
+
+fn submit_review_request(
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+    verdict: ReviewVerdict,
+    body: &str,
+) -> GitHubRequest {
+    GitHubRequest {
+        method: "POST",
+        path: format!("/repos/{repo_owner}/{repo_name}/pulls/{pr_number}/reviews"),
+        body: serde_json::json!({ "event": verdict.as_str(), "body": body }),
+    }
+}
+
 #[cfg(test)]
 mod comment_tests {
     use super::*;
@@ -283,6 +337,16 @@ mod comment_tests {
         assert_eq!(request.method, "PATCH");
         assert_eq!(request.path, "/repos/octo/repo/issues/comments/77");
         assert_eq!(request.body["body"], json!("new body"));
+    }
+
+    #[test]
+    fn submit_review_request_posts_the_verdict() {
+        let request =
+            submit_review_request("octo", "repo", 88, ReviewVerdict::RequestChanges, "digest");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/repos/octo/repo/pulls/88/reviews");
+        assert_eq!(request.body["event"], json!("REQUEST_CHANGES"));
+        assert_eq!(request.body["body"], json!("digest"));
     }
 
     #[test]
