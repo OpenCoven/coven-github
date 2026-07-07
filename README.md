@@ -160,7 +160,7 @@ duplicate comments.
 | Headless execution contract | Locked (v1) | Brief, result envelope, exit codes, and git-auth channel are pinned in [`docs/headless-contract.md`](docs/headless-contract.md) with JSON Schemas, golden fixtures, and a conformance test. |
 | `coven-code --headless` execution | Partial | Worker spawns headless sessions with a tokenless session brief and enforces task timeouts; result quality depends on the runtime. |
 | Pull request creation | Partial | Opens draft PRs from session results against the repository's resolved default/base branch. |
-| CovenCave task polling | Partial | Task API is served from the durable store and survives restarts; hosted control-plane auth is planned (#3). |
+| CovenCave task polling | Implemented | Task API served from the durable store, survives restarts, and is gated by the tenant boundary — `token` mode fails closed, tenant tokens are installation-scoped, and every read is audited (see [docs/security.md](docs/security.md)). |
 | Durable queue / task store | Implemented | Deliveries deduplicated by `X-GitHub-Delivery` before GitHub hears success; the SQLite `tasks` table is the queue (atomic claims, no drop path) and interrupted work is requeued at startup ([design](docs/durable-task-store.md)). |
 | Hosted tier | Planned | See [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md). |
 | Familiar trust contract | Planned | See [Familiar Contract](FAMILIAR-CONTRACT.md). |

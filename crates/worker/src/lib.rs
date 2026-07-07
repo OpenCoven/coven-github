@@ -1723,6 +1723,7 @@ mod disposition_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
         }
     }
 
@@ -1836,6 +1837,7 @@ mod process_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
         }
     }
 
@@ -2110,6 +2112,7 @@ exit 0
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
         };
         let task = Task {
             id: "task-pub".to_string(),
@@ -2337,6 +2340,7 @@ exit 0
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
         };
         let task = Task {
             id: "task-stale".to_string(),
@@ -2373,7 +2377,7 @@ exit 0
             .expect("stale review must complete cleanly");
 
         // Cave sees the honest terminal state.
-        let items = store.cave_list(HashMap::new()).await.expect("list");
+        let items = store.cave_list(HashMap::new(), None).await.expect("list");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, TaskListStatus::Superseded);
 
@@ -2471,6 +2475,7 @@ mod command_and_marker_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
         }
     }
 

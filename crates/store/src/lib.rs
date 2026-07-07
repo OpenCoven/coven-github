@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Handle to the durable store. Cheap to clone; all clones share one writer
 /// connection.
@@ -341,21 +341,27 @@ impl Store {
 
     /// The Cave oversight projection: every non-reply task, newest first.
     /// `familiar_names` maps familiar ids to display names (config-owned).
+    /// `scope` limits visibility to one tenant (issue #3); `None` is the
+    /// adapter's own unrestricted view.
     pub async fn cave_list(
         &self,
         familiar_names: HashMap<String, String>,
+        scope: Option<ApiScope>,
     ) -> Result<Vec<TaskListItem>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
             let mut stmt = conn.prepare(
                 "SELECT id, repo, familiar_id, kind, state, result_status,
-                        branch, pr_number, check_run_url, updated_at
+                        branch, pr_number, check_run_url, updated_at,
+                        installation_id
                  FROM tasks
                  WHERE json_extract(kind, '$.kind') <> 'command_reply'
+                   AND (?1 IS NULL OR installation_id = ?1)
                  ORDER BY updated_at DESC, id",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let installation_filter = scope.as_ref().map(|s| s.installation_id);
+            let rows = stmt.query_map(params![installation_filter], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -367,6 +373,7 @@ impl Store {
                     row.get::<_, Option<u64>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, u64>(10)?,
                 ))
             })?;
             let mut items = Vec::new();
@@ -382,7 +389,16 @@ impl Store {
                     pr_number,
                     check_run_url,
                     updated_at,
+                    _installation_id,
                 ) = row?;
+                // Repository narrowing within the installation, when scoped.
+                if let Some(scope) = &scope {
+                    if let Some(repos) = &scope.repos {
+                        if !repos.contains(&repo) {
+                            continue;
+                        }
+                    }
+                }
                 let kind: TaskKind = serde_json::from_str(&kind_json)
                     .context("stored task kind is unreadable")?;
                 let (issue_number, issue_title) = surface_of(&kind);
@@ -407,6 +423,62 @@ impl Store {
                 });
             }
             Ok(items)
+        })
+        .await
+        .expect("store task panicked")
+    }
+}
+
+/// Tenant visibility limits for task API reads (issue #3).
+#[derive(Debug, Clone)]
+pub struct ApiScope {
+    pub installation_id: u64,
+    /// `None` = every repository in the installation; `Some` narrows further.
+    pub repos: Option<Vec<String>>,
+}
+
+impl Store {
+    /// Appends a task-API read to the audit trail (issue #3).
+    pub async fn record_api_read(
+        &self,
+        caller: &str,
+        scope: &str,
+        action: &str,
+        result: &str,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let (caller, scope, action, result) = (
+            caller.to_string(),
+            scope.to_string(),
+            action.to_string(),
+            result.to_string(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO api_audit (at, caller, scope, action, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![now_rfc3339(), caller, scope, action, result],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// `(caller, scope, action, result)` audit rows, oldest first.
+    pub async fn api_audit_entries(&self) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt =
+                conn.prepare("SELECT caller, scope, action, result FROM api_audit ORDER BY id")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
         .await
         .expect("store task panicked")
@@ -524,6 +596,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         // v2: terminal result classification for the Cave projection.
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN result_status TEXT;")
             .context("failed to apply schema v2")?;
+    }
+    if version < 3 {
+        // v3: task API read audit (issue #3).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE api_audit (
+              id     INTEGER PRIMARY KEY AUTOINCREMENT,
+              at     TEXT NOT NULL,
+              caller TEXT NOT NULL,
+              scope  TEXT NOT NULL,
+              action TEXT NOT NULL,
+              result TEXT NOT NULL
+            );
+            "#,
+        )
+        .context("failed to apply schema v3")?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -870,7 +958,7 @@ mod queue_tests {
             .expect("finish");
 
         let items = store
-            .cave_list(HashMap::from([("cody".to_string(), "Cody".to_string())]))
+            .cave_list(HashMap::from([("cody".to_string(), "Cody".to_string())]), None)
             .await
             .expect("list");
         assert_eq!(items.len(), 1);
@@ -950,7 +1038,7 @@ mod queue_tests {
         enqueue(&store, "d1", &fix_task("work")).await;
         enqueue(&store, "d2", &reply).await;
 
-        let items = store.cave_list(HashMap::new()).await.expect("list");
+        let items = store.cave_list(HashMap::new(), None).await.expect("list");
         assert_eq!(items.len(), 1, "adapter replies are not Cave tasks");
         assert_eq!(items[0].id, "work");
         assert_eq!(items[0].status, TaskListStatus::Queued);

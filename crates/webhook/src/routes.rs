@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 
 use coven_github_api::tasks::TaskListStatus;
 use coven_github_api::{GitHubEvent, Task, TaskKind};
-use coven_github_config::Config;
-use coven_github_store::{Delivery, Recorded, Routing, Store};
+use coven_github_config::{ApiConfig, ApiMode, Config};
+use coven_github_store::{ApiScope, Delivery, Recorded, Routing, Store};
 
 use crate::{
     commands::{parse_mention, Command, MentionKind, COMMAND_LIST},
@@ -43,12 +43,69 @@ fn familiar_names(config: &Config) -> std::collections::HashMap<String, String> 
         .collect()
 }
 
-/// GET /api/github/tasks — current task state for CovenCave polling.
-pub async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
-    match state.store.cave_list(familiar_names(&state.config)).await {
-        Ok(tasks) => Json(json!({ "ok": true, "tasks": tasks })).into_response(),
+/// GET /api/github/tasks — task state for CovenCave polling, behind the
+/// tenant boundary (issue #3). `token` mode fails closed; a tenant token sees
+/// only its own installation (optionally narrowed to repositories); the
+/// service token — and `open` mode, for local development — see everything.
+/// Every read lands in the audit trail.
+pub async fn list_tasks(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let action = "list_tasks";
+    let (caller, scope) = match authorize_api(&state.config.api, &headers) {
+        ApiCaller::Denied => {
+            if let Err(e) = state
+                .store
+                .record_api_read("anonymous", "none", action, "denied")
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            // Fail closed with a body that reveals nothing about what exists.
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response();
+        }
+        ApiCaller::Open => ("open".to_string(), None),
+        ApiCaller::Service => ("service".to_string(), None),
+        ApiCaller::Tenant(tenant) => (
+            format!("tenant:{}", tenant.installation_id),
+            Some(ApiScope {
+                installation_id: tenant.installation_id,
+                repos: if tenant.repos.is_empty() {
+                    None
+                } else {
+                    Some(tenant.repos.clone())
+                },
+            }),
+        ),
+    };
+    let scope_label = scope
+        .as_ref()
+        .map(|s| format!("installation:{}", s.installation_id))
+        .unwrap_or_else(|| "all".to_string());
+
+    match state
+        .store
+        .cave_list(familiar_names(&state.config), scope)
+        .await
+    {
+        Ok(tasks) => {
+            if let Err(e) = state
+                .store
+                .record_api_read(&caller, &scope_label, action, &format!("ok:{}", tasks.len()))
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            Json(json!({ "ok": true, "tasks": tasks })).into_response()
+        }
         Err(e) => {
             error!("task list unavailable: {e:#}");
+            let _ = state
+                .store
+                .record_api_read(&caller, &scope_label, action, "error")
+                .await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"ok": false, "error": "task list unavailable"})),
@@ -56,6 +113,50 @@ pub async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response()
         }
     }
+}
+
+/// Resolved identity of a task-API caller.
+enum ApiCaller<'a> {
+    /// `open` mode: unauthenticated local development.
+    Open,
+    /// Operator-wide service token: unrestricted visibility.
+    Service,
+    /// Tenant token: one installation's scope.
+    Tenant(&'a coven_github_config::TenantToken),
+    /// No valid credential in `token` mode. Fail closed.
+    Denied,
+}
+
+fn authorize_api<'a>(api: &'a ApiConfig, headers: &HeaderMap) -> ApiCaller<'a> {
+    if api.mode == ApiMode::Open {
+        return ApiCaller::Open;
+    }
+    let candidate = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let Some(candidate) = candidate else {
+        return ApiCaller::Denied;
+    };
+    if let Some(service) = &api.service_token {
+        if token_matches(candidate, service) {
+            return ApiCaller::Service;
+        }
+    }
+    for tenant in &api.tenants {
+        if token_matches(candidate, &tenant.token) {
+            return ApiCaller::Tenant(tenant);
+        }
+    }
+    ApiCaller::Denied
+}
+
+/// Constant-time token comparison: comparing fixed-length digests leaks
+/// nothing about how many characters of the token matched.
+fn token_matches(candidate: &str, expected: &str) -> bool {
+    Sha256::digest(candidate.as_bytes()) == Sha256::digest(expected.as_bytes())
 }
 
 /// POST /webhook — GitHub webhook receiver.
@@ -498,7 +599,7 @@ async fn command_task(
         Command::Status => {
             let items = state
                 .store
-                .cave_list(familiar_names(&state.config))
+                .cave_list(familiar_names(&state.config), None)
                 .await
                 .unwrap_or_else(|e| {
                     warn!("status could not reach the store: {e:#}");
@@ -590,6 +691,7 @@ mod tests {
                 review,
                 storage: coven_github_config::StorageConfig::default(),
                 memory: coven_github_config::MemoryConfig::default(),
+                api: coven_github_config::ApiConfig::default(),
             }),
             store: Store::open_in_memory().expect("in-memory store"),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -1335,5 +1437,164 @@ mod delivery_idempotency_tests {
             Some("ignored:unroutable")
         );
         assert!(state.store.task_states().await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tenancy_tests {
+    //! The tenant boundary on the task API (issue #3): token mode fails
+    //! closed, a tenant sees only its own installation, and every read is
+    //! audited.
+    use super::tests::{app_state, seed_task};
+    use super::*;
+    use axum::extract::State;
+    use coven_github_config::TenantToken;
+    use std::sync::Arc;
+
+    fn token_state(api: ApiConfig) -> AppState {
+        let base = app_state();
+        let mut config = (*base.config).clone();
+        config.api = api;
+        AppState {
+            config: Arc::new(config),
+            ..base
+        }
+    }
+
+    fn two_tenant_api() -> ApiConfig {
+        ApiConfig {
+            mode: ApiMode::Token,
+            service_token: Some("service-token-0123456789abcdef".to_string()),
+            tenants: vec![
+                TenantToken {
+                    token: "tenant-one-0123456789abcdef".to_string(),
+                    installation_id: 1,
+                    repos: vec![],
+                },
+                TenantToken {
+                    token: "tenant-two-0123456789abcdef".to_string(),
+                    installation_id: 2,
+                    repos: vec![],
+                },
+            ],
+        }
+    }
+
+    fn task_for(id: &str, installation_id: u64, repo_name: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            installation_id,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: repo_name.to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: format!("task {id}"),
+                issue_body: "b".to_string(),
+            },
+        }
+    }
+
+    async fn list(state: &AppState, bearer: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = bearer {
+            headers.insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("header"),
+            );
+        }
+        let response = list_tasks(State(state.clone()), headers)
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    fn repos_of(json: &serde_json::Value) -> Vec<String> {
+        json["tasks"]
+            .as_array()
+            .expect("tasks array")
+            .iter()
+            .map(|t| t["repo"].as_str().expect("repo").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn open_mode_lists_without_auth_for_local_development() {
+        let state = app_state();
+        seed_task(&state, "d1", &task_for("t1", 1, "alpha")).await;
+        let (status, json) = list(&state, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_mode_fails_closed_and_reveals_nothing() {
+        let state = token_state(two_tenant_api());
+        seed_task(&state, "d1", &task_for("t1", 1, "alpha")).await;
+
+        for bearer in [None, Some("wrong-token-0123456789abcdef")] {
+            let (status, json) = list(&state, bearer).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "bearer: {bearer:?}");
+            assert_eq!(json["error"], "unauthorized");
+            assert!(json.get("tasks").is_none(), "no data may leak: {json}");
+        }
+
+        let audit = state.store.api_audit_entries().await.expect("audit");
+        assert_eq!(audit.len(), 2);
+        for (caller, scope, action, result) in audit {
+            assert_eq!(caller, "anonymous");
+            assert_eq!(scope, "none");
+            assert_eq!(action, "list_tasks");
+            assert_eq!(result, "denied");
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_token_sees_only_its_own_installation() {
+        let state = token_state(two_tenant_api());
+        seed_task(&state, "d1", &task_for("t1", 1, "alpha")).await;
+        seed_task(&state, "d2", &task_for("t2", 2, "beta")).await;
+
+        // Installation 1's token must never see installation 2's task.
+        let (status, json) = list(&state, Some("tenant-one-0123456789abcdef")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repos_of(&json), vec!["OpenCoven/alpha".to_string()]);
+
+        let (_, json) = list(&state, Some("tenant-two-0123456789abcdef")).await;
+        assert_eq!(repos_of(&json), vec!["OpenCoven/beta".to_string()]);
+
+        // The operator-wide service token sees both.
+        let (_, json) = list(&state, Some("service-token-0123456789abcdef")).await;
+        assert_eq!(json["tasks"].as_array().unwrap().len(), 2);
+
+        let audit = state.store.api_audit_entries().await.expect("audit");
+        assert_eq!(
+            audit
+                .iter()
+                .map(|(caller, scope, _, result)| (caller.as_str(), scope.as_str(), result.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tenant:1", "installation:1", "ok:1"),
+                ("tenant:2", "installation:2", "ok:1"),
+                ("service", "all", "ok:2"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_repo_scope_narrows_within_the_installation() {
+        let mut api = two_tenant_api();
+        api.tenants[0].repos = vec!["OpenCoven/alpha".to_string()];
+        let state = token_state(api);
+        seed_task(&state, "d1", &task_for("t1", 1, "alpha")).await;
+        seed_task(&state, "d2", &task_for("t2", 1, "gamma")).await;
+
+        let (_, json) = list(&state, Some("tenant-one-0123456789abcdef")).await;
+        assert_eq!(repos_of(&json), vec!["OpenCoven/alpha".to_string()]);
     }
 }
