@@ -770,6 +770,100 @@ impl Store {
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
         self.expire_memory_activity_before(&cutoff).await
     }
+
+    /// Purges all task artifacts for an installation — attempts, tasks, and the
+    /// delivery records — on uninstall (issue #12). Returns rows removed.
+    pub async fn delete_tasks_for_installation(&self, installation_id: u64) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            // Defer FK checks to commit so the multi-table cascade (attempts →
+            // tasks → deliveries) needn't be perfectly ordered; the whole set is
+            // consistent once committed.
+            tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+            let attempts = tx.execute(
+                "DELETE FROM task_attempts
+                 WHERE task_id IN (SELECT id FROM tasks WHERE installation_id = ?1)",
+                params![installation_id],
+            )?;
+            let tasks = tx.execute(
+                "DELETE FROM tasks WHERE installation_id = ?1",
+                params![installation_id],
+            )?;
+            let deliveries = tx.execute(
+                "DELETE FROM webhook_deliveries WHERE installation_id = ?1",
+                params![installation_id],
+            )?;
+            tx.commit()?;
+            Ok(attempts + tasks + deliveries)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Deletes terminal (completed / failed / superseded) tasks and their
+    /// attempts older than `cutoff` (RFC 3339) — task retention (issue #12).
+    /// In-flight (`queued` / `running`) tasks are never expired.
+    pub async fn expire_terminal_tasks_before(&self, cutoff: &str) -> Result<usize> {
+        let conn = self.conn.clone();
+        let cutoff = cutoff.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+            let expiring = "SELECT id FROM tasks \
+                 WHERE state IN ('completed','failed','superseded') AND updated_at < ?1";
+            let attempts = tx.execute(
+                &format!("DELETE FROM task_attempts WHERE task_id IN ({expiring})"),
+                params![cutoff],
+            )?;
+            let tasks = tx.execute(
+                "DELETE FROM tasks \
+                 WHERE state IN ('completed','failed','superseded') AND updated_at < ?1",
+                params![cutoff],
+            )?;
+            tx.commit()?;
+            Ok(attempts + tasks)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Expires terminal tasks older than `retention_days` from now.
+    pub async fn expire_terminal_tasks(&self, retention_days: u32) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+        self.expire_terminal_tasks_before(&cutoff).await
+    }
+
+    /// Every adapter-generated free-text value the store durably retains — the
+    /// scan surface for the redaction guarantee (issue #12): no raw token or
+    /// secret may survive here. Deliberately excludes user-authored content
+    /// (issue/comment bodies in `tasks.kind`), which may legitimately quote
+    /// token-shaped strings and is never the adapter's to redact.
+    pub async fn all_stored_text(&self) -> Result<Vec<String>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT summary FROM tasks WHERE summary IS NOT NULL",
+                "SELECT detail FROM task_attempts WHERE detail IS NOT NULL",
+                "SELECT routing FROM webhook_deliveries",
+                "SELECT target FROM memory_activity",
+                "SELECT target FROM memory_revocations",
+            ] {
+                let mut stmt = conn.prepare(sql)?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                out.extend(rows);
+            }
+            Ok(out)
+        })
+        .await
+        .expect("store task panicked")
+    }
 }
 
 /// One recorded memory operation for the inspect/audit trail (issue #6).
@@ -1429,6 +1523,94 @@ mod queue_tests {
         let claimed = store.claim_next(&Default::default()).await.unwrap().expect("claim");
         assert_eq!(claimed.id, "new", "the tombstoned review must be skipped");
         assert!(store.claim_next(&Default::default()).await.unwrap().is_none());
+    }
+
+    async fn finish_completed(store: &Store, task_id: &str, summary: &str, detail: Option<&str>) {
+        store
+            .finish(
+                task_id,
+                Terminal {
+                    state: TerminalState::Completed,
+                    result_status: Some("success".to_string()),
+                    branch: None,
+                    pr_number: None,
+                    summary: Some(summary.to_string()),
+                    detail: detail.map(str::to_string),
+                },
+            )
+            .await
+            .expect("finish");
+    }
+
+    #[tokio::test]
+    async fn delete_tasks_for_installation_purges_that_tenants_artifacts() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &fix_task("t1")).await; // installation 1
+        // Installation 2: the delivery and task share the installation (as they
+        // always do from one webhook payload).
+        let other = Task {
+            installation_id: 2,
+            ..fix_task("t2")
+        };
+        store
+            .record_delivery(
+                Delivery {
+                    installation_id: Some(2),
+                    ..delivery("d2")
+                },
+                Routing::Task(&other),
+            )
+            .await
+            .expect("enqueue");
+        // Claim + finish t1 so it has an attempt row too.
+        store.claim_next(&Default::default()).await.unwrap();
+        finish_completed(&store, "t1", "done", Some("some detail")).await;
+
+        let removed = store.delete_tasks_for_installation(1).await.unwrap();
+        assert!(removed >= 2, "task + delivery (+ attempt) removed: {removed}");
+
+        // Installation 1 is gone; installation 2 survives and is still claimable.
+        assert!(store
+            .delivery_routing("d1")
+            .await
+            .unwrap()
+            .is_none());
+        let claimed = store.claim_next(&Default::default()).await.unwrap().expect("t2 survives");
+        assert_eq!(claimed.id, "t2");
+    }
+
+    #[tokio::test]
+    async fn task_retention_expires_terminal_tasks_but_not_in_flight() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &fix_task("done")).await;
+        enqueue(&store, "d2", &fix_task("queued")).await;
+        // Make the first terminal; leave the second queued.
+        store.claim_next(&Default::default()).await.unwrap();
+        finish_completed(&store, "done", "s", None).await;
+
+        // A cutoff in the future expires the terminal task, never the queued one.
+        let removed = store
+            .expire_terminal_tasks_before("2999-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        // The terminal task plus its attempt row are removed.
+        assert_eq!(removed, 2);
+        let claimed = store.claim_next(&Default::default()).await.unwrap().expect("queued survives");
+        assert_eq!(claimed.id, "queued");
+    }
+
+    #[tokio::test]
+    async fn all_stored_text_surfaces_adapter_generated_fields() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &fix_task("t1")).await;
+        store.claim_next(&Default::default()).await.unwrap();
+        finish_completed(&store, "t1", "SUMMARY_MARKER", Some("DETAIL_MARKER")).await;
+
+        let text = store.all_stored_text().await.unwrap();
+        assert!(text.iter().any(|t| t.contains("SUMMARY_MARKER")));
+        assert!(text.iter().any(|t| t.contains("DETAIL_MARKER")));
+        // The delivery routing is adapter-generated and included.
+        assert!(text.iter().any(|t| t.starts_with("task:")));
     }
 
     #[tokio::test]
