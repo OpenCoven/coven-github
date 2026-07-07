@@ -344,8 +344,28 @@ async fn execute_task_with_minter(
     )
     .await;
 
-    // Workspace cleanup ALWAYS runs — success or failure.
-    tokio::fs::remove_dir_all(&workspace).await.ok();
+    // Workspace cleanup ALWAYS runs — success or failure. The workspace holds
+    // the private repository checkout, so a cleanup FAILURE that leaves it on
+    // disk must be surfaced and audited, never silently swallowed (issue #12).
+    if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+        // remove_dir_all also errors when the dir never existed; only alarm
+        // when the checkout is genuinely still on disk.
+        if tokio::fs::try_exists(&workspace).await.unwrap_or(true) {
+            error!(
+                task_id = %task.id,
+                workspace = %workspace.display(),
+                "workspace cleanup FAILED — a private checkout may remain on disk: {e:#}"
+            );
+            let _ = store
+                .record_api_read(
+                    &format!("worker:{}", task.id),
+                    &format!("{}/{}", task.repo_owner, task.repo_name),
+                    "workspace_cleanup_failed",
+                    "error",
+                )
+                .await;
+        }
+    }
 
     // The Check Run ALWAYS reaches a terminal conclusion; both arms complete it.
     match outcome {
