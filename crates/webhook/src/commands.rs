@@ -19,6 +19,8 @@ pub enum Command {
     Retry,
     /// Cancel queued work for this surface.
     Cancel,
+    /// Run the Branch Gardener for this repository.
+    Garden,
     /// Memory governance intents — parsed and acknowledged; persistence lands
     /// with the hosted memory contract (issue #6).
     Remember { note: String },
@@ -61,6 +63,7 @@ pub fn parse_mention(body: &str, bot_username: &str) -> MentionKind {
             "deepen" => Command::Deepen,
             "retry" => Command::Retry,
             "cancel" => Command::Cancel,
+            "garden" => Command::Garden,
             "remember" => Command::Remember { note: args },
             "forget" => Command::Forget { note: args },
             "status" => Command::Status,
@@ -82,7 +85,7 @@ pub fn parse_mention(body: &str, bot_username: &str) -> MentionKind {
 
 /// The commands a clarification reply should list.
 pub const COMMAND_LIST: &str =
-    "`review`, `fix`, `deepen`, `retry`, `cancel`, `remember`, `forget`, `status`";
+    "`review`, `fix`, `deepen`, `retry`, `cancel`, `garden`, `remember`, `forget`, `status`";
 
 /// If `text` starts with the mention as a whole token, returns the remainder.
 fn strip_command_mention<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
@@ -150,6 +153,8 @@ mod tests {
             ("@coven-cody deepen", Command::Deepen),
             ("@coven-cody retry", Command::Retry),
             ("@coven-cody cancel", Command::Cancel),
+            ("@coven-cody garden", Command::Garden),
+            ("@coven-cody garden now", Command::Garden),
             (
                 "@coven-cody remember we ship Fridays",
                 Command::Remember {
@@ -182,6 +187,11 @@ mod tests {
                 verb: "frobnicate".to_string()
             })
         );
+    }
+
+    #[test]
+    fn clarification_command_list_mentions_garden() {
+        assert!(COMMAND_LIST.contains("`garden`"));
     }
 
     #[test]

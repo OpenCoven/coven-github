@@ -99,6 +99,7 @@ enum Prepared {
     Declined {
         orchestration: String,
     },
+    AdapterCompleted,
 }
 
 /// Task execution past minter construction; tests inject `Minter::Fixed`.
@@ -232,6 +233,19 @@ async fn execute_task_with_minter(
             }
         }
 
+        if let TaskKind::GardenRun { report_issue } = &task.kind {
+            execute_garden_run(
+                api_base_url,
+                &orchestration,
+                &store,
+                &task,
+                familiar,
+                *report_issue,
+            )
+            .await?;
+            return Ok(Prepared::AdapterCompleted);
+        }
+
         // Resolve target refs and base branch from live GitHub state. Check Runs
         // must attach to an immutable commit SHA, and PRs must target the repo's
         // actual base branch rather than a hardcoded "main".
@@ -304,6 +318,7 @@ async fn execute_task_with_minter(
                 .await?;
             return Ok(());
         }
+        Ok(Prepared::AdapterCompleted) => return Ok(()),
         Err(e) => {
             error!(task_id = %task.id, "pre-flight failed before check run: {e:#}");
             store
@@ -1401,6 +1416,44 @@ fn pr_title(result: &SessionResult, task: &Task) -> String {
     )
 }
 
+async fn execute_garden_run(
+    api_base_url: &str,
+    orchestration: &str,
+    store: &Store,
+    task: &Task,
+    familiar: &FamiliarConfig,
+    report_issue: Option<u64>,
+) -> Result<()> {
+    if let Some(number) = report_issue {
+        let marker =
+            status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
+        let body = "Status: accepted\n\nBranch Gardener run accepted, but execution is not \
+                    implemented yet. No branches were changed.";
+        status_comment::upsert(
+            api_base_url,
+            orchestration,
+            &task.repo_owner,
+            &task.repo_name,
+            number,
+            &marker,
+            body,
+        )
+        .await?;
+    }
+
+    store
+        .finish(
+            &task.id,
+            Terminal {
+                state: TerminalState::Completed,
+                summary: Some("branch gardener run accepted but not implemented".to_string()),
+                ..Terminal::default()
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 /// True when the task carries a commander whose repository permission is
 /// below write (issue #13). Auto-triggered tasks (no commander) always pass.
 async fn commander_below_write(
@@ -1448,6 +1501,7 @@ fn task_title(kind: &TaskKind) -> String {
             pr_title,
             ..
         } => format!("Review PR #{pr_number}: {pr_title}"),
+        TaskKind::GardenRun { .. } => "Run branch gardener".to_string(),
         TaskKind::CommandReply { issue_number, .. } => format!("Reply on #{issue_number}"),
         TaskKind::CancelReviews { pr_number } => {
             format!("Cancel queued reviews on PR #{pr_number}")
@@ -1496,7 +1550,8 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
         TaskKind::FixIssue { .. }
         | TaskKind::RespondToMention { .. }
         | TaskKind::CommandReply { .. }
-        | TaskKind::CancelReviews { .. } => {
+        | TaskKind::CancelReviews { .. }
+        | TaskKind::GardenRun { .. } => {
             let head_sha = repo::get_branch_sha_with_base_url(
                 api_base_url,
                 token,
@@ -1525,6 +1580,7 @@ fn surface_number(kind: &TaskKind) -> Option<u64> {
         TaskKind::AddressReviewComment { pr_number, .. }
         | TaskKind::ReviewPullRequest { pr_number, .. }
         | TaskKind::CancelReviews { pr_number } => Some(*pr_number),
+        TaskKind::GardenRun { report_issue } => *report_issue,
     }
 }
 
@@ -2868,6 +2924,103 @@ mod command_and_marker_tests {
         let states = store.task_states().await.expect("states");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].1, "completed");
+    }
+
+    #[tokio::test]
+    async fn drive_by_garden_run_is_declined_before_stub() {
+        let server = MockServer::start().await;
+        permission_mock("drive-by", "read").mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("drive-by"),
+        )
+        .with_id("garden-task");
+        seed(&store, "dl-garden-declined", &garden).await;
+
+        execute_task_with_minter(&config(server.uri()), store.clone(), garden, &fixed_minter())
+            .await
+            .expect("declined garden run is not an error");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("check-runs")),
+            "no Check Run may be created for a declined garden command"
+        );
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("decline should land on the status surface");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(body.contains("Status: declined"), "decline body: {body}");
+        assert!(
+            !body.contains("accepted"),
+            "the garden stub must not run below the gate: {body}"
+        );
+
+        let states: std::collections::HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["garden-task"], "completed");
+    }
+
+    #[tokio::test]
+    async fn maintainer_garden_run_posts_stub_without_check_run_or_session() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-task");
+        seed(&store, "dl-garden", &garden).await;
+
+        execute_task_with_minter(&config(server.uri()), store.clone(), garden, &fixed_minter())
+            .await
+            .expect("garden stub should complete cleanly");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("check-runs")),
+            "garden stub is adapter-only — no Check Run"
+        );
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("stub status should land on the report surface");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(body.contains("Status: accepted"), "accepted status body: {body}");
+        assert!(body.contains("not implemented yet"), "stub must be honest: {body}");
+
+        let states: std::collections::HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["garden-task"], "completed");
     }
     async fn seed(store: &Store, delivery_id: &str, task: &Task) {
         store

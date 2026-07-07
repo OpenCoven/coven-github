@@ -243,6 +243,12 @@ pub enum TaskKind {
         /// or a maintainer command (`command:review`, `command:deepen`, …).
         reason: String,
     },
+    /// Branch Gardener run over this repository. Command-triggered runs report
+    /// status back to the invoking issue/PR number; scheduled runs have no
+    /// single GitHub conversation surface.
+    GardenRun {
+        report_issue: Option<u64>,
+    },
     /// Adapter-only reply on an issue/PR conversation (issue #13): command
     /// acknowledgements, clarifications, status answers, permission declines.
     /// Executed without spawning coven-code.

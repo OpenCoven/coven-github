@@ -27,7 +27,7 @@ pub enum TaskListStatus {
 pub struct TaskListItem {
     pub id: String,
     pub repo: String,
-    pub issue_number: u64,
+    pub issue_number: Option<u64>,
     pub issue_title: String,
     pub branch: Option<String>,
     pub pr_number: Option<u64>,
@@ -41,30 +41,34 @@ pub struct TaskListItem {
 }
 
 /// The issue/PR conversation a task surfaces on, with a human-readable title.
-pub fn surface_of(kind: &TaskKind) -> (u64, String) {
+pub fn surface_of(kind: &TaskKind) -> (Option<u64>, String) {
     match kind {
         TaskKind::FixIssue {
             issue_number,
             issue_title,
             ..
-        } => (*issue_number, issue_title.clone()),
+        } => (Some(*issue_number), issue_title.clone()),
         TaskKind::RespondToMention { issue_number, .. } => (
-            *issue_number,
+            Some(*issue_number),
             format!("Respond to issue #{issue_number} mention"),
         ),
         TaskKind::AddressReviewComment { pr_number, .. } => {
-            (*pr_number, format!("Address review on PR #{pr_number}"))
+            (Some(*pr_number), format!("Address review on PR #{pr_number}"))
         }
         TaskKind::ReviewPullRequest {
             pr_number,
             pr_title,
             ..
-        } => (*pr_number, format!("Review PR #{pr_number}: {pr_title}")),
+        } => (Some(*pr_number), format!("Review PR #{pr_number}: {pr_title}")),
+        TaskKind::GardenRun { report_issue } => (
+            *report_issue,
+            "Branch gardener run".to_string(),
+        ),
         TaskKind::CommandReply { issue_number, .. } => {
-            (*issue_number, format!("Reply on #{issue_number}"))
+            (Some(*issue_number), format!("Reply on #{issue_number}"))
         }
         TaskKind::CancelReviews { pr_number } => {
-            (*pr_number, format!("Cancel queued reviews on PR #{pr_number}"))
+            (Some(*pr_number), format!("Cancel queued reviews on PR #{pr_number}"))
         }
     }
 }
@@ -75,14 +79,14 @@ mod tests {
 
     #[test]
     fn surface_of_names_every_task_kind() {
-        let cases: Vec<(TaskKind, u64, &str)> = vec![
+        let cases: Vec<(TaskKind, Option<u64>, &str)> = vec![
             (
                 TaskKind::FixIssue {
                     issue_number: 42,
                     issue_title: "Fix auth".to_string(),
                     issue_body: "b".to_string(),
                 },
-                42,
+                Some(42),
                 "Fix auth",
             ),
             (
@@ -91,7 +95,7 @@ mod tests {
                     pr_title: "t".to_string(),
                     reason: "opened".to_string(),
                 },
-                88,
+                Some(88),
                 "Review PR #88: t",
             ),
             (
@@ -100,7 +104,7 @@ mod tests {
                     comment_body: "c".to_string(),
                     diff_hunk: None,
                 },
-                7,
+                Some(7),
                 "Address review on PR #7",
             ),
             (
@@ -108,8 +112,15 @@ mod tests {
                     issue_number: 3,
                     body: "b".to_string(),
                 },
-                3,
+                Some(3),
                 "Reply on #3",
+            ),
+            (
+                TaskKind::GardenRun {
+                    report_issue: Some(9),
+                },
+                Some(9),
+                "Branch gardener run",
             ),
         ];
         for (kind, number, title) in cases {
@@ -117,5 +128,12 @@ mod tests {
             assert_eq!(n, number);
             assert_eq!(t, title);
         }
+    }
+
+    #[test]
+    fn scheduled_garden_run_has_no_issue_surface() {
+        let (number, title) = surface_of(&TaskKind::GardenRun { report_issue: None });
+        assert_eq!(number, None);
+        assert_eq!(title, "Branch gardener run");
     }
 }

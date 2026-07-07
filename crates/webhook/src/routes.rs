@@ -1045,6 +1045,12 @@ async fn command_task(
             commander,
         ),
         Command::Cancel => reply("`cancel` currently applies to queued pull-request reviews only.".to_string()),
+        Command::Garden => make(
+            TaskKind::GardenRun {
+                report_issue: Some(s.number),
+            },
+            commander,
+        ),
         // Memory acknowledgements are gated too: only maintainers should hear
         // how the familiar handles memory intents.
         Command::Remember { .. } | Command::Forget { .. } => make(
@@ -1067,7 +1073,7 @@ async fn command_task(
                 });
             let mut lines: Vec<String> = items
                 .iter()
-                .filter(|t| t.repo == repo && t.issue_number == s.number)
+                .filter(|t| t.repo == repo && t.issue_number == Some(s.number))
                 .map(|t| format!("- {} — {}", t.issue_title, status_label(&t.status)))
                 .collect();
             let body = if lines.is_empty() {
@@ -1091,6 +1097,7 @@ fn verb(command: &Command) -> &'static str {
         Command::Deepen => "deepen",
         Command::Retry => "retry",
         Command::Cancel => "cancel",
+        Command::Garden => "garden",
         Command::Remember { .. } => "remember",
         Command::Forget { .. } => "forget",
         Command::Status => "status",
@@ -1345,6 +1352,60 @@ mod tests {
                 assert_eq!(issue_title, "Fix auth");
             }
             other => panic!("expected FixIssue for a fix command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn garden_command_on_issue_routes_to_garden_run_with_report_surface() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
+                comment_body: "@coven-cody garden".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: false,
+            }),
+        )
+        .await
+        .expect("a garden command on an issue should create a task");
+
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
+        match task.kind {
+            TaskKind::GardenRun { report_issue } => assert_eq!(report_issue, Some(42)),
+            other => panic!("expected GardenRun for a garden command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn garden_command_on_pr_conversation_comment_reports_on_pr_number() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 73,
+                issue_title: "Add spell compiler cache".to_string(),
+                issue_body: "".to_string(),
+                comment_body: "@coven-cody garden".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: true,
+            }),
+        )
+        .await
+        .expect("a garden command on a PR conversation should create a task");
+
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
+        match task.kind {
+            TaskKind::GardenRun { report_issue } => assert_eq!(report_issue, Some(73)),
+            other => panic!("expected GardenRun for a PR conversation, got {other:?}"),
         }
     }
 
@@ -1652,6 +1713,20 @@ mod command_routing_tests {
                 assert_eq!(reason, "command:review");
             }
             other => panic!("expected ReviewPullRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn garden_command_on_pr_review_comment_routes_to_garden_run_with_pr_surface() {
+        let state = app_state();
+        let task = event_to_task(&state, pr_comment("@coven-cody garden"))
+            .await
+            .expect("garden command should create a task");
+
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
+        match task.kind {
+            TaskKind::GardenRun { report_issue } => assert_eq!(report_issue, Some(88)),
+            other => panic!("expected GardenRun, got {other:?}"),
         }
     }
 

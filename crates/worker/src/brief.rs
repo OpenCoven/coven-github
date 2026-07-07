@@ -124,6 +124,7 @@ pub fn build(
         // paths.
         TaskKind::CommandReply { .. } => "issue_mention",
         TaskKind::CancelReviews { .. } => "issue_mention",
+        TaskKind::GardenRun { .. } => panic!("GardenRun is adapter-side and must not be briefed"),
     };
 
     let task_brief = match &task.kind {
@@ -160,6 +161,7 @@ pub fn build(
             issue_number: *pr_number,
             comment_body: format!("Cancel queued reviews for PR #{pr_number}."),
         },
+        TaskKind::GardenRun { .. } => panic!("GardenRun is adapter-side and must not be briefed"),
         TaskKind::ReviewPullRequest {
             pr_number,
             pr_title,
