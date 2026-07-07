@@ -15,6 +15,7 @@ use coven_github_store::{Store, Terminal, TerminalState};
 pub mod backend;
 pub mod brief;
 pub(crate) mod gardener_exec;
+pub mod gardener_schedule;
 pub mod findings;
 pub mod memory;
 pub mod redact;

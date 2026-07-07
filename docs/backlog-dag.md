@@ -6,8 +6,8 @@ shipped. Native GitHub "blocked by" relationships encode the same edges; this
 doc is the readable projection and the status ledger.
 
 > **Status: the engineering spine and all of Waves 0–4 are shipped.** What
-> remains is one in-progress hygiene skill (#14) and the GTM landing page (#16);
-> pricing (#17) has landed. See [Current state](#current-state).
+> remains is the GTM landing page (#16); pricing (#17) has landed. See
+> [Current state](#current-state).
 
 ## Critical path (the spine) — ✅ complete
 
@@ -34,7 +34,7 @@ Legend: ✅ shipped · 🔧 in progress · 🔲 open (no code dependency).
 - ✅ #8 Check Run head SHA / target ref
 - ✅ #9 Repo default branch for brief + PR base
 - ✅ #11 Structured review output + publication gates
-- 🔧 #14 Branch Gardener scheduled skill *(in progress)*
+- ✅ #14 Branch Gardener scheduled skill
 
 **Wave 2**
 - ✅ #10 PR/push/commit review triggers *(was blocked by #4)*
@@ -54,7 +54,7 @@ Legend: ✅ shipped · 🔧 in progress · 🔲 open (no code dependency).
 
 | Issue | Blocked by | Status |
 |---|---|---|
-| #3, #4, #5, #8, #9, #11, #14 | #2 | #14 in progress; rest ✅ |
+| #3, #4, #5, #8, #9, #11, #14 | #2 | ✅ |
 | #10 | #4 | ✅ |
 | #6, #7, #15 | #3 | ✅ |
 | #12 | #5 | ✅ |
@@ -84,7 +84,7 @@ flowchart LR
   I15["#15 usage metering"]:::done
   I12["#12 audit/retention"]:::done
   I18["#18 Cave dashboard"]:::done
-  I14["#14 Branch Gardener"]:::wip
+  I14["#14 Branch Gardener"]:::done
   I16["#16 landing/waitlist"]:::gtm
   I17["#17 pricing"]:::done
 
@@ -106,11 +106,11 @@ The moat → hosted-V1 engineering backlog is effectively complete:
   redaction (#12), Cave oversight dashboard (#18): shipped.
 - **GitHub correctness** — head-SHA/target-ref (#8), default-branch resolution
   (#9), structured review output + publication gates (#11): shipped.
+- **Hosted hygiene** — Branch Gardener scheduled branch cleanup (#14): shipped.
 - **Hosted worker fleet** — container isolation + resource limits (#5): shipped.
 
 **Remaining:**
 
-- 🔧 **#14 Branch Gardener** — scheduled branch-hygiene skill; in progress.
 - 🔲 **#16 (GTM)** — landing page + beta waitlist; no code dependency, sequenced
   by go-to-market rather than the DAG. Pricing (#17) has shipped.
 

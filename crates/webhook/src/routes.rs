@@ -942,6 +942,13 @@ fn parse_command<'a>(
     body: &str,
     author: &str,
 ) -> Option<(&'a coven_github_config::FamiliarConfig, Command)> {
+    if slash_garden_command(body) {
+        return scope
+            .familiars()
+            .find(|f| author != f.bot_username)
+            .map(|f| (f, Command::Garden));
+    }
+
     scope.familiars().find_map(|f| {
         if author == f.bot_username {
             return None;
@@ -951,6 +958,11 @@ fn parse_command<'a>(
             MentionKind::Casual | MentionKind::None => None,
         }
     })
+}
+
+fn slash_garden_command(body: &str) -> bool {
+    let mut words = body.split_whitespace();
+    matches!(words.next(), Some("/coven")) && matches!(words.next(), Some("garden"))
 }
 
 /// The issue/PR conversation a command arrived on.
@@ -1379,6 +1391,34 @@ mod tests {
         match task.kind {
             TaskKind::GardenRun { report_issue } => assert_eq!(report_issue, Some(42)),
             other => panic!("expected GardenRun for a garden command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_coven_garden_routes_to_garden_run_with_first_available_familiar() {
+        let state = app_state();
+        let task = event_to_task(
+            &state,
+            GitHubEvent::IssueComment(IssueCommentEvent {
+                installation_id: 123,
+                repo_owner: "OpenCoven".to_string(),
+                repo_name: "coven-code".to_string(),
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "Body".to_string(),
+                comment_body: "/coven garden".to_string(),
+                commenter_login: "octocat".to_string(),
+                on_pull_request: false,
+            }),
+        )
+        .await
+        .expect("slash garden command should create a task");
+
+        assert_eq!(task.familiar_id, "cody");
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
+        match task.kind {
+            TaskKind::GardenRun { report_issue } => assert_eq!(report_issue, Some(42)),
+            other => panic!("expected GardenRun for slash garden command, got {other:?}"),
         }
     }
 

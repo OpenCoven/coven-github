@@ -111,6 +111,18 @@ async fn main() -> Result<()> {
                 worker::run(worker_config, worker_store, worker_notify).await;
             });
 
+            // Branch Gardener scheduler (issue #14): enqueue one adapter-side
+            // garden task per configured installation/repo schedule. The durable
+            // store delivery id makes each schedule slot idempotent across
+            // process restarts.
+            let gardener_config = config.clone();
+            let gardener_store = store.clone();
+            let gardener_notify = notify.clone();
+            tokio::spawn(async move {
+                worker::gardener_schedule::run(gardener_config, gardener_store, gardener_notify)
+                    .await;
+            });
+
             // Memory retention sweep (issue #6): when a retention horizon is
             // configured, periodically expire audit rows older than it. The
             // first tick fires immediately, so a stale audit is trimmed at boot.

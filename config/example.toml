@@ -122,3 +122,17 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # retention_days = 365      # forwarded to the runtime; also expires the adapter's memory audit
 # [memory.repos."acme/billing"]
 # enabled = true             # per-repo opt-in
+
+# ── Branch Gardener (issue #14) ──────────────────────────────────────────────
+# Scheduled branch hygiene is off by default. Enable it per repository to scan
+# branches, open draft PRs for PRless work, and optionally prune dead/merged refs.
+# Scheduled runs require [[installations]] so the worker knows the installation id.
+# [gardener]
+# enabled = false
+# autonomy = "propose"       # propose (dry-run deletes) or prune-dead
+# schedule = "0 4 * * *"     # UTC daily; accepted form: M H * * *
+# exclude = ["release/*", "hotfix/*"]
+# draft_pr_label = "coven:garden"
+# [gardener.repos."your-org/your-repo"]
+# enabled = true
+# autonomy = "propose"

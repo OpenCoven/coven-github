@@ -96,6 +96,7 @@ Edit `config/local.toml`:
 - Set `worker.coven_code_bin` to your `coven-code` binary path
 - Configure `[[familiars]]` with your bot username and model
 - Set `server.cave_base_url` only if you need to override the hosted Cave default; task comments and Check Runs link to `/sessions/<task-id>` under this base URL.
+- Optional: enable `[gardener.repos."owner/name"]` for scheduled Branch Gardener runs. Scheduled runs require a matching `[[installations]]` id.
 
 Important config fields:
 
@@ -111,6 +112,29 @@ Important config fields:
 | `worker.timeout_secs` | Wall-clock limit for each familiar run. |
 | `familiars[].bot_username` | GitHub App bot username that assignment and mentions match. |
 | `familiars[].trigger_labels` | Labels such as `coven:fix` that create familiar tasks. |
+| `gardener.repos."owner/name".enabled` | Opts a repository into scheduled Branch Gardener runs. |
+| `gardener.schedule` | UTC schedule for Branch Gardener, accepted form `M H * * *`. |
+
+### Branch Gardener setup
+
+Branch Gardener is conservative by default: `autonomy = "propose"` opens draft
+PRs for PRless branches and reports dead/merged branches without deleting them.
+Switch to `prune-dead` only after the reports match your workflow.
+
+```toml
+[gardener]
+enabled = false
+autonomy = "propose"
+schedule = "0 4 * * *"
+exclude = ["release/*", "hotfix/*"]
+draft_pr_label = "coven:garden"
+
+[gardener.repos."your-org/your-repo"]
+enabled = true
+```
+
+Maintainers can also run the same path on demand with `@your-bot garden` in an
+issue or PR conversation.
 
 ### Validate the config
 

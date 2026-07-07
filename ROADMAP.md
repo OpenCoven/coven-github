@@ -37,7 +37,7 @@ Goal: support real hosted installations without losing task state or leaking ten
 - Task audit log and terminal states. (terminal states #2; audit controls #12)
 - Marker-backed GitHub status comments that are edited in place per task. (#13)
 - Maintainer command router for status, stop, retry, explain, and approve. (#13)
-- **Branch Gardener** — scheduled branch hygiene skill: classify branches, delete dead ones, open draft PRs for PRless work, report to Cave. See [`docs/branch-gardener.md`](docs/branch-gardener.md). (#14)
+- **Branch Gardener** — scheduled branch hygiene skill: classify branches, delete dead ones, open draft PRs for PRless work, report to Cave. See [`docs/branch-gardener.md`](docs/branch-gardener.md). (#14) **Shipped.**
 
 ## Milestone 3: GitHub Correctness
 
@@ -146,8 +146,7 @@ shipped (see the [backlog DAG](docs/backlog-dag.md) for the full ledger). What
 remains is sequenced by the hosted beta gates and go-to-market, not code
 dependencies:
 
-1. **#14 Branch Gardener** — the last scheduled-hygiene skill (in progress).
-2. **#16 (GTM)** — landing page + beta waitlist (pricing #17 has shipped —
+1. **#16 (GTM)** — landing page + beta waitlist (pricing #17 has shipped —
    see [docs/pricing.md](docs/pricing.md)).
-3. Harden toward the hosted beta gates in [HOSTED.md](HOSTED.md) and stand up
+2. Harden toward the hosted beta gates in [HOSTED.md](HOSTED.md) and stand up
    the hosted control plane on top of the now-durable, tenant-scoped adapter.

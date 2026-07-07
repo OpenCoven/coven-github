@@ -33,6 +33,7 @@ flowchart LR
 - Routes configured triggers to a familiar by bot username or label.
 - Runs `coven-code --headless` with a tokenless session brief.
 - Posts Check Run state, direct Cave session links, and draft PRs when the run produces commits.
+- Runs the Branch Gardener on configured schedules or `garden` commands to prune dead branches and surface PRless work.
 
 See [Architecture Diagrams](docs/architecture.md), [Design](DESIGN.md), [Hosted OpenCoven](HOSTED.md), [Familiar Contract](FAMILIAR-CONTRACT.md), [Roadmap](ROADMAP.md), and [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md) for the operational plan.
 
@@ -107,6 +108,8 @@ Implemented lanes:
 | Maintainer command in a comment (`@cody <command>`) | See the command table below |
 | PR opened / synchronize / reopened / ready_for_review | Automatic hosted review when the `[review]` policy enables the lane (drafts skipped by default; newer pushes supersede queued reviews of the same PR) |
 | Review label applied to a PR | Explicit per-PR review opt-in — works even with the automatic lane off, including drafts |
+| Branch Gardener schedule | Enqueues adapter-side branch hygiene for configured installation/repository policies |
+| Maintainer `garden` command | Runs Branch Gardener on demand for the current repository |
 
 Planned lanes:
 
@@ -137,6 +140,7 @@ comments never re-trigger it.
 | `deepen` | Clarification | Re-review with a wider lens (supporting files, tests) |
 | `retry` | Re-run the fix lane | Re-run the review |
 | `cancel` | Clarification (PR reviews only) | Cancel queued reviews for the PR (in-flight work finishes) |
+| `garden` | Run Branch Gardener for the repository | Run Branch Gardener for the repository |
 | `remember` / `forget` | Acknowledged; persistence lands with the memory governance contract (#6) | Same |
 | `status` | Current task state for this thread | Same |
 
@@ -161,6 +165,7 @@ duplicate comments.
 | Installation-scoped routing | Implemented | `[[installations]]` policy: per-installation familiar allow-lists, per-repo trigger-lane switches, fail-closed for unlisted installations; absent config keeps open self-hosted routing. |
 | Usage metering + tier limits | Implemented | Per-installation `max_concurrent` (enforced at claim) and `max_tasks_per_day` (enforced at intake, recorded `ignored:quota_exceeded`); tenant-scoped `GET /api/github/usage` rollup by installation/repo/familiar with attempt runtime. |
 | Reference demo of the operating loop | Implemented | Offline, self-verifying replay of the full loop with a real adapter binary — see [docs/demo.md](docs/demo.md). |
+| Branch Gardener | Implemented | Scheduled and `garden` command runs classify branches, dry-run or prune dead/merged refs by policy, open draft PRs for PRless branches, and report through Cave-visible task state/status surfaces. |
 | PR lifecycle review trigger | Implemented | Policy-gated auto-review on opened/synchronize/reopened/ready_for_review plus label opt-in; familiar-authored PRs are never auto-reviewed. |
 | Push / commit review trigger | Partial | Events parsed and typed with fixtures; execution lane needs headless contract v3. |
 | GitHub App installation tokens | Implemented | Mints installation access tokens from the App private key. |

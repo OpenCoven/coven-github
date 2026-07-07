@@ -105,9 +105,9 @@ Branch gardener runs are triggered in two ways:
 installation using the configured schedule. The worker calls `gardener::run()`
 with the installation's GitHub token and config.
 
-**On-demand (secondary)** — a maintainer posts `/coven garden` in any issue or PR
-comment. The webhook router recognises this as a `gardener` command and enqueues a
-one-shot run.
+**On-demand (secondary)** — a maintainer posts `/coven garden` (or
+`@familiar garden`) in any issue or PR comment. The webhook router recognises
+this as a `gardener` command and enqueues a one-shot run.
 
 ```mermaid
 flowchart LR
