@@ -55,6 +55,26 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # skills = ["requesting-code-review"]
 # trigger_labels = ["coven:review"]
 
+# ── Installation-scoped routing (issue #7) ──────────────────────────────────
+# Self-hosted default: no [[installations]] blocks — every installation sees
+# every familiar with all triggers on. Once ANY block exists, routing fails
+# closed for unlisted installations; hosted deployments list each customer
+# installation here (or via the hosted control plane, which feeds the same
+# resolution API).
+# [[installations]]
+# id = 123456                     # GitHub App installation id
+# account = "your-org"
+# familiars = ["cody"]            # allow-list; empty = all familiars
+# [installations.triggers]       # installation-wide lane switches (default on)
+# assignment = true
+# labels = true
+# commands = true
+# reviews = true
+# [installations.repos."your-org/frozen"]
+# enabled = false                 # every lane off for this repo
+# [installations.repos."your-org/quiet"]
+# labels = false                  # only the label lane off
+
 # ── Automatic review policy ─────────────────────────────────────────────────
 # Hosted PR review lanes (issue #10). Push/commit review is parsed today and
 # ships with headless contract v3.

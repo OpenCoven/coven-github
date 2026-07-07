@@ -34,7 +34,7 @@ flowchart LR
 | Queue | Durable SQLite queue built in | Managed durable queue |
 | Task state | Persistent across restarts (SQLite) | Persistent history at fleet scale |
 | Worker isolation | Operator-managed | Managed worker pool |
-| Familiar routing | Static config | Installation/repo scoped |
+| Familiar routing | Installation/repo scoped via `[[installations]]` TOML | Same policy via the hosted control plane |
 | Familiar memory | Local/operator-managed | Optional cloud memory |
 | Cave oversight | Local Cave | Hosted-ready oversight links and dashboard |
 | Usage limits | Operator-managed | Tiered limits and audit logs |
