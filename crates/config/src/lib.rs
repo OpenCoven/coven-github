@@ -23,6 +23,126 @@ pub struct Config {
     /// is only safe for local development.
     #[serde(default)]
     pub api: ApiConfig,
+    /// Installation-scoped routing policy (issue #7). Absent = open routing:
+    /// every installation sees every familiar with all triggers enabled (the
+    /// self-hosted default). Once any [[installations]] block exists, routing
+    /// fails closed for installations not listed.
+    #[serde(default)]
+    pub installations: Vec<InstallationConfig>,
+}
+
+/// Routing and trigger policy for one GitHub App installation (issue #7).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstallationConfig {
+    /// GitHub App installation id.
+    pub id: u64,
+    /// Account login this installation belongs to (informational).
+    pub account: Option<String>,
+    /// Familiar ids this installation may route to. Empty = all familiars.
+    #[serde(default)]
+    pub familiars: Vec<String>,
+    /// Installation-wide trigger switches; repos may override.
+    #[serde(default)]
+    pub triggers: TriggerPolicy,
+    /// Per-repo overrides keyed "owner/name".
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, RepoRoutingOverride>,
+}
+
+/// Which trigger lanes may create work. All on by default.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct TriggerPolicy {
+    /// Issue assigned to a familiar's bot user.
+    #[serde(default = "default_true")]
+    pub assignment: bool,
+    /// Trigger labels on issues and the per-PR review-label opt-in.
+    #[serde(default = "default_true")]
+    pub labels: bool,
+    /// Maintainer `@familiar <verb>` commands.
+    #[serde(default = "default_true")]
+    pub commands: bool,
+    /// Automatic PR review lane.
+    #[serde(default = "default_true")]
+    pub reviews: bool,
+}
+
+impl Default for TriggerPolicy {
+    fn default() -> Self {
+        Self {
+            assignment: true,
+            labels: true,
+            commands: true,
+            reviews: true,
+        }
+    }
+}
+
+/// Per-repo routing override; unset fields inherit from the installation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RepoRoutingOverride {
+    /// `false` disables every trigger for the repository.
+    pub enabled: Option<bool>,
+    pub assignment: Option<bool>,
+    pub labels: Option<bool>,
+    pub commands: Option<bool>,
+    pub reviews: Option<bool>,
+}
+
+/// The effective routing view for one delivery: which familiars are visible
+/// and which trigger lanes are open (issue #7).
+pub struct RoutingScope<'a> {
+    familiars: Vec<&'a FamiliarConfig>,
+    triggers: TriggerPolicy,
+}
+
+impl<'a> RoutingScope<'a> {
+    /// A scope that routes nothing (unknown installation, fail closed).
+    fn closed() -> Self {
+        Self {
+            familiars: Vec::new(),
+            triggers: TriggerPolicy {
+                assignment: false,
+                labels: false,
+                commands: false,
+                reviews: false,
+            },
+        }
+    }
+
+    pub fn familiars(&self) -> impl Iterator<Item = &'a FamiliarConfig> + '_ {
+        self.familiars.iter().copied()
+    }
+
+    pub fn familiar_by_bot(&self, login: &str) -> Option<&'a FamiliarConfig> {
+        self.familiars
+            .iter()
+            .copied()
+            .find(|f| f.bot_username == login)
+    }
+
+    pub fn familiar_by_label(&self, label: &str) -> Option<&'a FamiliarConfig> {
+        self.familiars
+            .iter()
+            .copied()
+            .find(|f| f.trigger_labels.iter().any(|l| l == label))
+    }
+
+    pub fn familiar_by_id(&self, id: &str) -> Option<&'a FamiliarConfig> {
+        self.familiars.iter().copied().find(|f| f.id == id)
+    }
+
+    pub fn assignment_enabled(&self) -> bool {
+        self.triggers.assignment
+    }
+    pub fn labels_enabled(&self) -> bool {
+        self.triggers.labels
+    }
+    pub fn commands_enabled(&self) -> bool {
+        self.triggers.commands
+    }
+    pub fn reviews_enabled(&self) -> bool {
+        self.triggers.reviews
+    }
 }
 
 /// Hosted memory governance policy (issue #6). Off by default; opting in is a
@@ -264,6 +384,55 @@ impl Config {
         Ok(config)
     }
 
+    /// Resolves the effective routing scope for one delivery (issue #7).
+    ///
+    /// With no `[[installations]]` configured, routing is open: every
+    /// familiar, all triggers — the self-hosted default. Once installations
+    /// are configured, an unlisted installation id routes nothing (fail
+    /// closed), and a listed one sees only its allow-listed familiars with
+    /// its trigger policy (repo overrides applied).
+    pub fn scope_for(&self, installation_id: u64, repo: &str) -> RoutingScope<'_> {
+        if self.installations.is_empty() {
+            return RoutingScope {
+                familiars: self.familiars.iter().collect(),
+                triggers: TriggerPolicy::default(),
+            };
+        }
+        let Some(installation) = self.installations.iter().find(|i| i.id == installation_id)
+        else {
+            return RoutingScope::closed();
+        };
+        let familiars: Vec<&FamiliarConfig> = if installation.familiars.is_empty() {
+            self.familiars.iter().collect()
+        } else {
+            self.familiars
+                .iter()
+                .filter(|f| installation.familiars.contains(&f.id))
+                .collect()
+        };
+        let mut triggers = installation.triggers;
+        if let Some(o) = installation.repos.get(repo) {
+            if o.enabled == Some(false) {
+                return RoutingScope {
+                    familiars,
+                    triggers: TriggerPolicy {
+                        assignment: false,
+                        labels: false,
+                        commands: false,
+                        reviews: false,
+                    },
+                };
+            }
+            triggers = TriggerPolicy {
+                assignment: o.assignment.unwrap_or(triggers.assignment),
+                labels: o.labels.unwrap_or(triggers.labels),
+                commands: o.commands.unwrap_or(triggers.commands),
+                reviews: o.reviews.unwrap_or(triggers.reviews),
+            };
+        }
+        RoutingScope { familiars, triggers }
+    }
+
     /// Run semantic validation over a parsed config and return every diagnostic
     /// found. An empty `Error`-severity set means the config is ready to serve.
     ///
@@ -474,6 +643,38 @@ impl Config {
             }
         }
 
+        // ── Installations (issue #7) ────────────────────────────────────
+        let known_familiar_ids: std::collections::HashSet<&str> =
+            self.familiars.iter().map(|f| f.id.as_str()).collect();
+        let mut seen_installations = std::collections::HashSet::new();
+        for installation in &self.installations {
+            if installation.id == 0 {
+                out.push(Diagnostic::error(
+                    "installations[].id",
+                    "an installation has id 0 — set it to the numeric GitHub App installation id.",
+                ));
+            } else if !seen_installations.insert(installation.id) {
+                out.push(Diagnostic::error(
+                    "installations[].id",
+                    format!(
+                        "duplicate installation id {} — merge the blocks; the first would silently win.",
+                        installation.id
+                    ),
+                ));
+            }
+            for id in &installation.familiars {
+                if !known_familiar_ids.contains(id.as_str()) {
+                    out.push(Diagnostic::error(
+                        "installations[].familiars",
+                        format!(
+                            "installation {} allows familiar '{id}', which matches no configured [[familiars]] block.",
+                            installation.id
+                        ),
+                    ));
+                }
+            }
+        }
+
         // ── Review policy ───────────────────────────────────────────────
         let known_ids: std::collections::HashSet<&str> =
             self.familiars.iter().map(|f| f.id.as_str()).collect();
@@ -648,6 +849,12 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         "review.publish" => {
             "Set review.publish to one of: check_run, advisory_comment, request_changes."
         }
+        "installations[].id" => {
+            "Copy the numeric installation id from the GitHub App installations page into installations[].id."
+        }
+        "installations[].familiars" => {
+            "Reference only ids that appear in a [[familiars]] block, or leave the list empty to allow all."
+        }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
 }
@@ -749,6 +956,7 @@ mod tests {
             storage: StorageConfig::default(),
             memory: MemoryConfig::default(),
             api: ApiConfig::default(),
+            installations: vec![],
         }
     }
 
@@ -1089,6 +1297,49 @@ mod tests {
             repos: vec![],
         }];
         assert!(errors(&cfg.check()).is_empty());
+    }
+
+    #[test]
+    fn installation_policy_is_validated() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.installations = vec![
+            InstallationConfig {
+                id: 7,
+                account: None,
+                familiars: vec!["ghost".to_string()],
+                triggers: TriggerPolicy::default(),
+                repos: std::collections::HashMap::new(),
+            },
+            InstallationConfig {
+                id: 7,
+                account: None,
+                familiars: vec![],
+                triggers: TriggerPolicy::default(),
+                repos: std::collections::HashMap::new(),
+            },
+        ];
+        let diags = cfg.check();
+        let errs = errors(&diags);
+        assert!(errs.contains(&"installations[].familiars"), "{errs:?}");
+        assert!(errs.contains(&"installations[].id"), "{errs:?}");
     }
 
     #[test]
