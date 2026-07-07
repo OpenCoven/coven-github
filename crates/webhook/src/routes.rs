@@ -1154,6 +1154,7 @@ mod tests {
                 review,
                 storage: coven_github_config::StorageConfig::default(),
                 memory: coven_github_config::MemoryConfig::default(),
+                gardener: coven_github_config::GardenerConfig::default(),
                 api: coven_github_config::ApiConfig::default(),
                 installations: vec![],
             }),

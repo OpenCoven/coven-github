@@ -346,6 +346,7 @@ name = "coven-github-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "coven-github-gardener",
  "serde",
  "toml",
 ]

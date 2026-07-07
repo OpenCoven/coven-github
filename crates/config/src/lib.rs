@@ -1,5 +1,6 @@
 //! Configuration types for coven-github installations.
 
+use coven_github_gardener::{parse_schedule, Autonomy};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,9 @@ pub struct Config {
     /// Hosted memory governance policy (issue #6). Absent section = memory off.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Scheduled branch hygiene policy (issue #14). Absent section = gardener off.
+    #[serde(default)]
+    pub gardener: GardenerConfig,
     /// Task API authentication (issue #3). Absent section = open mode, which
     /// is only safe for local development.
     #[serde(default)]
@@ -366,6 +370,112 @@ impl ReviewConfig {
     }
 }
 
+/// Scheduled branch hygiene policy (issue #14). Lanes default to off.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GardenerConfig {
+    /// Master opt-in. Repos may opt in or out independently.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Autonomy tier: `propose` or `prune-dead`.
+    #[serde(default = "default_gardener_autonomy")]
+    pub autonomy: String,
+    /// Restricted cron schedule, accepted form `M H * * *`.
+    #[serde(default = "default_gardener_schedule")]
+    pub schedule: String,
+    /// Branch-name exclude patterns: literal, bare `*`, or trailing-`*` prefix.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Optional label for draft PRs surfaced by the gardener.
+    pub draft_pr_label: Option<String>,
+    /// Per-repo overrides keyed "owner/name".
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, RepoGardenerOverride>,
+}
+
+impl Default for GardenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            autonomy: default_gardener_autonomy(),
+            schedule: default_gardener_schedule(),
+            exclude: Vec::new(),
+            draft_pr_label: None,
+            repos: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Per-repo override of the global [`GardenerConfig`]; unset fields inherit.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RepoGardenerOverride {
+    pub enabled: Option<bool>,
+    pub autonomy: Option<String>,
+    pub schedule: Option<String>,
+    pub exclude: Option<Vec<String>>,
+    pub draft_pr_label: Option<String>,
+}
+
+/// Effective gardener policy for one repository after override layering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGardenerPolicy {
+    pub enabled: bool,
+    pub autonomy: Autonomy,
+    pub schedule: String,
+    pub exclude: Vec<String>,
+    pub draft_pr_label: Option<String>,
+}
+
+impl GardenerConfig {
+    fn overrides(&self, repo: &str) -> Option<&RepoGardenerOverride> {
+        self.repos.get(repo)
+    }
+
+    pub fn enabled_for(&self, repo: &str) -> bool {
+        self.overrides(repo)
+            .and_then(|o| o.enabled)
+            .unwrap_or(self.enabled)
+    }
+
+    pub fn autonomy_for(&self, repo: &str) -> String {
+        self.overrides(repo)
+            .and_then(|o| o.autonomy.clone())
+            .unwrap_or_else(|| self.autonomy.clone())
+    }
+
+    pub fn schedule_for(&self, repo: &str) -> String {
+        self.overrides(repo)
+            .and_then(|o| o.schedule.clone())
+            .unwrap_or_else(|| self.schedule.clone())
+    }
+
+    pub fn exclude_for(&self, repo: &str) -> Vec<String> {
+        self.overrides(repo)
+            .and_then(|o| o.exclude.clone())
+            .unwrap_or_else(|| self.exclude.clone())
+    }
+
+    pub fn draft_pr_label_for(&self, repo: &str) -> Option<String> {
+        self.overrides(repo)
+            .and_then(|o| o.draft_pr_label.clone())
+            .or_else(|| self.draft_pr_label.clone())
+    }
+}
+
+fn default_gardener_autonomy() -> String {
+    "propose".to_string()
+}
+
+fn default_gardener_schedule() -> String {
+    "0 4 * * *".to_string()
+}
+
+fn gardener_autonomy(value: &str) -> Autonomy {
+    match value {
+        "prune-dead" => Autonomy::PruneDead,
+        _ => Autonomy::Propose,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     /// Bind address, e.g. "0.0.0.0:3000"
@@ -526,8 +636,7 @@ impl Config {
                 triggers: TriggerPolicy::default(),
             };
         }
-        let Some(installation) = self.installations.iter().find(|i| i.id == installation_id)
-        else {
+        let Some(installation) = self.installations.iter().find(|i| i.id == installation_id) else {
             return RoutingScope::closed();
         };
         let familiars: Vec<&FamiliarConfig> = if installation.familiars.is_empty() {
@@ -558,7 +667,10 @@ impl Config {
                 reviews: o.reviews.unwrap_or(triggers.reviews),
             };
         }
-        RoutingScope { familiars, triggers }
+        RoutingScope {
+            familiars,
+            triggers,
+        }
     }
 
     /// The routing policy view for one installation, for the Cave dashboard
@@ -632,6 +744,18 @@ impl Config {
             .iter()
             .filter_map(|i| i.limits.max_concurrent.map(|cap| (i.id, cap)))
             .collect()
+    }
+
+    /// Resolves the effective gardener policy for `repo` (issue #14).
+    pub fn gardener_policy(&self, repo: &str) -> ResolvedGardenerPolicy {
+        let autonomy = self.gardener.autonomy_for(repo);
+        ResolvedGardenerPolicy {
+            enabled: self.gardener.enabled_for(repo),
+            autonomy: gardener_autonomy(&autonomy),
+            schedule: self.gardener.schedule_for(repo),
+            exclude: self.gardener.exclude_for(repo),
+            draft_pr_label: self.gardener.draft_pr_label_for(repo),
+        }
     }
 
     /// Run semantic validation over a parsed config and return every diagnostic
@@ -932,7 +1056,10 @@ impl Config {
             )),
         };
         if self.review.pull_request {
-            check_reviewer("the pull_request review lane", self.review.familiar.as_deref());
+            check_reviewer(
+                "the pull_request review lane",
+                self.review.familiar.as_deref(),
+            );
         }
         for (repo, o) in &self.review.repos {
             if o.pull_request == Some(true) {
@@ -951,7 +1078,10 @@ impl Config {
                 if !severities.contains(&value.to_ascii_lowercase().as_str()) {
                     out.push(Diagnostic::error(
                         "review.min_severity",
-                        format!("{scope} has unknown min_severity '{value}' — use one of: {}.", severities.join(", ")),
+                        format!(
+                            "{scope} has unknown min_severity '{value}' — use one of: {}.",
+                            severities.join(", ")
+                        ),
                     ));
                 }
             }
@@ -959,7 +1089,10 @@ impl Config {
                 if !publish_modes.contains(&value.to_ascii_lowercase().as_str()) {
                     out.push(Diagnostic::error(
                         "review.publish",
-                        format!("{scope} has unknown publish mode '{value}' — use one of: {}.", publish_modes.join(", ")),
+                        format!(
+                            "{scope} has unknown publish mode '{value}' — use one of: {}.",
+                            publish_modes.join(", ")
+                        ),
                     ));
                 }
             }
@@ -977,14 +1110,75 @@ impl Config {
             );
         }
 
+        // ── Branch gardener (issue #14) ──────────────────────────────────
+        validate_gardener_autonomy(
+            &mut out,
+            "gardener.autonomy",
+            "the [gardener] section",
+            &self.gardener.autonomy,
+        );
+        validate_gardener_schedule(
+            &mut out,
+            "gardener.schedule",
+            "the [gardener] section",
+            &self.gardener.schedule,
+        );
+        let gardener_on = self.gardener.enabled
+            || self
+                .gardener
+                .repos
+                .values()
+                .any(|o| o.enabled == Some(true));
+        if gardener_on {
+            validate_gardener_excludes(
+                &mut out,
+                "gardener.exclude[]",
+                "the [gardener] section",
+                &self.gardener.exclude,
+            );
+        }
+        for (repo, o) in &self.gardener.repos {
+            if let Some(autonomy) = &o.autonomy {
+                validate_gardener_autonomy(
+                    &mut out,
+                    &format!("gardener.repos.\"{repo}\".autonomy"),
+                    &format!("the gardener override for '{repo}'"),
+                    autonomy,
+                );
+            }
+            if let Some(schedule) = &o.schedule {
+                validate_gardener_schedule(
+                    &mut out,
+                    &format!("gardener.repos.\"{repo}\".schedule"),
+                    &format!("the gardener override for '{repo}'"),
+                    schedule,
+                );
+            }
+            if o.enabled.unwrap_or(self.gardener.enabled) {
+                if let Some(exclude) = &o.exclude {
+                    validate_gardener_excludes(
+                        &mut out,
+                        &format!("gardener.repos.\"{repo}\".exclude[]"),
+                        &format!("the gardener override for '{repo}'"),
+                        exclude,
+                    );
+                }
+            }
+        }
+
         // ── Memory governance (issue #6) ────────────────────────────────
         // Memory is off by default; when an operator enables it anywhere,
         // warn if writes are not approval-gated — that is the posture that
         // lets untrusted content shape future reviews.
-        let memory_on = self.memory.enabled || self.memory.repos.values().any(|o| o.enabled == Some(true));
+        let memory_on =
+            self.memory.enabled || self.memory.repos.values().any(|o| o.enabled == Some(true));
         if memory_on {
             let gated = self.memory.approval_required
-                && self.memory.repos.values().all(|o| o.approval_required != Some(false));
+                && self
+                    .memory
+                    .repos
+                    .values()
+                    .all(|o| o.approval_required != Some(false));
             if !gated {
                 out.push(Diagnostic::warning(
                     "memory.approval_required",
@@ -1025,6 +1219,18 @@ impl Diagnostic {
             message,
         }
     }
+    fn error_with_next_step(
+        field: impl Into<String>,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: Severity::Error,
+            field: field.into(),
+            message: message.into(),
+            next_step: next_step.into(),
+        }
+    }
     fn warning(field: &str, message: impl Into<String>) -> Self {
         let message = message.into();
         Self {
@@ -1034,9 +1240,79 @@ impl Diagnostic {
             message,
         }
     }
+    fn warning_with_next_step(
+        field: impl Into<String>,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: Severity::Warning,
+            field: field.into(),
+            message: message.into(),
+            next_step: next_step.into(),
+        }
+    }
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
     }
+}
+
+fn validate_gardener_autonomy(out: &mut Vec<Diagnostic>, field: &str, scope: &str, value: &str) {
+    if matches!(value, "propose" | "prune-dead") {
+        return;
+    }
+
+    let next_step = "Set gardener autonomy to one of the supported tiers: propose or prune-dead.";
+    if value == "full" {
+        out.push(Diagnostic::error_with_next_step(
+            field,
+            format!(
+                "{scope} requests autonomy 'full', but the full/approval tier is not yet implemented."
+            ),
+            next_step,
+        ));
+    } else {
+        out.push(Diagnostic::error_with_next_step(
+            field,
+            format!("{scope} has unknown autonomy '{value}' — use one of: propose, prune-dead."),
+            next_step,
+        ));
+    }
+}
+
+fn validate_gardener_schedule(out: &mut Vec<Diagnostic>, field: &str, scope: &str, value: &str) {
+    if let Err(err) = parse_schedule(value) {
+        out.push(Diagnostic::error_with_next_step(
+            field,
+            format!("{scope} has unsupported schedule '{value}': {err}."),
+            "Use the accepted schedule form 'M H * * *', for example '0 4 * * *'.",
+        ));
+    }
+}
+
+fn validate_gardener_excludes(
+    out: &mut Vec<Diagnostic>,
+    field: &str,
+    scope: &str,
+    patterns: &[String],
+) {
+    for pattern in patterns {
+        if has_non_trailing_star(pattern) {
+            out.push(Diagnostic::warning_with_next_step(
+                field,
+                format!(
+                    "{scope} has exclude pattern '{pattern}' with '*' before the final character; the gardener will only match it literally."
+                ),
+                "Use a literal branch name, a trailing-* prefix such as 'release/*', or bare '*' to match every branch.",
+            ));
+        }
+    }
+}
+
+fn has_non_trailing_star(pattern: &str) -> bool {
+    pattern
+        .char_indices()
+        .any(|(idx, ch)| ch == '*' && idx + ch.len_utf8() != pattern.len())
 }
 
 const PLACEHOLDER_SECRETS: &[&str] = &[
@@ -1209,6 +1485,7 @@ mod tests {
             review: ReviewConfig::default(),
             storage: StorageConfig::default(),
             memory: MemoryConfig::default(),
+            gardener: GardenerConfig::default(),
             api: ApiConfig::default(),
             installations: vec![],
         }
@@ -1384,8 +1661,300 @@ mod tests {
                 approval_required: None,
             },
         );
-        assert!(!memory.enabled_for("acme/quiet"), "override disables the repo");
+        assert!(
+            !memory.enabled_for("acme/quiet"),
+            "override disables the repo"
+        );
         assert!(memory.enabled_for("acme/loud"));
+    }
+
+    #[test]
+    fn gardener_policy_defaults_to_disabled_propose_daily_schedule() {
+        let policy = GardenerConfig::default();
+        assert!(!policy.enabled_for("OpenCoven/any"));
+        assert_eq!(policy.autonomy_for("OpenCoven/any"), "propose");
+        assert_eq!(policy.schedule_for("OpenCoven/any"), "0 4 * * *");
+
+        let resolved = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: PathBuf::from("key.pem"),
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: PathBuf::from("coven-code"),
+                workspace_root: PathBuf::from("."),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        )
+        .gardener_policy("OpenCoven/any");
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.autonomy, coven_github_gardener::Autonomy::Propose);
+        assert_eq!(resolved.schedule, "0 4 * * *");
+        assert!(resolved.exclude.is_empty());
+        assert_eq!(resolved.draft_pr_label, None);
+    }
+
+    #[test]
+    fn gardener_policy_resolves_repo_overrides_and_repo_opt_in() {
+        let mut gardener = GardenerConfig {
+            enabled: true,
+            autonomy: "propose".to_string(),
+            schedule: "0 4 * * *".to_string(),
+            exclude: vec!["release/*".to_string()],
+            draft_pr_label: Some("coven:garden".to_string()),
+            repos: std::collections::HashMap::new(),
+        };
+        gardener.repos.insert(
+            "OpenCoven/coven-github".to_string(),
+            RepoGardenerOverride {
+                enabled: Some(true),
+                autonomy: Some("prune-dead".to_string()),
+                schedule: Some("30 6 * * *".to_string()),
+                exclude: Some(vec!["keep/*".to_string()]),
+                draft_pr_label: Some("coven:garden-local".to_string()),
+            },
+        );
+        gardener.repos.insert(
+            "OpenCoven/quiet".to_string(),
+            RepoGardenerOverride {
+                enabled: Some(false),
+                autonomy: None,
+                schedule: None,
+                exclude: None,
+                draft_pr_label: None,
+            },
+        );
+
+        assert!(gardener.enabled_for("OpenCoven/other"));
+        assert!(gardener.enabled_for("OpenCoven/coven-github"));
+        assert!(!gardener.enabled_for("OpenCoven/quiet"));
+        assert_eq!(
+            gardener.autonomy_for("OpenCoven/coven-github"),
+            "prune-dead"
+        );
+        assert_eq!(
+            gardener.schedule_for("OpenCoven/coven-github"),
+            "30 6 * * *"
+        );
+        assert_eq!(
+            gardener.exclude_for("OpenCoven/coven-github"),
+            vec!["keep/*".to_string()]
+        );
+        assert_eq!(
+            gardener
+                .draft_pr_label_for("OpenCoven/coven-github")
+                .as_deref(),
+            Some("coven:garden-local")
+        );
+
+        let mut repo_only = GardenerConfig::default();
+        repo_only.repos.insert(
+            "OpenCoven/coven-github".to_string(),
+            RepoGardenerOverride {
+                enabled: Some(true),
+                autonomy: Some("propose".to_string()),
+                schedule: Some("15 3 * * *".to_string()),
+                exclude: None,
+                draft_pr_label: None,
+            },
+        );
+        assert!(repo_only.enabled_for("OpenCoven/coven-github"));
+        assert!(!repo_only.enabled_for("OpenCoven/other"));
+    }
+
+    #[test]
+    fn gardener_policy_maps_supported_autonomy_strings_to_enums() {
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: PathBuf::from("key.pem"),
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: PathBuf::from("coven-code"),
+                workspace_root: PathBuf::from("."),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.gardener.autonomy = "propose".to_string();
+        assert_eq!(
+            cfg.gardener_policy("OpenCoven/any").autonomy,
+            coven_github_gardener::Autonomy::Propose
+        );
+        cfg.gardener.autonomy = "prune-dead".to_string();
+        assert_eq!(
+            cfg.gardener_policy("OpenCoven/any").autonomy,
+            coven_github_gardener::Autonomy::PruneDead
+        );
+    }
+
+    #[test]
+    fn doctor_validates_gardener_policy_values() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.gardener.enabled = true;
+        cfg.gardener.autonomy = "full".to_string();
+        cfg.gardener.schedule = "*/5 4 * * *".to_string();
+        cfg.gardener.exclude = vec!["release/*/hotfix".to_string()];
+        cfg.gardener.repos.insert(
+            "o/r".to_string(),
+            RepoGardenerOverride {
+                enabled: Some(true),
+                autonomy: Some("launch".to_string()),
+                schedule: Some("0 4 * * 1".to_string()),
+                exclude: Some(vec!["feat/*/wip".to_string()]),
+                draft_pr_label: None,
+            },
+        );
+
+        let diags = cfg.check();
+        let full = diags
+            .iter()
+            .find(|d| d.field == "gardener.autonomy")
+            .expect("full autonomy should be diagnosed");
+        assert_eq!(full.severity, Severity::Error);
+        assert!(full
+            .message
+            .contains("full/approval tier is not yet implemented"));
+        assert!(full.next_step.contains("propose"));
+        assert!(full.next_step.contains("prune-dead"));
+        assert!(errors(&diags).contains(&"gardener.schedule"));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.field == "gardener.exclude[]" && d.severity == Severity::Warning),
+            "mid-pattern wildcard should warn: {diags:?}"
+        );
+        assert!(
+            errors(&diags).contains(&"gardener.repos.\"o/r\".autonomy"),
+            "repo autonomy should be diagnosed: {diags:?}"
+        );
+        assert!(
+            errors(&diags).contains(&"gardener.repos.\"o/r\".schedule"),
+            "repo schedule should be diagnosed: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.field == "gardener.repos.\"o/r\".exclude[]" && d.severity == Severity::Warning
+            }),
+            "repo mid-pattern wildcard should warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_accepts_valid_gardener_policy() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.gardener.enabled = true;
+        cfg.gardener.autonomy = "prune-dead".to_string();
+        cfg.gardener.schedule = "45 2 * * *".to_string();
+        cfg.gardener.exclude = vec!["release/*".to_string(), "*".to_string(), "main".to_string()];
+
+        let gardener_diags: Vec<_> = cfg
+            .check()
+            .into_iter()
+            .filter(|d| d.field.starts_with("gardener."))
+            .collect();
+        assert!(gardener_diags.is_empty(), "diags: {gardener_diags:?}");
+    }
+
+    #[test]
+    fn parses_gardener_toml_with_repo_overrides() {
+        let raw = r#"
+            [server]
+            bind = "127.0.0.1:3000"
+
+            [github]
+            app_id = 123
+            private_key_path = "key.pem"
+            webhook_secret = "a-long-random-webhook-secret"
+
+            [worker]
+            concurrency = 4
+            coven_code_bin = "coven-code"
+            workspace_root = "."
+
+            [[familiars]]
+            id = "cody"
+            display_name = "Cody"
+            bot_username = "coven-cody[bot]"
+            trigger_labels = ["coven:fix"]
+
+            [gardener]
+            enabled = true
+            autonomy = "propose"
+            schedule = "0 4 * * *"
+            exclude = ["release/*"]
+            draft_pr_label = "coven:garden"
+
+            [gardener.repos."o/r"]
+            enabled = true
+            autonomy = "prune-dead"
+            schedule = "15 5 * * *"
+            exclude = ["keep/*"]
+            draft_pr_label = "coven:garden-local"
+        "#;
+
+        let cfg: Config = toml::from_str(raw).expect("config should parse");
+        let policy = cfg.gardener_policy("o/r");
+        assert!(policy.enabled);
+        assert_eq!(policy.autonomy, coven_github_gardener::Autonomy::PruneDead);
+        assert_eq!(policy.schedule, "15 5 * * *");
+        assert_eq!(policy.exclude, vec!["keep/*".to_string()]);
+        assert_eq!(policy.draft_pr_label.as_deref(), Some("coven:garden-local"));
+
+        let encoded = toml::to_string(&cfg).expect("config should serialize");
+        let round_tripped: Config =
+            toml::from_str(&encoded).expect("serialized config should parse");
+        let policy = round_tripped.gardener_policy("o/r");
+        assert!(policy.enabled);
+        assert_eq!(policy.autonomy, coven_github_gardener::Autonomy::PruneDead);
+        assert_eq!(policy.schedule, "15 5 * * *");
+        assert_eq!(policy.exclude, vec!["keep/*".to_string()]);
+        assert_eq!(policy.draft_pr_label.as_deref(), Some("coven:garden-local"));
     }
 
     #[test]

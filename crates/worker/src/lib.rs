@@ -1915,6 +1915,7 @@ mod disposition_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         }
@@ -2044,6 +2045,7 @@ mod process_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         }
@@ -2316,6 +2318,7 @@ exit 0
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         };
@@ -2550,6 +2553,7 @@ exit 0
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         };
@@ -2689,6 +2693,7 @@ mod command_and_marker_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         }
@@ -3157,6 +3162,7 @@ mod publication_gate_tests {
             review: policy,
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         };
