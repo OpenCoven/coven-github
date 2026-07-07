@@ -84,6 +84,11 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // Open durable state before serving so a bad storage path fails
+            // fast rather than on the first webhook (issue #2).
+            let store = coven_github_store::Store::open(&config.storage.path)?;
+            tracing::info!(path = %config.storage.path.display(), "durable store ready");
+
             let config = Arc::new(config);
 
             let (task_tx, task_rx) = mpsc::channel(256);
@@ -101,6 +106,7 @@ async fn main() -> Result<()> {
                 config: config.clone(),
                 task_tx,
                 task_store,
+                store,
             };
 
             let app = Router::new()

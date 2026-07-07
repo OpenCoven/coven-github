@@ -319,6 +319,7 @@ dependencies = [
  "clap",
  "coven-github-api",
  "coven-github-config",
+ "coven-github-store",
  "coven-github-webhook",
  "coven-github-worker",
  "tokio",
