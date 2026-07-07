@@ -56,8 +56,43 @@ Recommended baseline:
 
 Recommended order:
 
-1. Enforce process timeouts for all local workers.
-2. Persist task state before and after each worker phase.
-3. Add Docker-based worker backend behind the current worker interface.
-4. Add resource limits and workspace cleanup tests.
+1. Enforce process timeouts for all local workers. ✅
+2. Persist task state before and after each worker phase. ✅ (#2)
+3. Add Docker-based worker backend behind the current worker interface. ✅ (#5)
+4. Add resource limits and workspace cleanup tests. ✅ (#5)
 5. Add a dedicated worker pool tier for paid hosted customers.
+
+## Operator Configuration (issue #5)
+
+The worker backend is configured in `[worker]`:
+
+```toml
+[worker]
+backend = "container"            # "host" (dev) or "container" (hosted)
+# allow_host_backend = true      # explicit opt-in to host execution when
+                                 # [[installations]] are configured
+
+[worker.container]
+image = "ghcr.io/opencoven/coven-code:latest"
+docker_bin = "docker"            # any docker-compatible CLI: podman, nerdctl
+cpus = 1.0
+memory = "2g"
+pids = 512
+tmpfs_size = "256m"
+network = "bridge"               # "none" for full egress denial
+```
+
+Each task attempt runs `docker run --rm` with a fresh, uniquely named
+container: read-only rootfs, `--cap-drop ALL`, `no-new-privileges`, a
+bounded `/tmp` tmpfs, and only the task workspace bind-mounted. Git
+authority is forwarded by environment variable *name* (`-e COVEN_GIT_TOKEN`)
+so the token never appears in argv or `docker inspect`. On timeout the
+adapter kills both the CLI process and the container by name; `--rm` tears
+the container down on every path, and the host workspace is deleted after
+success and failure alike.
+
+**Minimum supported backends:** any docker-CLI-compatible runtime (Docker
+Engine, Podman, nerdctl/containerd). The `host` backend remains supported
+for development and trusted self-hosting; once `[[installations]]` blocks
+exist (the hosted posture), `doctor` refuses `host` unless
+`worker.allow_host_backend = true` is set deliberately.
