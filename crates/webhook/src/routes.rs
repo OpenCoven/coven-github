@@ -2,7 +2,7 @@
 
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -347,6 +347,120 @@ pub async fn usage(State(state): State<AppState>, headers: HeaderMap) -> impl In
                 .into_response()
         }
     }
+}
+
+/// Number of audit events one dashboard request returns.
+const AUDIT_LIMIT: u32 = 200;
+
+/// GET /api/github/audit — task-lifecycle audit stream for the Cave dashboard
+/// (issue #18), tenant-scoped and audited, same contract as `list_tasks`.
+pub async fn audit(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let action = "audit";
+    let (caller, scope) = match authorize_api(&state.config.api, &headers) {
+        ApiCaller::Denied => {
+            if let Err(e) = state
+                .store
+                .record_api_read("anonymous", "none", action, "denied")
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response();
+        }
+        ApiCaller::Open => ("open".to_string(), None),
+        ApiCaller::Service => ("service".to_string(), None),
+        ApiCaller::Tenant(tenant) => (
+            format!("tenant:{}", tenant.installation_id),
+            Some(ApiScope {
+                installation_id: tenant.installation_id,
+                repos: if tenant.repos.is_empty() {
+                    None
+                } else {
+                    Some(tenant.repos.clone())
+                },
+            }),
+        ),
+    };
+    let scope_label = scope
+        .as_ref()
+        .map(|s| format!("installation:{}", s.installation_id))
+        .unwrap_or_else(|| "all".to_string());
+
+    match state.store.audit_events(scope, AUDIT_LIMIT).await {
+        Ok(events) => {
+            if let Err(e) = state
+                .store
+                .record_api_read(&caller, &scope_label, action, &format!("ok:{}", events.len()))
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            Json(json!({ "ok": true, "events": events })).into_response()
+        }
+        Err(e) => {
+            error!("audit stream unavailable: {e:#}");
+            let _ = state
+                .store
+                .record_api_read(&caller, &scope_label, action, "error")
+                .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "audit unavailable"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/github/routing[?installation_id=N] — the effective routing policy
+/// for the Cave dashboard (issue #18). A tenant sees its own installation; the
+/// service/open caller names the installation via the query string.
+pub async fn routing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let action = "routing";
+    let (caller, installation_id) = match authorize_api(&state.config.api, &headers) {
+        ApiCaller::Denied => {
+            let _ = state
+                .store
+                .record_api_read("anonymous", "none", action, "denied")
+                .await;
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response();
+        }
+        ApiCaller::Tenant(tenant) => (
+            format!("tenant:{}", tenant.installation_id),
+            tenant.installation_id,
+        ),
+        ApiCaller::Service | ApiCaller::Open => {
+            match params.get("installation_id").and_then(|s| s.parse::<u64>().ok()) {
+                Some(id) => ("service".to_string(), id),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"ok": false, "error": "installation_id required"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+    };
+
+    let view = state.config.routing_view(installation_id);
+    let _ = state
+        .store
+        .record_api_read(&caller, &installation_id.to_string(), action, "ok")
+        .await;
+    Json(json!({ "ok": true, "routing": view })).into_response()
 }
 
 /// Resolved identity of a task-API caller.
@@ -2009,6 +2123,105 @@ mod tenancy_tests {
             .await
             .expect("body");
         (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    async fn call_audit(state: &AppState, bearer: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = bearer {
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        }
+        let response = audit(State(state.clone()), headers).await.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn call_routing(
+        state: &AppState,
+        bearer: Option<&str>,
+        installation_id: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = bearer {
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        }
+        let mut params = std::collections::HashMap::new();
+        if let Some(id) = installation_id {
+            params.insert("installation_id".to_string(), id.to_string());
+        }
+        let response = routing(State(state.clone()), headers, Query(params))
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn seed_ignored(state: &AppState, installation_id: u64) {
+        state
+            .store
+            .record_delivery(
+                coven_github_store::Delivery {
+                    delivery_id: format!("ig-{installation_id}"),
+                    event: "issues".to_string(),
+                    action: Some("closed".to_string()),
+                    installation_id: Some(installation_id),
+                    repo: Some("OpenCoven/demo".to_string()),
+                    payload_hash: "h".to_string(),
+                },
+                coven_github_store::Routing::Ignored("unsupported"),
+            )
+            .await
+            .expect("seed ignored delivery");
+    }
+
+    #[tokio::test]
+    async fn audit_is_tenant_scoped_and_fails_closed() {
+        let state = token_state(two_tenant_api());
+        seed_ignored(&state, 1).await;
+        seed_ignored(&state, 2).await;
+
+        // No token in token mode → fail closed.
+        let (status, json) = call_audit(&state, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(json.get("events").is_none());
+
+        // Installation 1's token sees only its own event.
+        let (status, json) = call_audit(&state, Some("tenant-one-0123456789abcdef")).await;
+        assert_eq!(status, StatusCode::OK);
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "ignored:unsupported");
+
+        // Service sees both installations.
+        let (_, json) = call_audit(&state, Some("service-token-0123456789abcdef")).await;
+        assert_eq!(json["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn routing_view_is_tenant_scoped_and_fails_closed() {
+        let state = token_state(two_tenant_api());
+
+        // Denied without a token.
+        let (status, _) = call_routing(&state, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A tenant sees its own installation's routing view.
+        let (status, json) = call_routing(&state, Some("tenant-one-0123456789abcdef"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["routing"]["installationId"], 1);
+
+        // Service must name the installation.
+        let (status, _) = call_routing(&state, Some("service-token-0123456789abcdef"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, json) =
+            call_routing(&state, Some("service-token-0123456789abcdef"), Some("42")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["routing"]["installationId"], 42);
     }
 
     async fn seed_memory(state: &AppState, installation_id: u64, repo: &str) {

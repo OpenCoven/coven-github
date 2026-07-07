@@ -102,6 +102,7 @@ pub struct RepoRoutingOverride {
 
 /// A serializable installation routing policy for the Cave dashboard (#18).
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutingView {
     pub installation_id: u64,
     pub account: Option<String>,

@@ -170,6 +170,7 @@ duplicate comments.
 | Worker container isolation | Implemented | `worker.backend = "container"` runs each attempt in a fresh hardened container (read-only rootfs, cap-drop ALL, cpu/memory/pids/tmpfs/network limits, env-only token injection, kill-by-name on timeout); hosted posture refuses host execution without explicit opt-in — see [docs/container-isolation.md](docs/container-isolation.md). |
 | Pull request creation | Partial | Opens draft PRs from session results against the repository's resolved default/base branch. |
 | CovenCave task polling | Implemented | Task API served from the durable store, survives restarts, and is gated by the tenant boundary — `token` mode fails closed, tenant tokens are installation-scoped, and every read is audited (see [docs/security.md](docs/security.md)). |
+| Cave oversight dashboard | Implemented | Tenant-scoped data behind the four Cave views: task history (`/api/github/tasks`), usage (`/api/github/usage`), familiar routing (`/api/github/routing`), and a task-lifecycle audit stream (`/api/github/audit`) — acceptance, execution/retries/timeout, and PR creation. |
 | Durable queue / task store | Implemented | Deliveries deduplicated by `X-GitHub-Delivery` before GitHub hears success; the SQLite `tasks` table is the queue (atomic claims, no drop path) and interrupted work is requeued at startup ([design](docs/durable-task-store.md)). |
 | Hosted tier | Planned | See [Hosted vs self-hosted](docs/hosted-vs-self-hosted.md). |
 | Familiar trust contract | Planned | See [Familiar Contract](FAMILIAR-CONTRACT.md). |
