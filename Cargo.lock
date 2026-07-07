@@ -351,6 +351,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "coven-github-gardener"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "coven-github-store"
 version = "0.1.0"
 dependencies = [

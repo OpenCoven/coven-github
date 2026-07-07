@@ -2,6 +2,7 @@
 members = [
     "crates/config",
     "crates/github",
+    "crates/gardener",
     "crates/store",
     "crates/webhook",
     "crates/worker",
