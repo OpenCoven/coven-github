@@ -385,15 +385,23 @@ fn storage_unavailable(e: anyhow::Error) -> axum::response::Response {
 }
 
 /// Maps a parsed event to a worker task, or returns None if not actionable.
+/// Routing is installation-scoped (issue #7): the delivery's installation id
+/// and repository resolve a [`coven_github_config::RoutingScope`] first, and
+/// only that scope's familiars and open trigger lanes can match.
 async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
+    let scope_of = |installation_id: u64, owner: &str, name: &str| {
+        state
+            .config
+            .scope_for(installation_id, &format!("{owner}/{name}"))
+    };
     match event {
         GitHubEvent::IssueAssigned(e) => {
+            let scope = scope_of(e.installation_id, &e.repo_owner, &e.repo_name);
+            if !scope.assignment_enabled() {
+                return None;
+            }
             // Find a familiar whose bot_username matches the assignee.
-            let familiar = state
-                .config
-                .familiars
-                .iter()
-                .find(|f| f.bot_username == e.assignee_login)?;
+            let familiar = scope.familiar_by_bot(&e.assignee_login)?;
 
             Some(Task {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -411,11 +419,11 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         }
 
         GitHubEvent::IssueLabeled(e) => {
-            let familiar = state
-                .config
-                .familiars
-                .iter()
-                .find(|f| f.trigger_labels.iter().any(|label| label == &e.label_name))?;
+            let scope = scope_of(e.installation_id, &e.repo_owner, &e.repo_name);
+            if !scope.labels_enabled() {
+                return None;
+            }
+            let familiar = scope.familiar_by_label(&e.label_name)?;
 
             Some(Task {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -435,7 +443,11 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         // Comment surfaces speak the maintainer command protocol (issue #13):
         // only command-position mentions act; casual mentions are ignored.
         GitHubEvent::IssueComment(e) => {
-            let (familiar, command) = parse_command(state, &e.comment_body, &e.commenter_login)?;
+            let scope = scope_of(e.installation_id, &e.repo_owner, &e.repo_name);
+            if !scope.commands_enabled() {
+                return None;
+            }
+            let (familiar, command) = parse_command(&scope, &e.comment_body, &e.commenter_login)?;
             let surface = CommandSurface {
                 installation_id: e.installation_id,
                 repo_owner: &e.repo_owner,
@@ -451,7 +463,11 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         }
 
         GitHubEvent::PullRequestReview(e) => {
-            let (familiar, command) = parse_command(state, &e.review_body, &e.reviewer_login)?;
+            let scope = scope_of(e.installation_id, &e.repo_owner, &e.repo_name);
+            if !scope.commands_enabled() {
+                return None;
+            }
+            let (familiar, command) = parse_command(&scope, &e.review_body, &e.reviewer_login)?;
             let surface = CommandSurface {
                 installation_id: e.installation_id,
                 repo_owner: &e.repo_owner,
@@ -467,7 +483,11 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         }
 
         GitHubEvent::PullRequestReviewComment(e) => {
-            let (familiar, command) = parse_command(state, &e.comment_body, &e.commenter_login)?;
+            let scope = scope_of(e.installation_id, &e.repo_owner, &e.repo_name);
+            if !scope.commands_enabled() {
+                return None;
+            }
+            let (familiar, command) = parse_command(&scope, &e.comment_body, &e.commenter_login)?;
             let surface = CommandSurface {
                 installation_id: e.installation_id,
                 repo_owner: &e.repo_owner,
@@ -485,6 +505,8 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
         GitHubEvent::PullRequestChanged(e) => {
             // Loop prevention: never auto-review PRs authored by our own
             // familiars — the adapter's draft PRs would otherwise re-trigger.
+            // Checked against the global list on purpose: scope filtering
+            // must never re-enable a self-trigger loop.
             if state
                 .config
                 .familiars
@@ -493,19 +515,22 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
             {
                 return None;
             }
+            let scope = scope_of(e.installation_id, &e.repo_owner, &e.repo_name);
             let repo = format!("{}/{}", e.repo_owner, e.repo_name);
             let policy = &state.config.review;
             let familiar = if e.action == "labeled" {
                 // A review label is an explicit per-PR opt-in: it works even
                 // when the automatic lane is off, and on drafts — the same
-                // contract as issue trigger labels.
+                // contract as issue trigger labels (the `labels` lane).
+                if !scope.labels_enabled() {
+                    return None;
+                }
                 let label = e.label_name.as_deref()?;
-                state
-                    .config
-                    .familiars
-                    .iter()
-                    .find(|f| f.trigger_labels.iter().any(|t| t == label))?
+                scope.familiar_by_label(label)?
             } else {
+                if !scope.reviews_enabled() {
+                    return None;
+                }
                 if !policy.pull_request_enabled(&repo) {
                     return None;
                 }
@@ -513,7 +538,7 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
                     return None;
                 }
                 let reviewer = policy.reviewer(&repo)?;
-                state.config.familiars.iter().find(|f| f.id == reviewer)?
+                scope.familiar_by_id(reviewer)?
             };
 
             Some(Task {
@@ -541,14 +566,14 @@ async fn event_to_task(state: &AppState, event: GitHubEvent) -> Option<Task> {
     }
 }
 
-/// Finds the first familiar addressed in command position, skipping the bots'
-/// own comments (self-trigger loop guard).
+/// Finds the first scoped familiar addressed in command position, skipping
+/// the bots' own comments (self-trigger loop guard).
 fn parse_command<'a>(
-    state: &'a AppState,
+    scope: &coven_github_config::RoutingScope<'a>,
     body: &str,
     author: &str,
 ) -> Option<(&'a coven_github_config::FamiliarConfig, Command)> {
-    state.config.familiars.iter().find_map(|f| {
+    scope.familiars().find_map(|f| {
         if author == f.bot_username {
             return None;
         }
@@ -758,6 +783,7 @@ mod tests {
                 storage: coven_github_config::StorageConfig::default(),
                 memory: coven_github_config::MemoryConfig::default(),
                 api: coven_github_config::ApiConfig::default(),
+                installations: vec![],
             }),
             store: Store::open_in_memory().expect("in-memory store"),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -1730,5 +1756,175 @@ mod tenancy_tests {
 
         let (_, json) = list(&state, Some("tenant-one-0123456789abcdef")).await;
         assert_eq!(repos_of(&json), vec!["OpenCoven/alpha".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod installation_routing_tests {
+    //! Installation-scoped routing (issue #7): the same label routes to
+    //! different familiars per installation, unknown installations fail
+    //! closed, and per-repo policy can switch trigger lanes off.
+    use super::tests::app_state;
+    use super::*;
+    use coven_github_api::{IssueAssignedEvent, IssueCommentEvent, IssueLabeledEvent};
+    use coven_github_config::{FamiliarConfig, InstallationConfig, RepoRoutingOverride};
+    use std::sync::Arc;
+
+    /// cody and nova both claim `coven:fix`; installations 1 and 2 allow-list
+    /// one familiar each.
+    fn two_installation_state() -> AppState {
+        let base = app_state();
+        let mut config = (*base.config).clone();
+        config.familiars = vec![
+            FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec!["coven:fix".to_string()],
+            },
+            FamiliarConfig {
+                id: "nova".to_string(),
+                display_name: "Nova".to_string(),
+                bot_username: "coven-nova[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec!["coven:fix".to_string()],
+            },
+        ];
+        config.installations = vec![
+            InstallationConfig {
+                id: 1,
+                account: Some("acme".to_string()),
+                familiars: vec!["cody".to_string()],
+                triggers: Default::default(),
+                repos: std::collections::HashMap::from([(
+                    "acme/frozen".to_string(),
+                    RepoRoutingOverride {
+                        enabled: Some(false),
+                        ..Default::default()
+                    },
+                ), (
+                    "acme/no-labels".to_string(),
+                    RepoRoutingOverride {
+                        labels: Some(false),
+                        ..Default::default()
+                    },
+                )]),
+            },
+            InstallationConfig {
+                id: 2,
+                account: Some("globex".to_string()),
+                familiars: vec!["nova".to_string()],
+                triggers: Default::default(),
+                repos: std::collections::HashMap::new(),
+            },
+        ];
+        AppState {
+            config: Arc::new(config),
+            ..base
+        }
+    }
+
+    fn labeled(installation_id: u64, owner: &str, name: &str) -> GitHubEvent {
+        GitHubEvent::IssueLabeled(IssueLabeledEvent {
+            installation_id,
+            repo_owner: owner.to_string(),
+            repo_name: name.to_string(),
+            issue_number: 42,
+            issue_title: "t".to_string(),
+            issue_body: "b".to_string(),
+            label_name: "coven:fix".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn same_label_routes_to_different_familiars_per_installation() {
+        let state = two_installation_state();
+
+        let a = event_to_task(&state, labeled(1, "acme", "app"))
+            .await
+            .expect("installation 1 routes");
+        assert_eq!(a.familiar_id, "cody");
+
+        let b = event_to_task(&state, labeled(2, "globex", "app"))
+            .await
+            .expect("installation 2 routes");
+        assert_eq!(b.familiar_id, "nova");
+    }
+
+    #[tokio::test]
+    async fn unknown_installation_fails_closed_once_installations_exist() {
+        let state = two_installation_state();
+        assert!(
+            event_to_task(&state, labeled(999, "stranger", "app"))
+                .await
+                .is_none(),
+            "an unlisted installation must route nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_respects_the_installation_familiar_allow_list() {
+        let state = two_installation_state();
+        // nova is not allow-listed for installation 1: assigning to nova's
+        // bot there must not route, while cody's bot does.
+        let assigned = |login: &str| {
+            GitHubEvent::IssueAssigned(IssueAssignedEvent {
+                installation_id: 1,
+                repo_owner: "acme".to_string(),
+                repo_name: "app".to_string(),
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+                assignee_login: login.to_string(),
+            })
+        };
+        assert!(event_to_task(&state, assigned("coven-nova[bot]"))
+            .await
+            .is_none());
+        let task = event_to_task(&state, assigned("coven-cody[bot]"))
+            .await
+            .expect("allow-listed familiar routes");
+        assert_eq!(task.familiar_id, "cody");
+    }
+
+    #[tokio::test]
+    async fn repo_policy_disables_triggers_per_repository() {
+        let state = two_installation_state();
+        // enabled = false: every lane off for that repo only.
+        assert!(event_to_task(&state, labeled(1, "acme", "frozen"))
+            .await
+            .is_none());
+        // labels = false: the label lane is off, but commands still work.
+        assert!(event_to_task(&state, labeled(1, "acme", "no-labels"))
+            .await
+            .is_none());
+        let command = GitHubEvent::IssueComment(IssueCommentEvent {
+            installation_id: 1,
+            repo_owner: "acme".to_string(),
+            repo_name: "no-labels".to_string(),
+            issue_number: 42,
+            issue_title: "t".to_string(),
+            issue_body: "b".to_string(),
+            comment_body: "@coven-cody status".to_string(),
+            commenter_login: "octocat".to_string(),
+            on_pull_request: false,
+        });
+        assert!(
+            event_to_task(&state, command).await.is_some(),
+            "the commands lane must stay open when only labels are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_routing_is_preserved_when_no_installations_are_configured() {
+        // The self-hosted default: app_state has no [[installations]].
+        let state = app_state();
+        let task = event_to_task(&state, labeled(123, "OpenCoven", "coven-code"))
+            .await
+            .expect("open routing must keep working");
+        assert_eq!(task.familiar_id, "cody");
     }
 }

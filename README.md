@@ -158,6 +158,7 @@ duplicate comments.
 | Label trigger | Implemented | Routes configured `trigger_labels` such as `coven:fix`. |
 | Maintainer command protocol | Implemented | Typed `@familiar <verb>` grammar; casual mentions ignored; write-access gate; self-comments never re-trigger. |
 | Marker-backed status comments | Implemented | One edited-in-place status surface per issue/PR; no duplicate bot comments. |
+| Installation-scoped routing | Implemented | `[[installations]]` policy: per-installation familiar allow-lists, per-repo trigger-lane switches, fail-closed for unlisted installations; absent config keeps open self-hosted routing. |
 | Reference demo of the operating loop | Implemented | Offline, self-verifying replay of the full loop with a real adapter binary — see [docs/demo.md](docs/demo.md). |
 | PR lifecycle review trigger | Implemented | Policy-gated auto-review on opened/synchronize/reopened/ready_for_review plus label opt-in; familiar-authored PRs are never auto-reviewed. |
 | Push / commit review trigger | Partial | Events parsed and typed with fixtures; execution lane needs headless contract v3. |

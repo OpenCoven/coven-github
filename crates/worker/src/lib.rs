@@ -1846,6 +1846,7 @@ mod disposition_tests {
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
             api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
         }
     }
 
@@ -1960,6 +1961,7 @@ mod process_tests {
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
             api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
         }
     }
 
@@ -2235,6 +2237,7 @@ exit 0
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
             api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
         };
         let task = Task {
             id: "task-pub".to_string(),
@@ -2465,6 +2468,7 @@ exit 0
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
             api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
         };
         let task = Task {
             id: "task-stale".to_string(),
@@ -2600,6 +2604,7 @@ mod command_and_marker_tests {
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
             api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
         }
     }
 
@@ -3064,6 +3069,7 @@ mod publication_gate_tests {
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
             api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
         };
         let task = Task {
             id: "task-gates".to_string(),
