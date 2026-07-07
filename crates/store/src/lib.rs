@@ -480,6 +480,19 @@ pub struct UsageRow {
     pub runtime_secs: u64,
 }
 
+/// One task-lifecycle audit event for the Cave dashboard (issue #18).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEvent {
+    /// RFC 3339 timestamp.
+    pub at: String,
+    pub task_id: Option<String>,
+    pub repo: Option<String>,
+    /// `ignored:<reason>` | `attempt:<outcome>` | `pr_opened`.
+    pub kind: String,
+    pub detail: Option<String>,
+}
+
 impl Store {
     /// Appends a task-API read to the audit trail (issue #3).
     pub async fn record_api_read(
@@ -504,6 +517,92 @@ impl Store {
                 params![now_rfc3339(), caller, scope, action, result],
             )?;
             Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Assembles a task-lifecycle audit stream for the Cave dashboard (issue
+    /// #18), scoped to the caller's installation and capped at `limit`, newest
+    /// first. Draws from three durable sources: ignored deliveries (acceptance
+    /// rejections), task attempts (execution / retries / timeout / failure),
+    /// and opened PRs (publication).
+    pub async fn audit_events(&self, scope: Option<ApiScope>, limit: u32) -> Result<Vec<AuditEvent>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let inst = scope.as_ref().map(|s| s.installation_id);
+            let mut events: Vec<AuditEvent> = Vec::new();
+
+            // Ignored deliveries — the adapter received but did not act.
+            let mut stmt = conn.prepare(
+                "SELECT received_at, repo, routing FROM webhook_deliveries
+                 WHERE routing LIKE 'ignored:%' AND (?1 IS NULL OR installation_id = ?1)",
+            )?;
+            for row in stmt.query_map(params![inst], |r| {
+                Ok(AuditEvent {
+                    at: r.get(0)?,
+                    task_id: None,
+                    repo: r.get::<_, Option<String>>(1)?,
+                    kind: r.get::<_, String>(2)?,
+                    detail: None,
+                })
+            })? {
+                events.push(row?);
+            }
+
+            // Task attempts — one per execution, carrying retries and outcomes.
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(a.ended_at, a.started_at), a.task_id, t.repo, a.attempt,
+                        a.outcome, a.detail
+                 FROM task_attempts a JOIN tasks t ON a.task_id = t.id
+                 WHERE (?1 IS NULL OR t.installation_id = ?1)",
+            )?;
+            for row in stmt.query_map(params![inst], |r| {
+                let attempt: i64 = r.get(3)?;
+                let outcome: Option<String> = r.get(4)?;
+                let detail: Option<String> = r.get(5)?;
+                Ok(AuditEvent {
+                    at: r.get(0)?,
+                    task_id: Some(r.get::<_, String>(1)?),
+                    repo: Some(r.get::<_, String>(2)?),
+                    kind: format!("attempt:{}", outcome.as_deref().unwrap_or("running")),
+                    detail: detail.map(|d| format!("attempt {attempt}: {d}")),
+                })
+            })? {
+                events.push(row?);
+            }
+
+            // Opened pull requests — the publication events.
+            let mut stmt = conn.prepare(
+                "SELECT updated_at, id, repo, pr_number FROM tasks
+                 WHERE pr_number IS NOT NULL AND (?1 IS NULL OR installation_id = ?1)",
+            )?;
+            for row in stmt.query_map(params![inst], |r| {
+                Ok(AuditEvent {
+                    at: r.get(0)?,
+                    task_id: Some(r.get::<_, String>(1)?),
+                    repo: Some(r.get::<_, String>(2)?),
+                    kind: "pr_opened".to_string(),
+                    detail: Some(format!("PR #{}", r.get::<_, u64>(3)?)),
+                })
+            })? {
+                events.push(row?);
+            }
+
+            // Newest first, honor an optional repo narrowing, then cap.
+            events.sort_by(|a, b| b.at.cmp(&a.at));
+            let repos = scope.as_ref().and_then(|s| s.repos.as_ref());
+            let filtered = events
+                .into_iter()
+                .filter(|e| match (repos, &e.repo) {
+                    (Some(allowed), Some(repo)) => allowed.contains(repo),
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                })
+                .take(limit as usize)
+                .collect();
+            Ok(filtered)
         })
         .await
         .expect("store task panicked")
@@ -1611,6 +1710,49 @@ mod queue_tests {
         assert!(text.iter().any(|t| t.contains("DETAIL_MARKER")));
         // The delivery routing is adapter-generated and included.
         assert!(text.iter().any(|t| t.starts_with("task:")));
+    }
+
+    #[tokio::test]
+    async fn audit_events_assemble_lifecycle_scoped_to_installation() {
+        let store = Store::open_in_memory().expect("open");
+        // A finished task that opened a PR (attempt + pr_opened events).
+        enqueue(&store, "d1", &fix_task("t1")).await;
+        store.claim_next(&Default::default()).await.unwrap();
+        store
+            .finish(
+                "t1",
+                Terminal {
+                    state: TerminalState::Completed,
+                    result_status: Some("success".to_string()),
+                    branch: Some("cody/fix".to_string()),
+                    pr_number: Some(9),
+                    summary: Some("done".to_string()),
+                    detail: Some("attempt ok".to_string()),
+                },
+            )
+            .await
+            .expect("finish");
+        // An ignored delivery (acceptance rejection).
+        store
+            .record_delivery(delivery("d-ig"), Routing::Ignored("unsupported"))
+            .await
+            .unwrap();
+
+        let events = store
+            .audit_events(Some(ApiScope { installation_id: 1, repos: None }), 100)
+            .await
+            .unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"pr_opened"), "kinds: {kinds:?}");
+        assert!(kinds.iter().any(|k| k.starts_with("attempt:")), "kinds: {kinds:?}");
+        assert!(kinds.contains(&"ignored:unsupported"), "kinds: {kinds:?}");
+
+        // A different installation sees none of it.
+        let other = store
+            .audit_events(Some(ApiScope { installation_id: 999, repos: None }), 100)
+            .await
+            .unwrap();
+        assert!(other.is_empty());
     }
 
     #[tokio::test]

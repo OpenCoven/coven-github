@@ -100,6 +100,24 @@ pub struct RepoRoutingOverride {
     pub reviews: Option<bool>,
 }
 
+/// A serializable installation routing policy for the Cave dashboard (#18).
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingView {
+    pub installation_id: u64,
+    pub account: Option<String>,
+    /// Familiar ids this installation may route to (resolved allow-list, or all
+    /// configured familiars).
+    pub familiars: Vec<String>,
+    /// Installation-level trigger lanes.
+    pub triggers: TriggerPolicy,
+    /// Per-repo trigger overrides.
+    pub repos: std::collections::HashMap<String, RepoRoutingOverride>,
+    /// `true` when the installation is explicitly configured; `false` means
+    /// open routing (nothing configured) or fail-closed (unlisted) — read
+    /// `familiars` to tell which.
+    pub listed: bool,
+}
+
 /// The effective routing view for one delivery: which familiars are visible
 /// and which trigger lanes are open (issue #7).
 pub struct RoutingScope<'a> {
@@ -540,6 +558,60 @@ impl Config {
             };
         }
         RoutingScope { familiars, triggers }
+    }
+
+    /// The routing policy view for one installation, for the Cave dashboard
+    /// (issue #18). Resolves familiars and triggers the same way [`scope_for`]
+    /// does, but at the installation level (not one delivery), and includes the
+    /// per-repo overrides so the dashboard can render them.
+    ///
+    /// [`scope_for`]: Config::scope_for
+    pub fn routing_view(&self, installation_id: u64) -> RoutingView {
+        let all_familiars = || self.familiars.iter().map(|f| f.id.clone()).collect::<Vec<_>>();
+        // Open routing (no installations configured): every familiar, all lanes.
+        if self.installations.is_empty() {
+            return RoutingView {
+                installation_id,
+                account: None,
+                familiars: all_familiars(),
+                triggers: TriggerPolicy::default(),
+                repos: std::collections::HashMap::new(),
+                listed: false,
+            };
+        }
+        // Configured but unlisted: fail closed — routes nothing.
+        let Some(installation) = self.installations.iter().find(|i| i.id == installation_id) else {
+            return RoutingView {
+                installation_id,
+                account: None,
+                familiars: Vec::new(),
+                triggers: TriggerPolicy {
+                    assignment: false,
+                    labels: false,
+                    commands: false,
+                    reviews: false,
+                },
+                repos: std::collections::HashMap::new(),
+                listed: false,
+            };
+        };
+        let familiars = if installation.familiars.is_empty() {
+            all_familiars()
+        } else {
+            self.familiars
+                .iter()
+                .map(|f| f.id.clone())
+                .filter(|id| installation.familiars.contains(id))
+                .collect()
+        };
+        RoutingView {
+            installation_id,
+            account: installation.account.clone(),
+            familiars,
+            triggers: installation.triggers,
+            repos: installation.repos.clone(),
+            listed: true,
+        }
     }
 
     /// Usage limits for one installation (issue #15). Unlimited when the
@@ -1172,6 +1244,75 @@ mod tests {
             .filter(|d| d.is_error())
             .map(|d| d.field.as_str())
             .collect()
+    }
+
+    fn routing_config(familiars: Vec<FamiliarConfig>) -> Config {
+        let dir = tmpdir();
+        config_with(
+            GitHubAppConfig {
+                app_id: 1,
+                private_key_path: write_pem(&dir),
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: write_bin(&dir),
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: true,
+            },
+            familiars,
+        )
+    }
+
+    fn fam(id: &str) -> FamiliarConfig {
+        FamiliarConfig {
+            id: id.into(),
+            display_name: id.into(),
+            bot_username: format!("coven-{id}[bot]"),
+            model: None,
+            skills: vec![],
+            trigger_labels: vec![],
+        }
+    }
+
+    #[test]
+    fn routing_view_reflects_open_listed_and_fail_closed() {
+        let mut cfg = routing_config(vec![fam("cody"), fam("nova")]);
+
+        // Open routing (no installations): every familiar, all lanes, unlisted.
+        let open = cfg.routing_view(123);
+        assert_eq!(open.familiars, vec!["cody", "nova"]);
+        assert!(open.triggers.reviews);
+        assert!(!open.listed);
+
+        // Listed with an allow-list and a disabled lane.
+        cfg.installations = vec![InstallationConfig {
+            id: 123,
+            account: Some("acme".into()),
+            familiars: vec!["cody".into()],
+            triggers: TriggerPolicy {
+                reviews: false,
+                ..Default::default()
+            },
+            limits: InstallationLimits::default(),
+            repos: std::collections::HashMap::new(),
+        }];
+        let listed = cfg.routing_view(123);
+        assert_eq!(listed.familiars, vec!["cody"]);
+        assert_eq!(listed.account.as_deref(), Some("acme"));
+        assert!(!listed.triggers.reviews);
+        assert!(listed.listed);
+
+        // Configured but unlisted → fail closed.
+        let closed = cfg.routing_view(999);
+        assert!(closed.familiars.is_empty());
+        assert!(!closed.triggers.assignment);
+        assert!(!closed.listed);
     }
 
     #[test]
