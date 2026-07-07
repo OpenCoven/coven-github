@@ -102,6 +102,6 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # [memory]
 # enabled = false
 # approval_required = true   # learned facts stay pending until a maintainer approves
-# retention_days = 365
+# retention_days = 365      # forwarded to the runtime; also expires the adapter's memory audit
 # [memory.repos."acme/billing"]
 # enabled = true             # per-repo opt-in

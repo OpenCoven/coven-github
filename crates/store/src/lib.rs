@@ -608,12 +608,19 @@ impl Store {
             let mut conn = conn.lock().expect("store mutex poisoned");
             let tx = conn.transaction()?;
             for row in &rows {
+                // Honor an explicit timestamp when provided (tests/backfills);
+                // otherwise stamp the current time.
+                let at = if row.at.is_empty() {
+                    now_rfc3339()
+                } else {
+                    row.at.clone()
+                };
                 tx.execute(
                     "INSERT INTO memory_activity
                        (at, installation_id, repo, task_id, op, target, scope, outcome)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
-                        now_rfc3339(),
+                        at,
                         row.installation_id,
                         row.repo,
                         row.task_id,
@@ -738,6 +745,30 @@ impl Store {
         })
         .await
         .expect("store task panicked")
+    }
+
+    /// Deletes memory-activity audit rows older than `cutoff` (RFC 3339) —
+    /// retention expiry (issue #6). Revocations are active policy and are never
+    /// expired: an expired revocation would silently un-revoke memory.
+    pub async fn expire_memory_activity_before(&self, cutoff: &str) -> Result<usize> {
+        let conn = self.conn.clone();
+        let cutoff = cutoff.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let n = conn.execute(
+                "DELETE FROM memory_activity WHERE at < ?1",
+                params![cutoff],
+            )?;
+            Ok(n)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Deletes memory-activity audit rows older than `retention_days` from now.
+    pub async fn expire_memory_activity(&self, retention_days: u32) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+        self.expire_memory_activity_before(&cutoff).await
     }
 }
 
@@ -1097,6 +1128,36 @@ mod tests {
         // A different repo, and a different installation, are isolated.
         assert!(store.revocations_for(1, "OpenCoven/other").await.unwrap().is_empty());
         assert!(store.revocations_for(2, "OpenCoven/billing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retention_expiry_removes_old_activity_but_keeps_revocations() {
+        let store = Store::open_in_memory().unwrap();
+        // An old audit row (explicit timestamp) and a fresh one (empty → now).
+        let mut old = memory_row(1, "OpenCoven/a", "repo/OpenCoven/a/old", "accepted");
+        old.at = "2020-01-01T00:00:00+00:00".to_string();
+        store.record_memory_activity(vec![old]).await.unwrap();
+        store
+            .record_memory_activity(vec![memory_row(1, "OpenCoven/a", "repo/OpenCoven/a/new", "accepted")])
+            .await
+            .unwrap();
+        // A revocation must survive the sweep.
+        store.record_revocation(1, "OpenCoven/a", "repo/OpenCoven/a/x").await.unwrap();
+
+        let removed = store
+            .expire_memory_activity_before("2021-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "only the 2020 row expires");
+
+        let remaining = store.list_memory(None).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].target, "repo/OpenCoven/a/new");
+        // Revocation is untouched — expiring it would un-revoke memory.
+        assert_eq!(
+            store.revocations_for(1, "OpenCoven/a").await.unwrap(),
+            vec!["repo/OpenCoven/a/x"]
+        );
     }
 
     #[tokio::test]

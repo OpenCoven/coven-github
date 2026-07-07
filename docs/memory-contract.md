@@ -320,9 +320,9 @@ values are sane.
    prefix-addressable keys; `POST /api/github/memory/revoke` with adapter-side
    enforcement (revoked keys refused on future reads/writes) plus a denial list
    forwarded to the runtime; `delete_on_uninstall`; read citation on the review
-   surface. **Done**, except **retention expiry**, which needs a periodic sweep
-   (an operational enhancement, not a contract requirement) and remains a
-   follow-up.
+   surface; and **retention expiry** — a periodic server sweep drops audit rows
+   past `retention_days` (revocations are never expired), while the same horizon
+   is forwarded to the runtime for the memory bytes themselves. **Done.**
 
 The adapter side is complete. What is inherently bilateral — the runtime
 honoring the `denied` list and physically deleting revoked bytes — is the
