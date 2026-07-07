@@ -358,6 +358,7 @@ dependencies = [
  "chrono",
  "coven-github-api",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

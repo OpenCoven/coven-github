@@ -291,6 +291,36 @@ mod tests {
     }
 
     #[test]
+    fn activity_rows_carry_the_adapter_verdict() {
+        use crate::memory_activity_rows;
+        let policy = compute_policy(inputs(TrustScope::ForkPr, true)).unwrap();
+        let used = used_with(
+            // A fork write is rejected (no write scope); the read is accepted.
+            vec![proposed("repo", "repo/acme/billing/y", "pending")],
+            vec![MemoryEntryRef {
+                id: "repo/acme/billing/x".to_string(),
+                scope: "repo".to_string(),
+            }],
+        );
+        let rejections = validate_memory_used(&policy, &used, never_secret);
+        let rows = memory_activity_rows(42, "acme/billing", "task-1", &used, &rejections);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().find(|r| r.op == "read").unwrap().outcome,
+            "accepted"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.op == "write")
+                .unwrap()
+                .outcome
+                .starts_with("rejected:"),
+            "fork write should be recorded as rejected"
+        );
+    }
+
+    #[test]
     fn fork_review_overrides_actor_trust() {
         // A fork PR is untrusted content: even a maintainer command reviewing it
         // is ForkPr (never writes), while a same-repo command is Maintainer.

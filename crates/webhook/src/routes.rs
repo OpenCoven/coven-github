@@ -115,6 +115,72 @@ pub async fn list_tasks(State(state): State<AppState>, headers: HeaderMap) -> im
     }
 }
 
+/// GET /api/github/memory — memory activity for the tenant boundary (issue #6),
+/// so a customer can inspect what memory a familiar read from and attempted to
+/// write to their repositories. Same auth as `list_tasks`: `token` mode fails
+/// closed, a tenant sees only its own installation, and every read is audited.
+pub async fn list_memory(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let action = "list_memory";
+    let (caller, scope) = match authorize_api(&state.config.api, &headers) {
+        ApiCaller::Denied => {
+            if let Err(e) = state
+                .store
+                .record_api_read("anonymous", "none", action, "denied")
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response();
+        }
+        ApiCaller::Open => ("open".to_string(), None),
+        ApiCaller::Service => ("service".to_string(), None),
+        ApiCaller::Tenant(tenant) => (
+            format!("tenant:{}", tenant.installation_id),
+            Some(ApiScope {
+                installation_id: tenant.installation_id,
+                repos: if tenant.repos.is_empty() {
+                    None
+                } else {
+                    Some(tenant.repos.clone())
+                },
+            }),
+        ),
+    };
+    let scope_label = scope
+        .as_ref()
+        .map(|s| format!("installation:{}", s.installation_id))
+        .unwrap_or_else(|| "all".to_string());
+
+    match state.store.list_memory(scope).await {
+        Ok(entries) => {
+            if let Err(e) = state
+                .store
+                .record_api_read(&caller, &scope_label, action, &format!("ok:{}", entries.len()))
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            Json(json!({ "ok": true, "memory": entries })).into_response()
+        }
+        Err(e) => {
+            error!("memory list unavailable: {e:#}");
+            let _ = state
+                .store
+                .record_api_read(&caller, &scope_label, action, "error")
+                .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "memory list unavailable"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Resolved identity of a task-API caller.
 enum ApiCaller<'a> {
     /// `open` mode: unauthenticated local development.
@@ -1588,6 +1654,70 @@ mod tenancy_tests {
                 ("service", "all", "ok:2"),
             ]
         );
+    }
+
+    async fn list_mem(state: &AppState, bearer: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = bearer {
+            headers.insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("header"),
+            );
+        }
+        let response = list_memory(State(state.clone()), headers)
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    async fn seed_memory(state: &AppState, installation_id: u64, repo: &str) {
+        state
+            .store
+            .record_memory_activity(vec![coven_github_store::MemoryActivity {
+                at: String::new(),
+                installation_id,
+                repo: repo.to_string(),
+                task_id: "t".to_string(),
+                op: "read".to_string(),
+                target: format!("repo/{repo}/x"),
+                scope: "repo".to_string(),
+                outcome: "accepted".to_string(),
+            }])
+            .await
+            .expect("record memory");
+    }
+
+    #[tokio::test]
+    async fn memory_inspect_is_tenant_scoped_and_fails_closed() {
+        let state = token_state(two_tenant_api());
+        seed_memory(&state, 1, "OpenCoven/alpha").await;
+        seed_memory(&state, 2, "OpenCoven/beta").await;
+
+        // No / wrong token in token mode → fail closed, no data leaks.
+        for bearer in [None, Some("wrong-token-0123456789abcdef")] {
+            let (status, json) = list_mem(&state, bearer).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "bearer: {bearer:?}");
+            assert!(json.get("memory").is_none(), "no data may leak: {json}");
+        }
+
+        // Installation 1's token sees only its own memory activity.
+        let (status, json) = list_mem(&state, Some("tenant-one-0123456789abcdef")).await;
+        assert_eq!(status, StatusCode::OK);
+        let repos: Vec<&str> = json["memory"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["repo"].as_str().unwrap())
+            .collect();
+        assert_eq!(repos, vec!["OpenCoven/alpha"]);
+
+        // The service token sees both installations.
+        let (_, json) = list_mem(&state, Some("service-token-0123456789abcdef")).await;
+        assert_eq!(json["memory"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

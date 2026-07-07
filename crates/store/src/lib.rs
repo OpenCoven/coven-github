@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// Handle to the durable store. Cheap to clone; all clones share one writer
 /// connection.
@@ -483,6 +483,101 @@ impl Store {
         .await
         .expect("store task panicked")
     }
+
+    /// Records memory activity for the inspect/audit trail (issue #6). Every
+    /// read and write the runtime reported is recorded with the adapter's
+    /// verdict, so a customer can later see what a familiar read from and
+    /// attempted to write to their repository's memory.
+    pub async fn record_memory_activity(&self, rows: Vec<MemoryActivity>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            for row in &rows {
+                tx.execute(
+                    "INSERT INTO memory_activity
+                       (at, installation_id, repo, task_id, op, target, scope, outcome)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        now_rfc3339(),
+                        row.installation_id,
+                        row.repo,
+                        row.task_id,
+                        row.op,
+                        row.target,
+                        row.scope,
+                        row.outcome,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Lists recorded memory activity, newest first, narrowed to the caller's
+    /// [`ApiScope`] (issue #6). `None` scope (service/open callers) sees all.
+    pub async fn list_memory(&self, scope: Option<ApiScope>) -> Result<Vec<MemoryActivity>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let installation_filter = scope.as_ref().map(|s| s.installation_id);
+            let mut stmt = conn.prepare(
+                "SELECT at, installation_id, repo, task_id, op, target, scope, outcome
+                 FROM memory_activity
+                 WHERE (?1 IS NULL OR installation_id = ?1)
+                 ORDER BY id DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![installation_filter], |row| {
+                    Ok(MemoryActivity {
+                        at: row.get(0)?,
+                        installation_id: row.get(1)?,
+                        repo: row.get(2)?,
+                        task_id: row.get(3)?,
+                        op: row.get(4)?,
+                        target: row.get(5)?,
+                        scope: row.get(6)?,
+                        outcome: row.get(7)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // Repository narrowing within the installation, when scoped.
+            let filtered = rows
+                .into_iter()
+                .filter(|r| match scope.as_ref().and_then(|s| s.repos.as_ref()) {
+                    Some(repos) => repos.contains(&r.repo),
+                    None => true,
+                })
+                .collect();
+            Ok(filtered)
+        })
+        .await
+        .expect("store task panicked")
+    }
+}
+
+/// One recorded memory operation for the inspect/audit trail (issue #6).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryActivity {
+    /// RFC 3339 timestamp; set by the store on insert (ignored on the way in).
+    pub at: String,
+    pub installation_id: u64,
+    pub repo: String,
+    pub task_id: String,
+    /// `read` or `write`.
+    pub op: String,
+    /// The memory entry id/key.
+    pub target: String,
+    /// Namespace: `repo` | `tenant_shared` | `familiar_global`.
+    pub scope: String,
+    /// Adapter verdict: `accepted` or `rejected:<reason>`.
+    pub outcome: String,
 }
 
 /// Terminal transition applied by [`Store::finish`].
@@ -613,6 +708,29 @@ fn migrate(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply schema v3")?;
     }
+    if version < 4 {
+        // v4: memory governance audit for inspect (issue #6). Records every
+        // memory read/write the runtime reported, with the adapter's verdict,
+        // scoped to installation/repo so customers can inspect it.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE memory_activity (
+              id              INTEGER PRIMARY KEY AUTOINCREMENT,
+              at              TEXT NOT NULL,
+              installation_id INTEGER NOT NULL,
+              repo            TEXT NOT NULL,
+              task_id         TEXT NOT NULL,
+              op              TEXT NOT NULL,
+              target          TEXT NOT NULL,
+              scope           TEXT NOT NULL,
+              outcome         TEXT NOT NULL
+            );
+            CREATE INDEX memory_activity_scope
+              ON memory_activity(installation_id, repo);
+            "#,
+        )
+        .context("failed to apply schema v4")?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -732,6 +850,72 @@ mod tests {
                 issue_body: "b".to_string(),
             },
         }
+    }
+
+    fn memory_row(installation_id: u64, repo: &str, target: &str, outcome: &str) -> MemoryActivity {
+        MemoryActivity {
+            at: String::new(),
+            installation_id,
+            repo: repo.to_string(),
+            task_id: "task-1".to_string(),
+            op: "write".to_string(),
+            target: target.to_string(),
+            scope: "repo".to_string(),
+            outcome: outcome.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_activity_records_and_lists_newest_first_with_verdicts() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_memory_activity(vec![
+                memory_row(1, "OpenCoven/demo", "repo/OpenCoven/demo/a", "accepted"),
+                memory_row(1, "OpenCoven/demo", "repo/other/x", "rejected:out_of_scope"),
+            ])
+            .await
+            .unwrap();
+
+        let all = store.list_memory(None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        // Newest first: the rejected row was inserted second.
+        assert_eq!(all[0].outcome, "rejected:out_of_scope");
+        assert!(!all[0].at.is_empty(), "the store stamps the timestamp");
+    }
+
+    #[tokio::test]
+    async fn list_memory_is_scoped_to_installation_and_repo() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_memory_activity(vec![
+                memory_row(1, "OpenCoven/billing", "repo/OpenCoven/billing/a", "accepted"),
+                memory_row(1, "OpenCoven/web", "repo/OpenCoven/web/b", "accepted"),
+                memory_row(2, "OpenCoven/other", "repo/OpenCoven/other/c", "accepted"),
+            ])
+            .await
+            .unwrap();
+
+        // Tenant scoped to installation 1 never sees installation 2.
+        let inst1 = store
+            .list_memory(Some(ApiScope {
+                installation_id: 1,
+                repos: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(inst1.len(), 2);
+        assert!(inst1.iter().all(|r| r.installation_id == 1));
+
+        // Narrowed further to a single repo.
+        let one_repo = store
+            .list_memory(Some(ApiScope {
+                installation_id: 1,
+                repos: Some(vec!["OpenCoven/billing".to_string()]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(one_repo.len(), 1);
+        assert_eq!(one_repo[0].repo, "OpenCoven/billing");
     }
 
     fn review_task(id: &str, pr: u64) -> Task {

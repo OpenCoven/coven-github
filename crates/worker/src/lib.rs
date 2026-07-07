@@ -338,6 +338,7 @@ async fn execute_task_with_minter(
         &targets,
         &workspace,
         check_id,
+        &store,
     )
     .await;
 
@@ -643,6 +644,56 @@ impl Minter {
 /// side-effects (comments, the in-progress transition, even PR opening) are
 /// best-effort and logged rather than propagated.
 #[allow(clippy::too_many_arguments)]
+/// Maps the runtime's reported memory activity to audit rows, stamping each
+/// with the adapter's verdict (`accepted` or `rejected:<reason>`) from the
+/// validation pass (issue #6).
+fn memory_activity_rows(
+    installation_id: u64,
+    repo: &str,
+    task_id: &str,
+    used: &coven_github_api::MemoryUsed,
+    rejections: &[memory::MemoryRejection],
+) -> Vec<coven_github_store::MemoryActivity> {
+    let verdict = |op: memory::MemoryOp, target: &str| {
+        rejections
+            .iter()
+            .find(|r| r.op == op && r.target == target)
+            .map(|r| format!("rejected:{}", r.reason))
+            .unwrap_or_else(|| "accepted".to_string())
+    };
+    let row = |op: &str, target: &str, scope: &str, outcome: String| {
+        coven_github_store::MemoryActivity {
+            at: String::new(),
+            installation_id,
+            repo: repo.to_string(),
+            task_id: task_id.to_string(),
+            op: op.to_string(),
+            target: target.to_string(),
+            scope: scope.to_string(),
+            outcome,
+        }
+    };
+    let mut rows = Vec::new();
+    for entry in &used.read {
+        rows.push(row(
+            "read",
+            &entry.id,
+            &entry.scope,
+            verdict(memory::MemoryOp::Read, &entry.id),
+        ));
+    }
+    for write in &used.proposed {
+        rows.push(row(
+            "write",
+            &write.key,
+            &write.scope,
+            verdict(memory::MemoryOp::Write, &write.key),
+        ));
+    }
+    rows
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_and_publish(
     config: &Config,
     task: &Task,
@@ -653,6 +704,7 @@ async fn run_and_publish(
     targets: &ResolvedTargets,
     workspace: &Path,
     check_id: u64,
+    store: &Store,
 ) -> Result<Published> {
     // Provision ephemeral workspace and write the tokenless session brief.
     tokio::fs::create_dir_all(workspace).await?;
@@ -795,6 +847,13 @@ async fn run_and_publish(
                 rejected = rejections.len(),
                 "refused out-of-policy memory activity — not persisting those entries"
             );
+        }
+        // Record every reported read/write with the adapter's verdict so a
+        // customer can inspect what memory a familiar used on their repo (#6).
+        let activity =
+            memory_activity_rows(task.installation_id, &repo_full, &task.id, used, &rejections);
+        if let Err(e) = store.record_memory_activity(activity).await {
+            warn!(task_id = %task.id, "failed to record memory activity: {e:#}");
         }
     }
 
@@ -2197,6 +2256,7 @@ exit 0
             head_is_fork: false,
         };
         let workspace = root.join("ws");
+        let store = coven_github_store::Store::open_in_memory().expect("store");
 
         let published = run_and_publish(
             &config,
@@ -2208,6 +2268,7 @@ exit 0
             &targets,
             &workspace,
             7,
+            &store,
         )
         .await
         .expect("publication should succeed");
