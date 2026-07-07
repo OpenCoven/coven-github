@@ -16,6 +16,59 @@ pub struct Config {
     /// Durable adapter state (issue #2). Absent section = default path.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Hosted memory governance policy (issue #6). Absent section = memory off.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Hosted memory governance policy (issue #6). Off by default; opting in is a
+/// hosted decision coordinated with the coven-code side of the contract (see
+/// `docs/memory-contract.md`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryConfig {
+    /// Master opt-in. `false` (or section absent) → the adapter emits no memory
+    /// policy and the runtime does no memory work.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Written memory stays `pending` until a maintainer approves it.
+    #[serde(default = "default_true")]
+    pub approval_required: bool,
+    /// Optional retention horizon for durable memory.
+    pub retention_days: Option<u32>,
+    /// Per-repo overrides keyed "owner/name".
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, RepoMemoryOverride>,
+}
+
+/// Per-repo override of the global [`MemoryConfig`]; unset fields inherit.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RepoMemoryOverride {
+    pub enabled: Option<bool>,
+    pub approval_required: Option<bool>,
+}
+
+impl MemoryConfig {
+    fn overrides(&self, repo: &str) -> Option<&RepoMemoryOverride> {
+        self.repos.get(repo)
+    }
+
+    /// Whether memory is opted in for `repo` ("owner/name").
+    pub fn enabled_for(&self, repo: &str) -> bool {
+        self.overrides(repo)
+            .and_then(|o| o.enabled)
+            .unwrap_or(self.enabled)
+    }
+
+    /// Whether writes for `repo` require maintainer approval.
+    pub fn approval_required_for(&self, repo: &str) -> bool {
+        self.overrides(repo)
+            .and_then(|o| o.approval_required)
+            .unwrap_or(self.approval_required)
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Durable store location. See `docs/durable-task-store.md`.
@@ -340,6 +393,22 @@ impl Config {
             }
         }
 
+        // ── Memory governance (issue #6) ────────────────────────────────
+        // Memory is off by default; when an operator enables it anywhere,
+        // warn if writes are not approval-gated — that is the posture that
+        // lets untrusted content shape future reviews.
+        let memory_on = self.memory.enabled || self.memory.repos.values().any(|o| o.enabled == Some(true));
+        if memory_on {
+            let gated = self.memory.approval_required
+                && self.memory.repos.values().all(|o| o.approval_required != Some(false));
+            if !gated {
+                out.push(Diagnostic::warning(
+                    "memory.approval_required",
+                    "memory is enabled with approval_required = false — learned facts write without maintainer review.",
+                ));
+            }
+        }
+
         out
     }
 }
@@ -422,6 +491,9 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         }
         "storage.path" => {
             "Point storage.path at a writable SQLite file location on a persistent volume."
+        }
+        "memory.approval_required" => {
+            "Keep memory.approval_required = true so learned facts need maintainer review, or accept the risk deliberately."
         }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
@@ -522,6 +594,7 @@ mod tests {
             familiars,
             review: ReviewConfig::default(),
             storage: StorageConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 
@@ -586,6 +659,62 @@ mod tests {
             policy.audit_instruction_for("OpenCoven/quiet").as_deref(),
             Some("global")
         );
+    }
+
+    #[test]
+    fn memory_policy_defaults_off_and_resolves_repo_overrides() {
+        let mut memory = MemoryConfig::default();
+        assert!(!memory.enabled_for("acme/any"), "memory is off by default");
+
+        memory.enabled = true;
+        assert!(memory.enabled_for("acme/any"));
+        // approval_required serde-defaults to true, but Default::default() is
+        // false; set it explicitly to model the deserialized default.
+        memory.approval_required = true;
+        assert!(memory.approval_required_for("acme/any"));
+
+        memory.repos.insert(
+            "acme/quiet".to_string(),
+            RepoMemoryOverride {
+                enabled: Some(false),
+                approval_required: None,
+            },
+        );
+        assert!(!memory.enabled_for("acme/quiet"), "override disables the repo");
+        assert!(memory.enabled_for("acme/loud"));
+    }
+
+    #[test]
+    fn doctor_warns_when_memory_enabled_without_approval() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+        cfg.memory.enabled = true;
+        cfg.memory.approval_required = false;
+
+        let warned = cfg
+            .check()
+            .iter()
+            .any(|d| d.field == "memory.approval_required");
+        assert!(warned, "diags: {:?}", cfg.check());
+        // It is a warning, not an error — the operator may accept the risk.
+        assert!(errors(&cfg.check()).is_empty());
     }
 
     #[test]

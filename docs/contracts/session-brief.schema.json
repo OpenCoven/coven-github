@@ -111,6 +111,31 @@
           }
         }
       }
+    },
+    "memory_policy": {
+      "type": ["object", "null"],
+      "description": "Optional hosted memory governance policy (issue #6). Present only when the installation opted memory in for this repo; absent means memory is off. See docs/memory-contract.md.",
+      "additionalProperties": false,
+      "required": ["enabled", "installation_id", "repo", "trust_scope", "read_scopes", "write_scopes", "approval_required"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "installation_id": { "type": "integer" },
+        "repo": { "type": "string" },
+        "trust_scope": {
+          "type": "string",
+          "enum": ["maintainer", "collaborator", "external", "fork_pr", "scheduled"]
+        },
+        "read_scopes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["repo", "tenant_shared", "familiar_global"] }
+        },
+        "write_scopes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["repo", "tenant_shared", "familiar_global"] }
+        },
+        "approval_required": { "type": "boolean" },
+        "retention_days": { "type": ["integer", "null"] }
+      }
     }
   }
 }

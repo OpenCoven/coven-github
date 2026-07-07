@@ -628,12 +628,34 @@ async fn run_and_publish(
         }
         _ => None,
     };
+    // Compute the memory governance policy (issue #6). Deny-by-default: unless
+    // the installation opts memory in for this repo, this is None and no policy
+    // is stamped, so the runtime does no memory work. Trust: a commander here
+    // already passed the #13 write-access gate (below-write is declined
+    // earlier), so a command carries maintainer trust; auto-triggered work gets
+    // the safe collaborator default. Fork-PR hardening is a follow-up.
+    let repo_full = format!("{}/{}", task.repo_owner, task.repo_name);
+    let memory_policy = memory::compute_policy(memory::PolicyInputs {
+        enabled: config.memory.enabled_for(&repo_full),
+        installation_id: task.installation_id,
+        repo: &repo_full,
+        trust: if task.commander.is_some() {
+            memory::TrustScope::Maintainer
+        } else {
+            memory::TrustScope::Collaborator
+        },
+        approval_required: config.memory.approval_required_for(&repo_full),
+        retention_days: config.memory.retention_days,
+    });
     let brief = brief::build(
         task,
         familiar,
         workspace,
         &targets.default_branch,
         review.as_ref(),
+        memory_policy
+            .as_ref()
+            .map(|p| serde_json::to_value(p).expect("memory policy serializes")),
     );
     let brief_path = workspace.join("session-brief.json");
     let result_path = workspace.join("result.json");
@@ -703,6 +725,22 @@ async fn run_and_publish(
     // anything downstream persists or publishes it (task store, comments,
     // PR body, Check Run output).
     redact::sanitize_result(&mut result, &[orchestration, &agent_git]);
+
+    // Re-validate the runtime's reported memory activity against the policy we
+    // granted (issue #6). The runtime's self-report is not trusted on its own:
+    // any read or write outside scope — including a fork PR that tried to write
+    // durable memory — is refused here before it can be persisted.
+    if let (Some(policy), Some(used)) = (&memory_policy, &result.memory_used) {
+        let rejections =
+            memory::validate_memory_used(policy, used, |text| redact::redact(text, &[]) != text);
+        if !rejections.is_empty() {
+            warn!(
+                task_id = %task.id,
+                rejected = rejections.len(),
+                "refused out-of-policy memory activity — not persisting those entries"
+            );
+        }
+    }
 
     // Stale-ref gate (issue #8): review findings are only valid for the head
     // SHA that was actually reviewed. Re-fetch the PR before publishing; if
@@ -1684,6 +1722,7 @@ mod disposition_tests {
             familiars: vec![],
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
         }
     }
 
@@ -1796,6 +1835,7 @@ mod process_tests {
             }],
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
         }
     }
 
@@ -2069,6 +2109,7 @@ exit 0
             familiars: vec![familiar.clone()],
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
         };
         let task = Task {
             id: "task-pub".to_string(),
@@ -2294,6 +2335,7 @@ exit 0
             }],
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
         };
         let task = Task {
             id: "task-stale".to_string(),
@@ -2427,6 +2469,7 @@ mod command_and_marker_tests {
             }],
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
         }
     }
 
