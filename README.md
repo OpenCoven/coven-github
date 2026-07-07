@@ -156,7 +156,7 @@ duplicate comments.
 | PR lifecycle review trigger | Implemented | Policy-gated auto-review on opened/synchronize/reopened/ready_for_review plus label opt-in; familiar-authored PRs are never auto-reviewed. |
 | Push / commit review trigger | Partial | Events parsed and typed with fixtures; execution lane needs headless contract v3. |
 | GitHub App installation tokens | Implemented | Mints installation access tokens from the App private key. |
-| Check Run creation and completion | Partial | Creates and updates Check Runs against the resolved target head SHA; stale-ref revalidation before publish is still planned. |
+| Check Run creation and completion | Implemented | Check Runs attach to the resolved target head SHA; PR reviews re-fetch the head pre-publish and complete as neutral/Stale instead of publishing findings against a moved ref. |
 | Headless execution contract | Locked (v1) | Brief, result envelope, exit codes, and git-auth channel are pinned in [`docs/headless-contract.md`](docs/headless-contract.md) with JSON Schemas, golden fixtures, and a conformance test. |
 | `coven-code --headless` execution | Partial | Worker spawns headless sessions with a tokenless session brief and enforces task timeouts; result quality depends on the runtime. |
 | Pull request creation | Partial | Opens draft PRs from session results against the repository's resolved default/base branch. |

@@ -12,6 +12,9 @@ pub enum TaskListStatus {
     Review,
     Done,
     Failed,
+    /// The target moved while the task ran (e.g. a PR head advanced during a
+    /// review); the output was withheld as stale (issue #8).
+    Superseded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +105,16 @@ impl TaskStore {
         let mut items = self.inner.write().await;
         if let Some(item) = items.get_mut(task_id) {
             item.status = TaskListStatus::Failed;
+            item.updated_at = now_rfc3339();
+        }
+    }
+
+    /// Marks a task whose target moved mid-run; its output was withheld as
+    /// stale rather than published against the wrong ref (issue #8).
+    pub async fn mark_superseded(&self, task_id: &str) {
+        let mut items = self.inner.write().await;
+        if let Some(item) = items.get_mut(task_id) {
+            item.status = TaskListStatus::Superseded;
             item.updated_at = now_rfc3339();
         }
     }

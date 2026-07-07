@@ -440,6 +440,7 @@ fn status_label(status: &TaskListStatus) -> &'static str {
         TaskListStatus::Review => "awaiting review",
         TaskListStatus::Done => "done",
         TaskListStatus::Failed => "failed",
+        TaskListStatus::Superseded => "superseded",
     }
 }
 

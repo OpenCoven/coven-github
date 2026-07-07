@@ -257,6 +257,58 @@ async fn execute_task_with_minter(
 
     // The Check Run ALWAYS reaches a terminal conclusion; both arms complete it.
     match outcome {
+        // Head moved mid-review (issue #8): the findings describe a commit the
+        // PR no longer points at. Mark superseded everywhere — never publish
+        // stale review output as if it covered the current head.
+        Ok(published) if published.stale.is_some() => {
+            let stale = published.stale.as_ref().expect("guarded by arm");
+            task_store.mark_superseded(&task.id).await;
+            if let Some(number) = surface_number(&task.kind) {
+                let marker = status_comment::marker(
+                    &familiar.id,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                );
+                let body = format!(
+                    "Status: superseded\n\nThe PR head moved from `{}` to `{}` while the \
+                     review ran, so these findings no longer describe the current diff. \
+                     The newer push is reviewed by its own event, or re-run with a \
+                     `retry` command.",
+                    stale.reviewed_sha, stale.current_sha
+                );
+                if let Err(e) = status_comment::upsert(
+                    api_base_url,
+                    &orchestration,
+                    &task.repo_owner,
+                    &task.repo_name,
+                    number,
+                    &marker,
+                    &body,
+                )
+                .await
+                {
+                    warn!(task_id = %task.id, "failed to upsert superseded status: {e:#}");
+                }
+            }
+            if let Err(e) = check_run::complete_with_base_url(
+                api_base_url,
+                &orchestration,
+                &task.repo_owner,
+                &task.repo_name,
+                check_id,
+                check_run::CheckConclusion::Neutral,
+                "Stale",
+                &format!(
+                    "Reviewed {}, but the PR head is now {} — findings withheld as stale.",
+                    stale.reviewed_sha, stale.current_sha
+                ),
+            )
+            .await
+            {
+                error!(task_id = %task.id, "failed to finalize stale check run: {e:#}");
+            }
+        }
         Ok(published) => {
             let disp = disposition(&published.result);
             task_store
@@ -355,6 +407,17 @@ async fn execute_task_with_minter(
 struct Published {
     result: SessionResult,
     opened_pr: Option<u64>,
+    /// Set when a PR review's head moved while the session ran (issue #8):
+    /// the findings were computed against `reviewed_sha`, but the PR is now
+    /// at `current_sha`. Publication must mark the task superseded instead of
+    /// presenting stale findings as current.
+    stale: Option<StaleRefs>,
+}
+
+/// Evidence of a mid-session head move on a reviewed PR.
+struct StaleRefs {
+    reviewed_sha: String,
+    current_sha: String,
 }
 
 /// Mints repo-scoped installation tokens for one task. Tests substitute
@@ -529,6 +592,38 @@ async fn run_and_publish(
     // PR body, Check Run output).
     redact::sanitize_result(&mut result, &[orchestration, &agent_git]);
 
+    // Stale-ref gate (issue #8): review findings are only valid for the head
+    // SHA that was actually reviewed. Re-fetch the PR before publishing; if
+    // the head moved mid-session, surface the task as superseded rather than
+    // presenting stale findings as current. The newer push's own event (or a
+    // maintainer `retry`) re-reviews the fresh head.
+    if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+        let refs = repo::get_pull_request_refs_with_base_url(
+            api_base_url,
+            orchestration,
+            &task.repo_owner,
+            &task.repo_name,
+            *pr_number,
+        )
+        .await?;
+        if refs.head_sha != targets.head_sha {
+            info!(
+                task_id = %task.id,
+                reviewed = %targets.head_sha,
+                current = %refs.head_sha,
+                "PR head moved during review — publishing as superseded"
+            );
+            return Ok(Published {
+                result,
+                opened_pr: None,
+                stale: Some(StaleRefs {
+                    reviewed_sha: targets.head_sha.clone(),
+                    current_sha: refs.head_sha,
+                }),
+            });
+        }
+    }
+
     // Publish according to the terminal disposition of the result.
     let disp = disposition(&result);
     let mut opened_pr = None;
@@ -583,7 +678,11 @@ async fn run_and_publish(
     // Terminal state (done / needs input / failed) lands on the status surface
     // from execute_task's outcome handling.
 
-    Ok(Published { result, opened_pr })
+    Ok(Published {
+        result,
+        opened_pr,
+        stale: None,
+    })
 }
 
 /// Opens the draft PR and posts the PR-opened comment with post-validation
@@ -1955,6 +2054,204 @@ mod supersession_tests {
             task_store.list().await.is_empty(),
             "a skipped review must not surface as a task in Cave"
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_ref_tests {
+    use super::*;
+    use coven_github_api::installation::TokenRole;
+    use coven_github_api::tasks::TaskListStatus;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORCHESTRATION: &str = "ghs_orchestration0000000000000000000000";
+    const AGENT_GIT: &str = "******";
+
+    fn fixed_minter() -> Minter {
+        Minter::Fixed(HashMap::from([
+            (TokenRole::Orchestration, ORCHESTRATION.to_string()),
+            (TokenRole::AgentGit, AGENT_GIT.to_string()),
+        ]))
+    }
+
+    fn pr_refs_body(head_sha: &str) -> serde_json::Value {
+        serde_json::json!({
+            "head": { "ref": "feat/change", "sha": head_sha },
+            "base": { "ref": "main", "sha": "base0000" }
+        })
+    }
+
+    /// A hosted review whose PR head advances mid-session must complete the
+    /// Check Run as neutral/Stale, surface `Status: superseded` on the status
+    /// comment, and mark the task superseded — never publishing the findings
+    /// as if they covered the current head (issue #8).
+    #[tokio::test]
+    async fn review_of_moved_head_is_published_as_superseded() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        // First fetch (target resolution) sees the reviewed head; the
+        // pre-publish re-fetch sees that the head has moved on.
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/pulls/88"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pr_refs_body("sha-reviewed")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/pulls/88"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pr_refs_body("sha-moved")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/pulls/88/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "filename": "src/lib.rs" }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/check-runs"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 7})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/OpenCoven/demo/check-runs/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/88/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/88/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        // Contract-conformant review result with a finding that must NOT be
+        // presented as current once the head has moved.
+        let script = r#"#!/usr/bin/env bash
+cat > "$5" <<EOF
+{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"Found one issue in src/lib.rs.","pr_body":"","review":{"mode":"pull_request","evidence_status":"complete","reviewed_files":["src/lib.rs"],"supporting_files":[],"findings":[{"severity":"medium","file":"src/lib.rs","line":10,"title":"Off-by-one","body":"Loop bound skips the last element.","recommendation":null}],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null}
+EOF
+exit 0
+"#;
+        let root =
+            std::env::temp_dir().join(format!("coven-github-stale-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test dir should be created");
+        let script_path = root.join("fake-coven-code.sh");
+        fs::write(&script_path, script).expect("script should be written");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("script should be executable");
+
+        let config = Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("/nonexistent/never-read.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: Some(server.uri()),
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: script_path,
+                workspace_root: root.clone(),
+                timeout_secs: 30,
+                max_retries: 0,
+            },
+            familiars: vec![FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec![],
+            }],
+            review: coven_github_config::ReviewConfig::default(),
+        };
+        let task = Task {
+            id: "task-stale".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "t".to_string(),
+                reason: "synchronize".to_string(),
+            },
+        };
+        let task_store = TaskStore::default();
+
+        execute_task_with_minter(&config, task_store.clone(), task, &fixed_minter())
+            .await
+            .expect("stale review must complete cleanly");
+
+        // Cave sees the honest terminal state.
+        let items = task_store.list().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, TaskListStatus::Superseded);
+
+        let requests = server.received_requests().await.expect("requests recorded");
+
+        // The Check Run reached neutral/Stale — not success/Done.
+        let check_patches: Vec<String> = requests
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "PATCH"
+                    && r.url.path() == "/repos/OpenCoven/demo/check-runs/7"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let terminal = check_patches
+            .last()
+            .expect("the check run must reach a terminal state");
+        assert!(terminal.contains("\"neutral\""), "conclusion: {terminal}");
+        assert!(terminal.contains("Stale"), "title: {terminal}");
+        assert!(terminal.contains("sha-reviewed") && terminal.contains("sha-moved"));
+        assert!(
+            !check_patches.iter().any(|b| b.contains("\"success\"")),
+            "stale findings must never publish as a successful review"
+        );
+
+        // The status surface says superseded, and the finding text was withheld.
+        let comment_posts: Vec<String> = requests
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/88/comments"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert!(
+            comment_posts.iter().any(|b| b.contains("Status: superseded")),
+            "status surface must say superseded: {comment_posts:?}"
+        );
+        assert!(
+            !comment_posts.iter().any(|b| b.contains("Off-by-one")),
+            "stale findings must not land on the status surface"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
 
