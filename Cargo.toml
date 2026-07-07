@@ -2,6 +2,7 @@
 members = [
     "crates/config",
     "crates/github",
+    "crates/store",
     "crates/webhook",
     "crates/worker",
     "crates/server",
@@ -37,3 +38,4 @@ uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 toml = "0.8"
 wiremock = "0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
