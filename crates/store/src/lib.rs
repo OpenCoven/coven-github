@@ -563,7 +563,7 @@ impl Store {
 }
 
 /// One recorded memory operation for the inspect/audit trail (issue #6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MemoryActivity {
     /// RFC 3339 timestamp; set by the store on insert (ignored on the way in).
     pub at: String,
