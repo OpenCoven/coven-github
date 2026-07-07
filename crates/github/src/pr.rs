@@ -10,6 +10,38 @@ struct PullRequestResponse {
     number: u64,
 }
 
+/// Pull request summary for PRs found by head branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadPullRequest {
+    /// Pull request number.
+    pub number: u64,
+    /// Pull request state (`open` or `closed`).
+    pub state: String,
+    /// Whether GitHub reports the PR as merged.
+    pub merged: bool,
+    /// Whether the PR is a draft.
+    pub draft: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadPullRequestResponse {
+    number: u64,
+    state: String,
+    merged_at: Option<String>,
+    draft: bool,
+}
+
+impl From<HeadPullRequestResponse> for HeadPullRequest {
+    fn from(value: HeadPullRequestResponse) -> Self {
+        Self {
+            number: value.number,
+            state: value.state,
+            merged: value.merged_at.is_some(),
+            draft: value.draft,
+        }
+    }
+}
+
 /// Opens a draft pull request. Returns the PR number.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_pull_request(
@@ -74,6 +106,42 @@ pub async fn open_pull_request_with_base_url(
     Ok(body.number)
 }
 
+/// Lists pull requests whose head is `{owner}:{branch}`.
+pub async fn list_pulls_by_head(
+    installation_token: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    branch: &str,
+) -> Result<Vec<HeadPullRequest>> {
+    list_pulls_by_head_with_base_url(
+        DEFAULT_API_BASE_URL,
+        installation_token,
+        repo_owner,
+        repo_name,
+        branch,
+    )
+    .await
+}
+
+pub async fn list_pulls_by_head_with_base_url(
+    api_base_url: &str,
+    installation_token: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    branch: &str,
+) -> Result<Vec<HeadPullRequest>> {
+    let client = client()?;
+    let response = send_json(
+        &client,
+        api_base_url,
+        installation_token,
+        list_pulls_by_head_request(repo_owner, repo_name, branch),
+    )
+    .await?;
+    let body: Vec<HeadPullRequestResponse> = response.json().await?;
+    Ok(body.into_iter().map(HeadPullRequest::from).collect())
+}
+
 /// Posts a comment on an issue or PR.
 pub async fn post_comment(
     installation_token: &str,
@@ -113,6 +181,44 @@ pub async fn post_comment_with_base_url(
     Ok(())
 }
 
+/// Adds labels to an issue or PR.
+pub async fn add_labels_to_issue(
+    installation_token: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    issue_number: u64,
+    labels: &[String],
+) -> Result<()> {
+    add_labels_to_issue_with_base_url(
+        DEFAULT_API_BASE_URL,
+        installation_token,
+        repo_owner,
+        repo_name,
+        issue_number,
+        labels,
+    )
+    .await
+}
+
+pub async fn add_labels_to_issue_with_base_url(
+    api_base_url: &str,
+    installation_token: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    issue_number: u64,
+    labels: &[String],
+) -> Result<()> {
+    let client = client()?;
+    send_json(
+        &client,
+        api_base_url,
+        installation_token,
+        add_labels_to_issue_request(repo_owner, repo_name, issue_number, labels),
+    )
+    .await?;
+    Ok(())
+}
+
 fn pull_request_request(
     repo_owner: &str,
     repo_name: &str,
@@ -135,6 +241,17 @@ fn pull_request_request(
     }
 }
 
+fn list_pulls_by_head_request(repo_owner: &str, repo_name: &str, branch: &str) -> GitHubRequest {
+    let branch = crate::encode_ref_component(branch);
+    GitHubRequest {
+        method: "GET",
+        path: format!(
+            "/repos/{repo_owner}/{repo_name}/pulls?state=all&head={repo_owner}:{branch}&per_page=100"
+        ),
+        body: serde_json::Value::Null,
+    }
+}
+
 fn issue_comment_request(
     repo_owner: &str,
     repo_name: &str,
@@ -145,6 +262,19 @@ fn issue_comment_request(
         method: "POST",
         path: format!("/repos/{repo_owner}/{repo_name}/issues/{issue_number}/comments"),
         body: serde_json::json!({ "body": body }),
+    }
+}
+
+fn add_labels_to_issue_request(
+    repo_owner: &str,
+    repo_name: &str,
+    issue_number: u64,
+    labels: &[String],
+) -> GitHubRequest {
+    GitHubRequest {
+        method: "POST",
+        path: format!("/repos/{repo_owner}/{repo_name}/issues/{issue_number}/labels"),
+        body: serde_json::json!({ "labels": labels }),
     }
 }
 
@@ -186,6 +316,60 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/repos/octo/repo/issues/7/comments");
         assert_eq!(request.body, json!({ "body": "On it" }));
+    }
+
+    #[test]
+    fn list_pulls_by_head_request_targets_head_query() {
+        let request = list_pulls_by_head_request("octo", "repo", "coven/fix-7");
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            "/repos/octo/repo/pulls?state=all&head=octo:coven/fix-7&per_page=100"
+        );
+        assert!(request.body.is_null());
+    }
+
+    #[test]
+    fn list_pulls_by_head_request_percent_encodes_query_delimiters() {
+        let request = list_pulls_by_head_request("octo", "repo", "feature&fix#1");
+
+        assert_eq!(
+            request.path,
+            "/repos/octo/repo/pulls?state=all&head=octo:feature%26fix%231&per_page=100"
+        );
+    }
+
+    #[test]
+    fn add_labels_to_issue_request_posts_label_names() {
+        let labels = vec!["branch-gardener".to_string(), "automated".to_string()];
+        let request = add_labels_to_issue_request("octo", "repo", 7, &labels);
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/repos/octo/repo/issues/7/labels");
+        assert_eq!(
+            request.body,
+            json!({ "labels": ["branch-gardener", "automated"] })
+        );
+    }
+
+    #[test]
+    fn head_pull_request_response_derives_merged_from_merged_at() {
+        let body: Vec<HeadPullRequestResponse> = serde_json::from_value(json!([
+            { "number": 7, "state": "closed", "merged_at": "2026-07-07T00:00:00Z", "draft": false },
+            { "number": 8, "state": "open", "merged_at": null, "draft": true }
+        ]))
+        .unwrap();
+
+        let pulls: Vec<_> = body.into_iter().map(HeadPullRequest::from).collect();
+        assert_eq!(pulls[0].number, 7);
+        assert_eq!(pulls[0].state, "closed");
+        assert!(pulls[0].merged);
+        assert!(!pulls[0].draft);
+        assert_eq!(pulls[1].number, 8);
+        assert_eq!(pulls[1].state, "open");
+        assert!(!pulls[1].merged);
+        assert!(pulls[1].draft);
     }
 }
 
