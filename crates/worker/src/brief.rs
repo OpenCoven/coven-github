@@ -42,6 +42,10 @@ pub struct SessionBrief {
     pub review_context: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_instruction: Option<String>,
+    /// Hosted memory governance policy (issue #6). Present only when the
+    /// installation has opted memory in for this repo; absent → memory off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_policy: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +109,7 @@ pub fn build(
     workspace: &Path,
     default_branch: &str,
     review: Option<&ReviewContext>,
+    memory_policy: Option<serde_json::Value>,
 ) -> SessionBrief {
     let trigger = match &task.kind {
         TaskKind::FixIssue { .. } => "issue_assigned",
@@ -205,6 +210,7 @@ pub fn build(
             })
         }),
         audit_instruction: review.and_then(|r| r.audit_instruction.clone()),
+        memory_policy,
     }
 }
 
@@ -258,8 +264,29 @@ mod tests {
 
     #[test]
     fn brief_uses_resolved_default_branch_not_hardcoded_main() {
-        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "develop", None);
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "develop", None, None);
         assert_eq!(brief.repo.default_branch, "develop");
+    }
+
+    #[test]
+    fn brief_omits_memory_policy_by_default_and_stamps_it_when_present() {
+        // No policy → the field is absent (memory off, deny-by-default).
+        let plain = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None, None);
+        assert!(plain.memory_policy.is_none());
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("memory_policy"), "unexpected field: {json}");
+
+        // A policy → stamped verbatim into the brief.
+        let policy = serde_json::json!({ "enabled": true, "repo": "acme/billing" });
+        let stamped = build(
+            &task(),
+            &familiar(),
+            Path::new("/tmp/ws"),
+            "main",
+            None,
+            Some(policy.clone()),
+        );
+        assert_eq!(stamped.memory_policy.as_ref(), Some(&policy));
     }
 
     #[test]
@@ -274,6 +301,7 @@ mod tests {
             Path::new("/tmp/ws"),
             "main",
             Some(&review),
+            None,
         );
 
         // Contract v2 locks trigger/task enums — the review lane must ride on
@@ -311,14 +339,14 @@ mod tests {
 
     #[test]
     fn non_review_tasks_carry_no_review_context() {
-        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None);
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None, None);
         assert!(brief.review_context.is_none());
         assert!(brief.audit_instruction.is_none());
     }
 
     #[test]
     fn brief_serialization_never_contains_token_or_auth_fields() {
-        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None);
+        let brief = build(&task(), &familiar(), Path::new("/tmp/ws"), "main", None, None);
         let value = serde_json::to_value(&brief).expect("brief should serialize");
         let json = serde_json::to_string(&brief).expect("brief should serialize");
 

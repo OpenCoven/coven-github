@@ -589,6 +589,7 @@ mod tests {
                 }],
                 review,
                 storage: coven_github_config::StorageConfig::default(),
+                memory: coven_github_config::MemoryConfig::default(),
             }),
             store: Store::open_in_memory().expect("in-memory store"),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),

@@ -53,3 +53,14 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # audit_instruction = "Focus on correctness and security."
 # [review.repos."OpenCoven/coven-code"]
 # pull_request = false    # Per-repo override
+
+# ── Hosted memory governance (issue #6) ─────────────────────────────────────
+# Off by default. Enabling memory is a hosted decision coordinated with the
+# coven-code side of the contract (docs/memory-contract.md). Fork and external
+# actors can never write durable memory regardless of these settings.
+# [memory]
+# enabled = false
+# approval_required = true   # learned facts stay pending until a maintainer approves
+# retention_days = 365
+# [memory.repos."acme/billing"]
+# enabled = true             # per-repo opt-in

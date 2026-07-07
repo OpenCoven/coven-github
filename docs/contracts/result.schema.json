@@ -142,6 +142,54 @@
     "exit_reason": {
       "type": ["string", "null"],
       "enum": ["test_failure", "ambiguous_spec", "git_conflict", "infra_error", null]
+    },
+    "memory_used": {
+      "type": ["object", "null"],
+      "description": "Runtime-reported memory activity for hosted governance (issue #6). Optional; omitted when the run did no memory work.",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "read": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "scope"],
+            "properties": {
+              "id": { "type": "string" },
+              "scope": { "type": "string" }
+            }
+          }
+        },
+        "proposed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "summary", "scope", "approval"],
+            "properties": {
+              "key": { "type": "string" },
+              "summary": { "type": "string" },
+              "scope": { "type": "string" },
+              "approval": { "type": "string", "enum": ["pending", "applied", "auto"] }
+            }
+          }
+        },
+        "rejected": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["summary", "scope", "reason"],
+            "properties": {
+              "summary": { "type": "string" },
+              "scope": { "type": "string" },
+              "reason": { "type": "string", "enum": ["pii", "secret", "out_of_scope", "low_confidence"] }
+            }
+          }
+        }
+      }
     }
   },
   "allOf": [

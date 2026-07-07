@@ -260,6 +260,58 @@ pub struct SessionResult {
     pub pr_body: String,
     pub review: ReviewResult,
     pub exit_reason: Option<ExitReason>,
+    /// Memory activity the runtime reports for hosted governance (issue #6).
+    /// Absent/`None` when the run did no memory work. The adapter re-validates
+    /// every proposed write against the invocation's memory policy before
+    /// anything is persisted — see `docs/memory-contract.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used: Option<MemoryUsed>,
+}
+
+/// Runtime-reported memory activity for one session (issue #6).
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryUsed {
+    pub enabled: bool,
+    /// Entries loaded and used — the basis for citing what shaped a review.
+    #[serde(default)]
+    pub read: Vec<MemoryEntryRef>,
+    /// Candidate writes the runtime proposes (subject to adapter validation
+    /// and, when the policy requires it, maintainer approval).
+    #[serde(default)]
+    pub proposed: Vec<ProposedMemory>,
+    /// Candidates the runtime itself declined, with a reason.
+    #[serde(default)]
+    pub rejected: Vec<RejectedMemory>,
+}
+
+/// A memory entry the runtime read, by fully-qualified id and namespace scope.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryEntryRef {
+    pub id: String,
+    pub scope: String,
+}
+
+/// A memory write the runtime proposes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedMemory {
+    pub key: String,
+    pub summary: String,
+    pub scope: String,
+    /// `pending` | `applied` | `auto`.
+    pub approval: String,
+}
+
+/// A memory write the runtime declined on its own.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RejectedMemory {
+    pub summary: String,
+    pub scope: String,
+    /// `pii` | `secret` | `out_of_scope` | `low_confidence`.
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -368,4 +420,45 @@ pub enum ExitReason {
     AmbiguousSpec,
     GitConflict,
     InfraError,
+}
+
+#[cfg(test)]
+mod memory_result_tests {
+    use super::*;
+
+    const BASE: &str = r#"{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"s","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null"#;
+
+    #[test]
+    fn result_without_memory_used_parses_as_none_and_omits_on_reserialize() {
+        let json = format!("{BASE}}}");
+        let result: SessionResult = serde_json::from_str(&json).expect("parses");
+        assert!(result.memory_used.is_none());
+        // Backward compatible: a memory-free result never grows the field.
+        let out = serde_json::to_string(&result).expect("serializes");
+        assert!(!out.contains("memory_used"), "unexpected field: {out}");
+    }
+
+    #[test]
+    fn result_with_memory_used_round_trips() {
+        let json = format!(
+            r#"{BASE},"memory_used":{{"enabled":true,"read":[{{"id":"repo/o/r/conventions/x","scope":"repo"}}],"proposed":[{{"key":"repo/o/r/conventions/y","summary":"y","scope":"repo","approval":"pending"}}],"rejected":[]}}}}"#
+        );
+        let result: SessionResult = serde_json::from_str(&json).expect("parses");
+        let mem = result.memory_used.as_ref().expect("memory_used present");
+        assert!(mem.enabled);
+        assert_eq!(mem.read[0].id, "repo/o/r/conventions/x");
+        assert_eq!(mem.proposed[0].approval, "pending");
+
+        let value = serde_json::to_value(&result).expect("serializes");
+        assert_eq!(value["memory_used"]["proposed"][0]["scope"], "repo");
+    }
+
+    #[test]
+    fn unknown_memory_field_is_rejected() {
+        let json = format!(
+            r#"{BASE},"memory_used":{{"enabled":true,"bogus":1}}}}"#
+        );
+        let err = serde_json::from_str::<SessionResult>(&json).expect_err("deny_unknown_fields");
+        assert!(err.to_string().contains("bogus"), "unexpected error: {err}");
+    }
 }
