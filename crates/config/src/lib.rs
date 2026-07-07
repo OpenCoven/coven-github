@@ -373,6 +373,98 @@ pub struct WorkerConfig {
     /// Max retry attempts for infra errors (exit code 2)
     #[serde(default = "default_retries")]
     pub max_retries: u32,
+    /// Execution backend (issue #5): `host` runs coven-code directly (dev /
+    /// self-hosted); `container` runs each task attempt in a fresh container
+    /// with resource limits — the hosted posture.
+    #[serde(default)]
+    pub backend: WorkerBackendKind,
+    /// Container backend settings; ignored for the host backend.
+    #[serde(default)]
+    pub container: ContainerConfig,
+    /// Hosted mode (any [[installations]] configured) refuses the host
+    /// backend unless the operator explicitly opts in here.
+    #[serde(default)]
+    pub allow_host_backend: bool,
+}
+
+/// Which sandbox executes coven-code sessions (issue #5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBackendKind {
+    #[default]
+    Host,
+    Container,
+}
+
+/// Container backend settings (issue #5). Defaults are a conservative
+/// hardened profile; see `docs/container-isolation.md`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContainerConfig {
+    /// Image containing the coven-code runtime.
+    #[serde(default = "default_container_image")]
+    pub image: String,
+    /// Docker-compatible CLI (docker, podman, nerdctl).
+    #[serde(default = "default_docker_bin")]
+    pub docker_bin: PathBuf,
+    /// coven-code invocation inside the image.
+    #[serde(default = "default_container_coven_code")]
+    pub coven_code_bin: String,
+    /// CPU limit (docker `--cpus`).
+    #[serde(default = "default_container_cpus")]
+    pub cpus: f64,
+    /// Memory limit (docker `--memory`), e.g. "2g".
+    #[serde(default = "default_container_memory")]
+    pub memory: String,
+    /// Process count limit (docker `--pids-limit`).
+    #[serde(default = "default_container_pids")]
+    pub pids: u32,
+    /// Size of the writable /tmp tmpfs, e.g. "256m".
+    #[serde(default = "default_container_tmpfs")]
+    pub tmpfs_size: String,
+    /// Network mode (docker `--network`): "bridge", "none", or a custom
+    /// egress-restricted network.
+    #[serde(default = "default_container_network")]
+    pub network: String,
+}
+
+impl Default for ContainerConfig {
+    fn default() -> Self {
+        Self {
+            image: default_container_image(),
+            docker_bin: default_docker_bin(),
+            coven_code_bin: default_container_coven_code(),
+            cpus: default_container_cpus(),
+            memory: default_container_memory(),
+            pids: default_container_pids(),
+            tmpfs_size: default_container_tmpfs(),
+            network: default_container_network(),
+        }
+    }
+}
+
+fn default_container_image() -> String {
+    "ghcr.io/opencoven/coven-code:latest".to_string()
+}
+fn default_docker_bin() -> PathBuf {
+    PathBuf::from("docker")
+}
+fn default_container_coven_code() -> String {
+    "coven-code".to_string()
+}
+fn default_container_cpus() -> f64 {
+    1.0
+}
+fn default_container_memory() -> String {
+    "2g".to_string()
+}
+fn default_container_pids() -> u32 {
+    512
+}
+fn default_container_tmpfs() -> String {
+    "256m".to_string()
+}
+fn default_container_network() -> String {
+    "bridge".to_string()
 }
 
 fn default_timeout() -> u64 {
@@ -535,14 +627,44 @@ impl Config {
             ));
         }
 
-        if !binary_resolvable(&self.worker.coven_code_bin) {
-            out.push(Diagnostic::error(
-                "worker.coven_code_bin",
-                format!(
-                    "coven-code binary not found at '{}' (and not on PATH) — build/install coven-code or fix the path.",
-                    self.worker.coven_code_bin.display()
-                ),
-            ));
+        match self.worker.backend {
+            WorkerBackendKind::Host => {
+                if !binary_resolvable(&self.worker.coven_code_bin) {
+                    out.push(Diagnostic::error(
+                        "worker.coven_code_bin",
+                        format!(
+                            "coven-code binary not found at '{}' (and not on PATH) — build/install coven-code or fix the path.",
+                            self.worker.coven_code_bin.display()
+                        ),
+                    ));
+                }
+                // Hosted posture gate (issue #5): multi-tenant installations
+                // must not run arbitrary repository workloads on the host
+                // unless the operator explicitly accepts that risk.
+                if !self.installations.is_empty() && !self.worker.allow_host_backend {
+                    out.push(Diagnostic::error(
+                        "worker.backend",
+                        "installations are configured (hosted posture) but worker.backend is 'host' — set worker.backend = \"container\", or set worker.allow_host_backend = true to accept host execution explicitly.",
+                    ));
+                }
+            }
+            WorkerBackendKind::Container => {
+                if !binary_resolvable(&self.worker.container.docker_bin) {
+                    out.push(Diagnostic::error(
+                        "worker.container.docker_bin",
+                        format!(
+                            "container CLI not found at '{}' (and not on PATH) — install docker/podman or fix worker.container.docker_bin.",
+                            self.worker.container.docker_bin.display()
+                        ),
+                    ));
+                }
+                if self.worker.container.image.trim().is_empty() {
+                    out.push(Diagnostic::error(
+                        "worker.container.image",
+                        "container image is empty — set worker.container.image to the coven-code runtime image.",
+                    ));
+                }
+            }
         }
 
         // ── Familiars ───────────────────────────────────────────────────
@@ -862,6 +984,15 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         "worker.coven_code_bin" => {
             "Install coven-code with headless support or set worker.coven_code_bin to the binary path."
         }
+        "worker.backend" => {
+            "Set worker.backend = \"container\" for hosted isolation, or worker.allow_host_backend = true to explicitly accept host execution."
+        }
+        "worker.container.docker_bin" => {
+            "Install a docker-compatible CLI or point worker.container.docker_bin at it."
+        }
+        "worker.container.image" => {
+            "Set worker.container.image to the image that carries the coven-code runtime."
+        }
         "familiars" => "Add at least one [[familiars]] block for the bot account that should receive work.",
         "familiars[].id" => "Give each familiar a stable, unique id.",
         "familiars[].bot_username" => {
@@ -1128,6 +1259,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1169,6 +1303,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1208,6 +1345,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1232,6 +1372,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1260,6 +1403,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1285,6 +1431,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![],
         );
@@ -1313,6 +1462,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1362,6 +1514,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar()],
         );
@@ -1390,6 +1545,62 @@ mod tests {
     }
 
     #[test]
+    fn hosted_posture_refuses_the_host_backend_without_explicit_opt_in() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin.clone(),
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: false,
+            },
+            vec![good_familiar()],
+        );
+        cfg.installations = vec![InstallationConfig {
+            id: 7,
+            account: None,
+            familiars: vec![],
+            triggers: TriggerPolicy::default(),
+            limits: InstallationLimits::default(),
+            repos: std::collections::HashMap::new(),
+        }];
+
+        // Hosted posture + host backend: refused.
+        let diags = cfg.check();
+        assert!(errors(&diags).contains(&"worker.backend"), "{diags:?}");
+
+        // Explicit operator opt-in clears it.
+        cfg.worker.allow_host_backend = true;
+        let diags = cfg.check();
+        assert!(!errors(&diags).contains(&"worker.backend"), "{diags:?}");
+
+        // Container backend also clears it — but validates the runtime CLI.
+        cfg.worker.allow_host_backend = false;
+        cfg.worker.backend = WorkerBackendKind::Container;
+        cfg.worker.container.docker_bin = bin; // any executable file
+        let diags = cfg.check();
+        assert!(!errors(&diags).contains(&"worker.backend"), "{diags:?}");
+        cfg.worker.container.docker_bin = dir.join("no-such-docker");
+        let diags = cfg.check();
+        assert!(
+            errors(&diags).contains(&"worker.container.docker_bin"),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
     fn first_run_errors_include_operator_next_steps() {
         let dir = tmpdir();
         let cfg = config_with(
@@ -1405,6 +1616,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![],
         );
@@ -1452,6 +1666,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+            backend: WorkerBackendKind::Host,
+            container: ContainerConfig::default(),
+            allow_host_backend: false,
             },
             vec![good_familiar(), good_familiar()],
         );

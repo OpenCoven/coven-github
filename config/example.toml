@@ -18,6 +18,22 @@ coven_code_bin = "/usr/local/bin/coven-code"  # Path to coven-code binary
 workspace_root = "/tmp/coven-github-tasks"    # Ephemeral workspace root
 timeout_secs = 600  # 10 minutes per task
 max_retries = 2     # Retries for infra errors (exit code 2)
+# ── Execution backend (issue #5) ────────────────────────────────────────────
+# "host"      — run coven-code directly (development / trusted self-hosting)
+# "container" — one fresh hardened container per task attempt (hosted posture)
+# With [[installations]] configured, the host backend is refused unless
+# allow_host_backend = true.
+# backend = "container"
+# allow_host_backend = false
+# [worker.container]
+# image = "ghcr.io/opencoven/coven-code:latest"
+# docker_bin = "docker"       # docker / podman / nerdctl
+# coven_code_bin = "coven-code"  # invocation inside the image
+# cpus = 1.0                  # docker --cpus
+# memory = "2g"               # docker --memory (SIGKILL at the limit)
+# pids = 512                  # docker --pids-limit
+# tmpfs_size = "256m"         # writable /tmp inside the read-only rootfs
+# network = "bridge"          # or "none", or a custom egress-limited network
 
 [storage]
 # Durable adapter state: webhook deliveries (idempotency) and task records.
