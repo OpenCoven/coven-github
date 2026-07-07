@@ -107,12 +107,14 @@ pub async fn handle_webhook(
         let task_id = task.id.clone();
         // Register auto-reviews BEFORE enqueueing so the worker can never
         // dequeue a task that a newer event has already superseded (#10).
-        if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
-            let repo = format!("{}/{}", task.repo_owner, task.repo_name);
-            state
-                .task_store
-                .register_pr_review(&repo, *pr_number, &task_id)
-                .await;
+        if task.commander.is_none() {
+            if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+                let repo = format!("{}/{}", task.repo_owner, task.repo_name);
+                state
+                    .task_store
+                    .register_pr_review(&repo, *pr_number, &task_id)
+                    .await;
+            }
         }
         if state.task_tx.try_send(task).is_err() {
             warn!(task_id, "task queue full — dropping task");
@@ -312,8 +314,9 @@ struct CommandSurface<'a> {
     commander: &'a str,
 }
 
-/// Maps a typed maintainer command to a task. Work commands carry the
-/// commander for the worker's permission gate; replies carry none.
+/// Maps a typed maintainer command to a task. Work commands and gated replies
+/// carry the commander for the worker's permission gate; clarifications and
+/// status replies carry none.
 async fn command_task(
     state: &AppState,
     familiar: &coven_github_config::FamiliarConfig,
@@ -379,25 +382,24 @@ async fn command_task(
             },
             commander,
         ),
-        Command::Cancel if s.on_pull_request => {
-            // Tombstone queued reviews for this PR. In-flight work is not
-            // interrupted (documented limitation); the next review command or
-            // PR event re-arms the lane.
-            state
-                .task_store
-                .register_pr_review(&repo, s.number, &format!("cancelled:{}", uuid::Uuid::new_v4()))
-                .await;
-            reply(format!(
-                "Cancelled queued reviews for PR #{}. Work already running will finish; `@{} review` re-arms the lane.",
-                s.number,
-                familiar.bot_username.trim_end_matches("[bot]")
-            ))
+        Command::Cancel if s.on_pull_request => make(
+            TaskKind::CancelReviews {
+                pr_number: s.number,
+            },
+            commander,
+        ),
+        Command::Cancel => {
+            reply("`cancel` currently applies to queued pull-request reviews only.".to_string())
         }
-        Command::Cancel => reply("`cancel` currently applies to queued pull-request reviews only.".to_string()),
-        Command::Remember { .. } | Command::Forget { .. } => reply(
-            "Noted, but memory persistence is not wired up yet — it lands with the hosted \
-             memory governance contract (#6). Nothing was stored or deleted."
-                .to_string(),
+        Command::Remember { .. } | Command::Forget { .. } => make(
+            TaskKind::CommandReply {
+                issue_number: s.number,
+                body:
+                    "Noted, but memory persistence is not wired up yet — it lands with the hosted \
+                       memory governance contract (#6). Nothing was stored or deleted."
+                        .to_string(),
+            },
+            commander,
         ),
         Command::Status => {
             let items = state.task_store.list().await;
@@ -704,7 +706,10 @@ mod tests {
             TaskKind::CommandReply { issue_number, body } => {
                 assert_eq!(issue_number, 42);
                 assert!(body.contains("`can`"));
-                assert!(body.contains("`review`"), "reply should list commands: {body}");
+                assert!(
+                    body.contains("`review`"),
+                    "reply should list commands: {body}"
+                );
             }
             other => panic!("expected CommandReply, got {other:?}"),
         }
@@ -761,7 +766,6 @@ mod tests {
         let state = app_state();
         assert!(event_to_task(&state, GitHubEvent::Ping).await.is_none());
     }
-
 }
 
 #[cfg(test)]
@@ -838,7 +842,9 @@ mod review_lane_tests {
     async fn pr_opened_is_ignored_when_lane_disabled() {
         let state = app_state();
         assert!(
-            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).await.is_none()
+            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened")))
+                .await
+                .is_none()
         );
     }
 
@@ -848,7 +854,11 @@ mod review_lane_tests {
         let state = app_state_with_review(review_on());
         let mut event = pr_event("opened");
         event.author_login = "coven-cody[bot]".to_string();
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).await.is_none());
+        assert!(
+            event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -856,12 +866,20 @@ mod review_lane_tests {
         let state = app_state_with_review(review_on());
         let mut event = pr_event("opened");
         event.draft = true;
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event.clone())).await.is_none());
+        assert!(
+            event_to_task(&state, GitHubEvent::PullRequestChanged(event.clone()))
+                .await
+                .is_none()
+        );
 
         let mut inclusive = review_on();
         inclusive.include_drafts = true;
         let state = app_state_with_review(inclusive);
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).await.is_some());
+        assert!(
+            event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -878,7 +896,9 @@ mod review_lane_tests {
         );
         let state = app_state_with_review(review);
         assert!(
-            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened"))).await.is_none()
+            event_to_task(&state, GitHubEvent::PullRequestChanged(pr_event("opened")))
+                .await
+                .is_none()
         );
     }
 
@@ -901,7 +921,11 @@ mod review_lane_tests {
         let state = app_state_with_review(review_on());
         let mut event = pr_event("labeled");
         event.label_name = Some("help wanted".to_string());
-        assert!(event_to_task(&state, GitHubEvent::PullRequestChanged(event)).await.is_none());
+        assert!(
+            event_to_task(&state, GitHubEvent::PullRequestChanged(event))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -927,7 +951,26 @@ mod review_lane_tests {
 mod command_routing_tests {
     use super::tests::app_state;
     use super::*;
+    use axum::http::HeaderValue;
     use coven_github_api::PrReviewCommentEvent;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    fn signed_headers(event_type: &str, body: &[u8]) -> HeaderMap {
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").expect("HMAC accepts key");
+        mac.update(body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&signature).expect("signature header is valid"),
+        );
+        headers.insert(
+            "x-github-event",
+            HeaderValue::from_str(event_type).expect("event type header is valid"),
+        );
+        headers
+    }
 
     fn pr_comment(body: &str) -> GitHubEvent {
         GitHubEvent::PullRequestReviewComment(PrReviewCommentEvent {
@@ -939,6 +982,38 @@ mod command_routing_tests {
             comment_body: body.to_string(),
             commenter_login: "octocat".to_string(),
         })
+    }
+
+    #[tokio::test]
+    async fn review_command_does_not_supersede_queued_reviews_in_router() {
+        let state = app_state();
+        state
+            .task_store
+            .register_pr_review("OpenCoven/coven-code", 88, "task-queued")
+            .await;
+        let body = serde_json::json!({
+            "action": "created",
+            "installation": { "id": 123 },
+            "repository": { "name": "coven-code", "owner": { "login": "OpenCoven" } },
+            "pull_request": { "number": 88, "title": "Add spell compiler cache" },
+            "comment": { "body": "@coven-cody review", "user": { "login": "octocat" } }
+        })
+        .to_string();
+
+        let _response = handle_webhook(
+            State(state.clone()),
+            signed_headers("pull_request_review_comment", body.as_bytes()),
+            Bytes::from(body),
+        )
+        .await;
+
+        assert!(
+            state
+                .task_store
+                .is_current_pr_review("OpenCoven/coven-code", 88, "task-queued")
+                .await,
+            "router must not let an ungated review command supersede queued reviews"
+        );
     }
 
     #[tokio::test]
@@ -972,7 +1047,7 @@ mod command_routing_tests {
     }
 
     #[tokio::test]
-    async fn cancel_command_tombstones_queued_reviews_and_acknowledges() {
+    async fn cancel_command_routes_authorized_worker_side_tombstone() {
         let state = app_state();
         state
             .task_store
@@ -981,36 +1056,39 @@ mod command_routing_tests {
 
         let task = event_to_task(&state, pr_comment("@coven-cody cancel"))
             .await
-            .expect("cancel should acknowledge");
+            .expect("cancel should enqueue gated worker-side cancellation");
 
         assert!(
-            !state
+            state
                 .task_store
                 .is_current_pr_review("OpenCoven/coven-code", 88, "task-queued")
                 .await,
-            "queued review must be superseded by the cancel tombstone"
+            "router must not tombstone before the worker permission gate"
         );
+        assert_eq!(task.commander.as_deref(), Some("octocat"));
         match task.kind {
-            TaskKind::CommandReply { issue_number, body } => {
-                assert_eq!(issue_number, 88);
-                assert!(body.contains("Cancelled queued reviews"));
+            TaskKind::CancelReviews { pr_number } => {
+                assert_eq!(pr_number, 88);
             }
-            other => panic!("expected CommandReply, got {other:?}"),
+            other => panic!("expected CancelReviews, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn memory_commands_are_acknowledged_but_deferred() {
-        let state = app_state();
-        let task = event_to_task(&state, pr_comment("@coven-cody remember we ship Fridays"))
-            .await
-            .expect("remember should acknowledge");
-        match task.kind {
-            TaskKind::CommandReply { body, .. } => {
-                assert!(body.contains("#6"));
-                assert!(body.contains("Nothing was stored"));
+        for command in ["remember we ship Fridays", "forget we ship Fridays"] {
+            let state = app_state();
+            let task = event_to_task(&state, pr_comment(&format!("@coven-cody {command}")))
+                .await
+                .expect("memory command should acknowledge");
+            assert_eq!(task.commander.as_deref(), Some("octocat"));
+            match task.kind {
+                TaskKind::CommandReply { body, .. } => {
+                    assert!(body.contains("#6"));
+                    assert!(body.contains("Nothing was stored"));
+                }
+                other => panic!("expected CommandReply, got {other:?}"),
             }
-            other => panic!("expected CommandReply, got {other:?}"),
         }
     }
 

@@ -234,10 +234,10 @@ pub enum TaskKind {
     /// Adapter-only reply on an issue/PR conversation (issue #13): command
     /// acknowledgements, clarifications, status answers, permission declines.
     /// Executed without spawning coven-code.
-    CommandReply {
-        issue_number: u64,
-        body: String,
-    },
+    CommandReply { issue_number: u64, body: String },
+    /// Adapter-only cancellation of queued PR reviews (issue #13). The worker
+    /// gates the commander before mutating the supersession registry.
+    CancelReviews { pr_number: u64 },
 }
 
 /// Structured result envelope written by coven-code --headless.

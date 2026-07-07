@@ -117,6 +117,9 @@ pub fn build(
         // CommandReply is executed adapter-side before briefing (issue #13);
         // this arm is a safe fallback, not an expected path.
         TaskKind::CommandReply { .. } => "issue_mention",
+        TaskKind::CancelReviews { .. } => {
+            unreachable!("CancelReviews is handled adapter-side before briefing")
+        }
     };
 
     let task_brief = match &task.kind {
@@ -149,6 +152,9 @@ pub fn build(
             issue_number: *issue_number,
             comment_body: body.clone(),
         },
+        TaskKind::CancelReviews { .. } => {
+            unreachable!("CancelReviews is handled adapter-side before briefing")
+        }
         TaskKind::ReviewPullRequest {
             pr_number,
             pr_title,

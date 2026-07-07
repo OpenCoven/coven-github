@@ -162,6 +162,10 @@ fn task_list_item(task: &Task, familiar_name: &str) -> TaskListItem {
         TaskKind::CommandReply { issue_number, .. } => {
             (*issue_number, format!("Reply on #{issue_number}"))
         }
+        TaskKind::CancelReviews { pr_number } => (
+            *pr_number,
+            format!("Cancel queued reviews for PR #{pr_number}"),
+        ),
     };
 
     TaskListItem {
