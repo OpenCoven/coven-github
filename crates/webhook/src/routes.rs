@@ -181,6 +181,109 @@ pub async fn list_memory(State(state): State<AppState>, headers: HeaderMap) -> i
     }
 }
 
+/// Body of a memory revocation request (issue #6).
+#[derive(serde::Deserialize)]
+pub struct RevokeRequest {
+    /// `owner/name`. Must be within the caller's scope.
+    pub repo: String,
+    /// The memory key or prefix to revoke.
+    pub key: String,
+    /// Required for service/open callers; ignored for tenants (taken from the
+    /// token so a tenant can only ever revoke its own installation).
+    pub installation_id: Option<u64>,
+}
+
+/// POST /api/github/memory/revoke — revoke a memory key/prefix for a repo
+/// (issue #6). A tenant may only revoke within its own installation (and
+/// repositories, when scoped); the operator service token may revoke any
+/// installation named in the body. Every revocation is audited.
+pub async fn revoke_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeRequest>,
+) -> impl IntoResponse {
+    let action = "revoke_memory";
+    let (caller, installation_id) = match authorize_api(&state.config.api, &headers) {
+        ApiCaller::Denied => {
+            if let Err(e) = state
+                .store
+                .record_api_read("anonymous", "none", action, "denied")
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response();
+        }
+        ApiCaller::Tenant(tenant) => {
+            // A scoped tenant may only revoke within its own repositories.
+            if !tenant.repos.is_empty() && !tenant.repos.contains(&req.repo) {
+                let _ = state
+                    .store
+                    .record_api_read(
+                        &format!("tenant:{}", tenant.installation_id),
+                        &req.repo,
+                        action,
+                        "forbidden",
+                    )
+                    .await;
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"ok": false, "error": "repository not in scope"})),
+                )
+                    .into_response();
+            }
+            (
+                format!("tenant:{}", tenant.installation_id),
+                tenant.installation_id,
+            )
+        }
+        // Operator-wide callers must name the installation explicitly.
+        ApiCaller::Service | ApiCaller::Open => match req.installation_id {
+            Some(id) => ("service".to_string(), id),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": "installation_id required"})),
+                )
+                    .into_response()
+            }
+        },
+    };
+
+    match state
+        .store
+        .record_revocation(installation_id, &req.repo, &req.key)
+        .await
+    {
+        Ok(()) => {
+            if let Err(e) = state
+                .store
+                .record_api_read(&caller, &req.repo, action, "ok")
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            Json(json!({"ok": true, "revoked": req.key})).into_response()
+        }
+        Err(e) => {
+            error!("revocation failed: {e:#}");
+            let _ = state
+                .store
+                .record_api_read(&caller, &req.repo, action, "error")
+                .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "revocation failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Resolved identity of a task-API caller.
 enum ApiCaller<'a> {
     /// `open` mode: unauthenticated local development.
@@ -328,6 +431,33 @@ pub async fn handle_webhook(
             .await
         {
             Ok(_) => (StatusCode::OK, Json(json!({"ok": true, "pong": true}))).into_response(),
+            Err(e) => storage_unavailable(e),
+        };
+    }
+
+    // Installation removed → purge that tenant's durable memory records
+    // (issue #6, delete-on-uninstall). Idempotent via the delivery id.
+    if event_type == "installation" && payload.action.as_deref() == Some("deleted") {
+        let installation_id = payload.installation.as_ref().map(|i| i.id);
+        return match state
+            .store
+            .record_delivery(delivery, Routing::Ignored("installation_deleted"))
+            .await
+        {
+            Ok(Recorded::New) => {
+                if let Some(id) = installation_id {
+                    match state.store.delete_memory_for_installation(id).await {
+                        Ok(purged) => {
+                            info!(installation_id = id, purged, "purged memory on uninstall")
+                        }
+                        Err(e) => error!("failed to purge memory on uninstall: {e:#}"),
+                    }
+                }
+                (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+            }
+            Ok(Recorded::Duplicate) => {
+                (StatusCode::OK, Json(json!({"ok": true, "duplicate": true}))).into_response()
+            }
             Err(e) => storage_unavailable(e),
         };
     }
@@ -1447,6 +1577,52 @@ mod delivery_idempotency_tests {
     }
 
     #[tokio::test]
+    async fn installation_deleted_purges_only_that_installations_memory() {
+        let state = app_state();
+        let mem = |installation_id: u64| coven_github_store::MemoryActivity {
+            at: String::new(),
+            installation_id,
+            repo: "OpenCoven/demo".to_string(),
+            task_id: "t".to_string(),
+            op: "read".to_string(),
+            target: "repo/OpenCoven/demo/x".to_string(),
+            scope: "repo".to_string(),
+            outcome: "accepted".to_string(),
+        };
+        state.store.record_memory_activity(vec![mem(7)]).await.unwrap();
+        state.store.record_memory_activity(vec![mem(99)]).await.unwrap();
+        state
+            .store
+            .record_revocation(7, "OpenCoven/demo", "repo/OpenCoven/demo/x")
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({ "action": "deleted", "installation": { "id": 7 } })
+            .to_string();
+        let (status, _) =
+            call(&state, signed_headers("installation", Some("del-1"), &body), &body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Installation 7's memory and revocations are purged; 99 is untouched.
+        assert!(state
+            .store
+            .list_memory(Some(ApiScope { installation_id: 7, repos: None }))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state.store.revocations_for(7, "OpenCoven/demo").await.unwrap().is_empty());
+        assert_eq!(
+            state
+                .store
+                .list_memory(Some(ApiScope { installation_id: 99, repos: None }))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn redelivered_delivery_id_never_dispatches_twice() {
         let state = app_state();
         let body = assigned_payload();
@@ -1718,6 +1894,77 @@ mod tenancy_tests {
         // The service token sees both installations.
         let (_, json) = list_mem(&state, Some("service-token-0123456789abcdef")).await;
         assert_eq!(json["memory"].as_array().unwrap().len(), 2);
+    }
+
+    async fn revoke(
+        state: &AppState,
+        bearer: Option<&str>,
+        repo: &str,
+        key: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = bearer {
+            headers.insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("header"),
+            );
+        }
+        let response = revoke_memory(
+            State(state.clone()),
+            headers,
+            Json(RevokeRequest {
+                repo: repo.to_string(),
+                key: key.to_string(),
+                installation_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    #[tokio::test]
+    async fn revoke_is_tenant_scoped_and_persists() {
+        let mut api = two_tenant_api();
+        api.tenants[0].repos = vec!["OpenCoven/alpha".to_string()];
+        let state = token_state(api);
+
+        // In-scope revocation succeeds and is stored.
+        let (status, json) = revoke(
+            &state,
+            Some("tenant-one-0123456789abcdef"),
+            "OpenCoven/alpha",
+            "repo/OpenCoven/alpha/secrets/",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            state
+                .store
+                .revocations_for(1, "OpenCoven/alpha")
+                .await
+                .unwrap(),
+            vec!["repo/OpenCoven/alpha/secrets/"]
+        );
+
+        // A repo outside the tenant's scope is forbidden.
+        let (status, _) = revoke(
+            &state,
+            Some("tenant-one-0123456789abcdef"),
+            "OpenCoven/beta",
+            "k",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // No credential fails closed.
+        let (status, _) = revoke(&state, None, "OpenCoven/alpha", "k").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
