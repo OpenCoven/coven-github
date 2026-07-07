@@ -153,22 +153,50 @@ impl Store {
     /// Atomically claims the oldest queued task, marking it `running` and
     /// opening an attempt record. Returns `None` when the queue is empty.
     /// Tombstoned (`superseded`) rows are never claimable.
-    pub async fn claim_next(&self) -> Result<Option<Task>> {
+    ///
+    /// `concurrency_caps` maps installation ids to their `max_concurrent`
+    /// limit (issue #15): a queued task whose installation is already at its
+    /// cap is skipped — capacity frees when its running tasks finish, and the
+    /// claim loop's poll timer retries.
+    pub async fn claim_next(
+        &self,
+        concurrency_caps: &std::collections::HashMap<u64, u32>,
+    ) -> Result<Option<Task>> {
         let conn = self.conn.clone();
+        let caps = concurrency_caps.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.lock().expect("store mutex poisoned");
             let now = now_rfc3339();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Installations at their concurrency cap right now.
+            let mut capped: Vec<u64> = Vec::new();
+            if !caps.is_empty() {
+                let mut stmt = tx.prepare(
+                    "SELECT installation_id, COUNT(*) FROM tasks
+                     WHERE state = 'running' GROUP BY installation_id",
+                )?;
+                let running: Vec<(u64, u32)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (installation, count) in running {
+                    if caps.get(&installation).is_some_and(|cap| count >= *cap) {
+                        capped.push(installation);
+                    }
+                }
+            }
+            let capped_json = serde_json::to_string(&capped)?;
             let claimed = tx
                 .query_row(
                     "UPDATE tasks
                        SET state = 'running', attempts = attempts + 1, updated_at = ?1
                      WHERE id = (SELECT id FROM tasks
                                  WHERE state = 'queued'
+                                   AND installation_id NOT IN
+                                       (SELECT value FROM json_each(?2))
                                  ORDER BY created_at, id LIMIT 1)
                      RETURNING id, installation_id, repo, familiar_id, kind,
                                commander, attempts",
-                    params![now],
+                    params![now, capped_json],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -437,6 +465,21 @@ pub struct ApiScope {
     pub repos: Option<Vec<String>>,
 }
 
+/// One usage metering row (issue #15).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRow {
+    pub installation_id: u64,
+    pub repo: String,
+    pub familiar_id: String,
+    /// Tasks accepted (every state).
+    pub tasks: u32,
+    pub completed: u32,
+    pub failed: u32,
+    /// Total attempt wall-clock runtime, seconds.
+    pub runtime_secs: u64,
+}
+
 impl Store {
     /// Appends a task-API read to the audit trail (issue #3).
     pub async fn record_api_read(
@@ -478,6 +521,74 @@ impl Store {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Number of tasks accepted for an installation since `cutoff`
+    /// (RFC 3339) — the intake-side daily-cap check (issue #15).
+    pub async fn tasks_created_since(&self, installation_id: u64, cutoff: &str) -> Result<u32> {
+        let conn = self.conn.clone();
+        let cutoff = cutoff.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let count: u32 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE installation_id = ?1 AND created_at >= ?2",
+                params![installation_id, cutoff],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Usage metering rollup (issue #15): task counts and attempt runtime,
+    /// grouped by installation, repository, and familiar. `scope` applies the
+    /// same tenant boundary as the task list.
+    pub async fn usage(&self, scope: Option<ApiScope>) -> Result<Vec<UsageRow>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT t.installation_id, t.repo, t.familiar_id,
+                        COUNT(DISTINCT t.id),
+                        SUM(CASE WHEN t.state = 'completed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.state = 'failed' THEN 1 ELSE 0 END),
+                        COALESCE(SUM(
+                          CASE WHEN a.ended_at IS NOT NULL
+                            THEN MAX(0, CAST(strftime('%s', a.ended_at) AS INTEGER)
+                                      - CAST(strftime('%s', a.started_at) AS INTEGER))
+                            ELSE 0 END), 0)
+                 FROM tasks t
+                 LEFT JOIN task_attempts a ON a.task_id = t.id
+                 WHERE (?1 IS NULL OR t.installation_id = ?1)
+                 GROUP BY t.installation_id, t.repo, t.familiar_id
+                 ORDER BY t.installation_id, t.repo, t.familiar_id",
+            )?;
+            let installation_filter = scope.as_ref().map(|s| s.installation_id);
+            let rows = stmt
+                .query_map(params![installation_filter], |row| {
+                    Ok(UsageRow {
+                        installation_id: row.get(0)?,
+                        repo: row.get(1)?,
+                        familiar_id: row.get(2)?,
+                        tasks: row.get(3)?,
+                        completed: row.get(4)?,
+                        failed: row.get(5)?,
+                        runtime_secs: row.get(6)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut rows = rows;
+            if let Some(scope) = &scope {
+                if let Some(repos) = &scope.repos {
+                    rows.retain(|r| repos.contains(&r.repo));
+                }
+            }
             Ok(rows)
         })
         .await
@@ -1233,7 +1344,7 @@ mod queue_tests {
         enqueue(&store, "d1", &fix_task("t1")).await;
         enqueue(&store, "d2", &fix_task("t2")).await;
 
-        let first = store.claim_next().await.unwrap().expect("first claim");
+        let first = store.claim_next(&Default::default()).await.unwrap().expect("first claim");
         assert_eq!(first.id, "t1");
         assert_eq!(first.repo_owner, "OpenCoven");
         assert_eq!(first.repo_name, "demo");
@@ -1243,9 +1354,9 @@ mod queue_tests {
             TaskKind::FixIssue { issue_number: 42, .. }
         ));
 
-        let second = store.claim_next().await.unwrap().expect("second claim");
+        let second = store.claim_next(&Default::default()).await.unwrap().expect("second claim");
         assert_eq!(second.id, "t2");
-        assert!(store.claim_next().await.unwrap().is_none(), "queue drained");
+        assert!(store.claim_next(&Default::default()).await.unwrap().is_none(), "queue drained");
     }
 
     #[tokio::test]
@@ -1254,16 +1365,16 @@ mod queue_tests {
         enqueue(&store, "d1", &review_task("old", 88)).await;
         enqueue(&store, "d2", &review_task("new", 88)).await;
 
-        let claimed = store.claim_next().await.unwrap().expect("claim");
+        let claimed = store.claim_next(&Default::default()).await.unwrap().expect("claim");
         assert_eq!(claimed.id, "new", "the tombstoned review must be skipped");
-        assert!(store.claim_next().await.unwrap().is_none());
+        assert!(store.claim_next(&Default::default()).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn finish_reaches_terminal_state_and_closes_the_attempt() {
         let store = Store::open_in_memory().expect("open");
         enqueue(&store, "d1", &fix_task("t1")).await;
-        let task = store.claim_next().await.unwrap().expect("claim");
+        let task = store.claim_next(&Default::default()).await.unwrap().expect("claim");
         store
             .finish(
                 &task.id,
@@ -1301,16 +1412,16 @@ mod queue_tests {
         // "spent" burns three claim attempts across simulated crashes.
         enqueue(&store, "d1", &fix_task("spent")).await;
         for _ in 0..2 {
-            let claimed = store.claim_next().await.unwrap().expect("claim spent");
+            let claimed = store.claim_next(&Default::default()).await.unwrap().expect("claim spent");
             assert_eq!(claimed.id, "spent");
             store.recover_interrupted(99).await.expect("interim recovery");
         }
-        let claimed = store.claim_next().await.unwrap().expect("third claim");
+        let claimed = store.claim_next(&Default::default()).await.unwrap().expect("third claim");
         assert_eq!(claimed.id, "spent");
 
         // "fresh" is claimed once; both are mid-run when the process dies.
         enqueue(&store, "d2", &fix_task("fresh")).await;
-        let claimed = store.claim_next().await.unwrap().expect("claim fresh");
+        let claimed = store.claim_next(&Default::default()).await.unwrap().expect("claim fresh");
         assert_eq!(claimed.id, "fresh");
 
         // Boot with a budget of 3 claims: "spent" fails, "fresh" requeues.
@@ -1322,16 +1433,16 @@ mod queue_tests {
         assert_eq!(states["fresh"], "queued");
 
         // The requeued task is claimable again; the failed one is not.
-        let reclaimed = store.claim_next().await.unwrap().expect("re-claim");
+        let reclaimed = store.claim_next(&Default::default()).await.unwrap().expect("re-claim");
         assert_eq!(reclaimed.id, "fresh");
-        assert!(store.claim_next().await.unwrap().is_none());
+        assert!(store.claim_next(&Default::default()).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn cancel_queued_tombstones_only_queued_rows_for_the_key() {
         let store = Store::open_in_memory().expect("open");
         enqueue(&store, "d1", &review_task("running", 88)).await;
-        let claimed = store.claim_next().await.unwrap().expect("claim");
+        let claimed = store.claim_next(&Default::default()).await.unwrap().expect("claim");
         assert_eq!(claimed.id, "running");
         enqueue(&store, "d2", &review_task("queued", 88)).await;
         enqueue(&store, "d3", &review_task("other", 89)).await;
@@ -1448,5 +1559,135 @@ mod command_gate_tests {
             store.task_states().await.unwrap().into_iter().collect();
         assert_eq!(states["older"], "superseded");
         assert_eq!(states["commanded"], "queued", "the commanding task survives");
+    }
+}
+
+#[cfg(test)]
+mod metering_tests {
+    //! Usage metering and limit enforcement (issue #15).
+    use super::*;
+
+    fn delivery(id: &str) -> Delivery {
+        Delivery {
+            delivery_id: id.to_string(),
+            event: "issues".to_string(),
+            action: Some("assigned".to_string()),
+            installation_id: Some(1),
+            repo: Some("OpenCoven/demo".to_string()),
+            payload_hash: "h".to_string(),
+        }
+    }
+
+    fn task_for(id: &str, installation_id: u64) -> Task {
+        Task {
+            id: id.to_string(),
+            installation_id,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+            },
+        }
+    }
+
+    async fn enqueue(store: &Store, delivery_id: &str, task: &Task) {
+        store
+            .record_delivery(delivery(delivery_id), Routing::Task(task))
+            .await
+            .expect("enqueue");
+    }
+
+    #[tokio::test]
+    async fn concurrency_cap_skips_saturated_installations_without_starving_others() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &task_for("cap-a", 1)).await;
+        enqueue(&store, "d2", &task_for("cap-b", 1)).await;
+        enqueue(&store, "d3", &task_for("other", 2)).await;
+
+        let caps = std::collections::HashMap::from([(1u64, 1u32)]);
+        let first = store.claim_next(&caps).await.unwrap().expect("first claim");
+        assert_eq!(first.id, "cap-a");
+
+        // Installation 1 is at its cap: its second task is skipped, but
+        // installation 2's task still claims.
+        let second = store.claim_next(&caps).await.unwrap().expect("second");
+        assert_eq!(second.id, "other", "capped installation must be skipped");
+        assert!(store.claim_next(&caps).await.unwrap().is_none());
+
+        // Finishing frees capacity.
+        store
+            .finish(
+                "cap-a",
+                Terminal {
+                    state: TerminalState::Completed,
+                    ..Terminal::default()
+                },
+            )
+            .await
+            .expect("finish");
+        let third = store.claim_next(&caps).await.unwrap().expect("third");
+        assert_eq!(third.id, "cap-b");
+    }
+
+    #[tokio::test]
+    async fn tasks_created_since_counts_only_the_installation() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &task_for("a", 1)).await;
+        enqueue(&store, "d2", &task_for("b", 1)).await;
+        enqueue(&store, "d3", &task_for("c", 2)).await;
+
+        let past = "2000-01-01T00:00:00+00:00";
+        assert_eq!(store.tasks_created_since(1, past).await.unwrap(), 2);
+        assert_eq!(store.tasks_created_since(2, past).await.unwrap(), 1);
+        let future = "2999-01-01T00:00:00+00:00";
+        assert_eq!(store.tasks_created_since(1, future).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_rolls_up_by_installation_repo_and_familiar_with_scope() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &task_for("a", 1)).await;
+        enqueue(&store, "d2", &task_for("b", 2)).await;
+        // Claim + finish task a so it has runtime and a terminal state.
+        let claimed = store
+            .claim_next(&Default::default())
+            .await
+            .unwrap()
+            .expect("claim");
+        assert_eq!(claimed.id, "a");
+        store
+            .finish(
+                "a",
+                Terminal {
+                    state: TerminalState::Completed,
+                    result_status: Some("success".to_string()),
+                    ..Terminal::default()
+                },
+            )
+            .await
+            .expect("finish");
+
+        let all = store.usage(None).await.expect("usage");
+        assert_eq!(all.len(), 2);
+        let one = all.iter().find(|r| r.installation_id == 1).expect("row");
+        assert_eq!(one.repo, "OpenCoven/demo");
+        assert_eq!(one.familiar_id, "cody");
+        assert_eq!((one.tasks, one.completed, one.failed), (1, 1, 0));
+
+        // The tenant boundary applies to metering exactly as to tasks.
+        let scoped = store
+            .usage(Some(ApiScope {
+                installation_id: 2,
+                repos: None,
+            }))
+            .await
+            .expect("scoped usage");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].installation_id, 2);
+        assert_eq!(scoped[0].completed, 0);
     }
 }

@@ -44,9 +44,21 @@ pub struct InstallationConfig {
     /// Installation-wide trigger switches; repos may override.
     #[serde(default)]
     pub triggers: TriggerPolicy,
+    /// Usage limits for this installation (issue #15). Absent = unlimited.
+    #[serde(default)]
+    pub limits: InstallationLimits,
     /// Per-repo overrides keyed "owner/name".
     #[serde(default)]
     pub repos: std::collections::HashMap<String, RepoRoutingOverride>,
+}
+
+/// Tier limits for one installation (issue #15). `None` = unlimited.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct InstallationLimits {
+    /// Max tasks running at once for this installation.
+    pub max_concurrent: Option<u32>,
+    /// Max tasks accepted per rolling 24 hours.
+    pub max_tasks_per_day: Option<u32>,
 }
 
 /// Which trigger lanes may create work. All on by default.
@@ -433,6 +445,25 @@ impl Config {
         RoutingScope { familiars, triggers }
     }
 
+    /// Usage limits for one installation (issue #15). Unlimited when the
+    /// installation is not configured.
+    pub fn limits_for(&self, installation_id: u64) -> InstallationLimits {
+        self.installations
+            .iter()
+            .find(|i| i.id == installation_id)
+            .map(|i| i.limits)
+            .unwrap_or_default()
+    }
+
+    /// `installation id → max_concurrent` for every configured cap — the
+    /// worker's claim filter (issue #15).
+    pub fn concurrency_caps(&self) -> std::collections::HashMap<u64, u32> {
+        self.installations
+            .iter()
+            .filter_map(|i| i.limits.max_concurrent.map(|cap| (i.id, cap)))
+            .collect()
+    }
+
     /// Run semantic validation over a parsed config and return every diagnostic
     /// found. An empty `Error`-severity set means the config is ready to serve.
     ///
@@ -673,6 +704,17 @@ impl Config {
                     ));
                 }
             }
+            if installation.limits.max_concurrent == Some(0)
+                || installation.limits.max_tasks_per_day == Some(0)
+            {
+                out.push(Diagnostic::error(
+                    "installations[].limits",
+                    format!(
+                        "installation {} has a limit of 0 — no task would ever run; omit the limit for unlimited or set it to 1+.",
+                        installation.id
+                    ),
+                ));
+            }
         }
 
         // ── Review policy ───────────────────────────────────────────────
@@ -854,6 +896,9 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         }
         "installations[].familiars" => {
             "Reference only ids that appear in a [[familiars]] block, or leave the list empty to allow all."
+        }
+        "installations[].limits" => {
+            "Remove the zero limit (unlimited) or set max_concurrent / max_tasks_per_day to 1 or more."
         }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
@@ -1326,6 +1371,7 @@ mod tests {
                 account: None,
                 familiars: vec!["ghost".to_string()],
                 triggers: TriggerPolicy::default(),
+                limits: InstallationLimits::default(),
                 repos: std::collections::HashMap::new(),
             },
             InstallationConfig {
@@ -1333,6 +1379,7 @@ mod tests {
                 account: None,
                 familiars: vec![],
                 triggers: TriggerPolicy::default(),
+                limits: InstallationLimits::default(),
                 repos: std::collections::HashMap::new(),
             },
         ];

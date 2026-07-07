@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use coven_github_config::Config;
 use coven_github_webhook::routes::{
-    handle_webhook, list_memory, list_tasks, revoke_memory, AppState,
+    handle_webhook, list_memory, list_tasks, revoke_memory, usage, AppState,
 };
 use coven_github_worker as worker;
 
@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
                 .route("/api/github/tasks", get(list_tasks))
                 .route("/api/github/memory", get(list_memory))
                 .route("/api/github/memory/revoke", post(revoke_memory))
+                .route("/api/github/usage", get(usage))
                 .with_state(state)
                 .layer(TraceLayer::new_for_http());
 

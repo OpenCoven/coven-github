@@ -65,6 +65,10 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # id = 123456                     # GitHub App installation id
 # account = "your-org"
 # familiars = ["cody"]            # allow-list; empty = all familiars
+# [installations.limits]         # tier limits (issue #15); omit = unlimited
+# max_concurrent = 2              # tasks running at once for this installation
+# max_tasks_per_day = 50          # accepted tasks per rolling 24h; overflow
+#                                 # deliveries are recorded ignored:quota_exceeded
 # [installations.triggers]       # installation-wide lane switches (default on)
 # assignment = true
 # labels = true

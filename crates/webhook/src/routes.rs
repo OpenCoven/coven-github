@@ -284,6 +284,71 @@ pub async fn revoke_memory(
     }
 }
 
+/// GET /api/github/usage — metering rollup by installation, repository, and
+/// familiar (issue #15). Same tenant boundary and audit trail as the task
+/// list.
+pub async fn usage(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let action = "usage";
+    let (caller, scope) = match authorize_api(&state.config.api, &headers) {
+        ApiCaller::Denied => {
+            if let Err(e) = state
+                .store
+                .record_api_read("anonymous", "none", action, "denied")
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "unauthorized"})),
+            )
+                .into_response();
+        }
+        ApiCaller::Open => ("open".to_string(), None),
+        ApiCaller::Service => ("service".to_string(), None),
+        ApiCaller::Tenant(tenant) => (
+            format!("tenant:{}", tenant.installation_id),
+            Some(ApiScope {
+                installation_id: tenant.installation_id,
+                repos: if tenant.repos.is_empty() {
+                    None
+                } else {
+                    Some(tenant.repos.clone())
+                },
+            }),
+        ),
+    };
+    let scope_label = scope
+        .as_ref()
+        .map(|s| format!("installation:{}", s.installation_id))
+        .unwrap_or_else(|| "all".to_string());
+
+    match state.store.usage(scope).await {
+        Ok(rows) => {
+            if let Err(e) = state
+                .store
+                .record_api_read(&caller, &scope_label, action, &format!("ok:{}", rows.len()))
+                .await
+            {
+                error!("api audit write failed: {e:#}");
+            }
+            Json(json!({ "ok": true, "usage": rows })).into_response()
+        }
+        Err(e) => {
+            error!("usage rollup unavailable: {e:#}");
+            let _ = state
+                .store
+                .record_api_read(&caller, &scope_label, action, "error")
+                .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "usage unavailable"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Resolved identity of a task-API caller.
 enum ApiCaller<'a> {
     /// `open` mode: unauthenticated local development.
@@ -467,6 +532,42 @@ pub async fn handle_webhook(
     //    delivery id must never dispatch twice (issue #2).
     match event_to_task(&state, event).await {
         Some(task) => {
+            // Daily task cap (issue #15): over-quota installations get their
+            // delivery recorded as ignored — visible in the audit trail — and
+            // GitHub still hears 200 (the delivery itself succeeded).
+            if let Some(cap) = state
+                .config
+                .limits_for(task.installation_id)
+                .max_tasks_per_day
+            {
+                let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                match state
+                    .store
+                    .tasks_created_since(task.installation_id, &cutoff)
+                    .await
+                {
+                    Ok(used) if used >= cap => {
+                        warn!(
+                            installation_id = task.installation_id,
+                            used, cap, "daily task cap reached — delivery ignored"
+                        );
+                        if let Err(e) = state
+                            .store
+                            .record_delivery(delivery, Routing::Ignored("quota_exceeded"))
+                            .await
+                        {
+                            return storage_unavailable(e);
+                        }
+                        return (
+                            StatusCode::OK,
+                            Json(json!({"ok": true, "ignored": "quota_exceeded"})),
+                        )
+                            .into_response();
+                    }
+                    Ok(_) => {}
+                    Err(e) => return storage_unavailable(e),
+                }
+            }
             match state
                 .store
                 .record_delivery(delivery, Routing::Task(&task))
@@ -2046,6 +2147,7 @@ mod installation_routing_tests {
                 account: Some("acme".to_string()),
                 familiars: vec!["cody".to_string()],
                 triggers: Default::default(),
+                limits: Default::default(),
                 repos: std::collections::HashMap::from([(
                     "acme/frozen".to_string(),
                     RepoRoutingOverride {
@@ -2065,6 +2167,7 @@ mod installation_routing_tests {
                 account: Some("globex".to_string()),
                 familiars: vec!["nova".to_string()],
                 triggers: Default::default(),
+                limits: Default::default(),
                 repos: std::collections::HashMap::new(),
             },
         ];
@@ -2173,5 +2276,182 @@ mod installation_routing_tests {
             .await
             .expect("open routing must keep working");
         assert_eq!(task.familiar_id, "cody");
+    }
+}
+
+#[cfg(test)]
+mod metering_route_tests {
+    //! The intake daily cap and the tenant-scoped usage endpoint (issue #15).
+    use super::tests::{app_state, seed_task};
+    use super::*;
+    use axum::extract::State;
+    use coven_github_config::{InstallationConfig, InstallationLimits, TenantToken};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256 as HmacSha;
+    use std::sync::Arc;
+
+    fn capped_state(max_tasks_per_day: u32) -> AppState {
+        let base = app_state();
+        let mut config = (*base.config).clone();
+        config.installations = vec![InstallationConfig {
+            id: 7,
+            account: None,
+            familiars: vec![],
+            triggers: Default::default(),
+            limits: InstallationLimits {
+                max_concurrent: None,
+                max_tasks_per_day: Some(max_tasks_per_day),
+            },
+            repos: std::collections::HashMap::new(),
+        }];
+        AppState {
+            config: Arc::new(config),
+            ..base
+        }
+    }
+
+    fn signed(event: &str, delivery_id: &str, body: &str) -> HeaderMap {
+        let mut mac = Hmac::<HmacSha>::new_from_slice(b"secret").expect("hmac");
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", event.parse().expect("header"));
+        headers.insert("x-hub-signature-256", sig.parse().expect("header"));
+        headers.insert("x-github-delivery", delivery_id.parse().expect("header"));
+        headers
+    }
+
+    fn assigned(installation: u64, issue: u64) -> String {
+        serde_json::json!({
+            "action": "assigned",
+            "issue": { "number": issue, "title": "t", "body": "b" },
+            "assignee": { "login": "coven-cody[bot]" },
+            "repository": { "name": "demo", "owner": { "login": "OpenCoven" } },
+            "installation": { "id": installation }
+        })
+        .to_string()
+    }
+
+    async fn deliver(state: &AppState, delivery_id: &str, body: &str) -> serde_json::Value {
+        let response = handle_webhook(
+            State(state.clone()),
+            signed("issues", delivery_id, body),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn daily_cap_ignores_overflow_and_records_the_reason() {
+        let state = capped_state(1);
+
+        let first = deliver(&state, "dl-1", &assigned(7, 1)).await;
+        assert!(first.get("ignored").is_none());
+
+        let second = deliver(&state, "dl-2", &assigned(7, 2)).await;
+        assert_eq!(second["ignored"], "quota_exceeded");
+
+        // One durable task; the overflow delivery is audited as ignored.
+        assert_eq!(state.store.task_states().await.unwrap().len(), 1);
+        assert_eq!(
+            state.store.delivery_routing("dl-2").await.unwrap().as_deref(),
+            Some("ignored:quota_exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn uncapped_installations_are_unaffected() {
+        let state = capped_state(1);
+        // installation 8 has no [[installations]] block… but blocks exist, so
+        // routing fails closed for it — use the capped installation's sibling
+        // config instead: an unlimited installation block.
+        let mut config = (*state.config).clone();
+        config.installations.push(InstallationConfig {
+            id: 8,
+            account: None,
+            familiars: vec![],
+            triggers: Default::default(),
+            limits: InstallationLimits::default(),
+            repos: std::collections::HashMap::new(),
+        });
+        let state = AppState {
+            config: Arc::new(config),
+            ..state
+        };
+        for (i, delivery_id) in ["dl-a", "dl-b", "dl-c"].iter().enumerate() {
+            let json = deliver(&state, delivery_id, &assigned(8, i as u64 + 1)).await;
+            assert!(json.get("ignored").is_none(), "delivery {i}: {json}");
+        }
+        assert_eq!(state.store.task_states().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_is_tenant_scoped_and_audited() {
+        let base = app_state();
+        let mut config = (*base.config).clone();
+        config.api = ApiConfig {
+            mode: ApiMode::Token,
+            service_token: None,
+            tenants: vec![TenantToken {
+                token: "tenant-one-0123456789abcdef".to_string(),
+                installation_id: 1,
+                repos: vec![],
+            }],
+        };
+        let state = AppState {
+            config: Arc::new(config),
+            ..base
+        };
+        let mk = |id: &str, installation_id: u64| Task {
+            id: id.to_string(),
+            installation_id,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+            },
+        };
+        seed_task(&state, "d1", &mk("mine", 1)).await;
+        seed_task(&state, "d2", &mk("theirs", 2)).await;
+
+        // No token: fail closed.
+        let response = usage(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Tenant token: only installation 1's rollup.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer tenant-one-0123456789abcdef".parse().expect("header"),
+        );
+        let response = usage(State(state.clone()), headers).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let rows = json["usage"].as_array().expect("usage rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["installationId"], 1);
+
+        let audit = state.store.api_audit_entries().await.expect("audit");
+        assert!(
+            audit
+                .iter()
+                .any(|(c, s, a, r)| c == "tenant:1" && s == "installation:1" && a == "usage" && r == "ok:1"),
+            "usage reads must be audited: {audit:?}"
+        );
     }
 }

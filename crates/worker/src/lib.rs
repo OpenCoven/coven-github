@@ -35,6 +35,8 @@ pub async fn run(
     notify: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.worker.concurrency));
+    // Per-installation concurrency caps (issue #15), applied at claim time.
+    let caps = config.concurrency_caps();
 
     loop {
         // Hold capacity BEFORE claiming so a claimed task is never parked
@@ -43,7 +45,7 @@ pub async fn run(
             Ok(permit) => permit,
             Err(_) => break,
         };
-        match store.claim_next().await {
+        match store.claim_next(&caps).await {
             Ok(Some(task)) => {
                 let config = config.clone();
                 let store = store.clone();
