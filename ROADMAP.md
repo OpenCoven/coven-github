@@ -73,7 +73,7 @@ Goal: make the value legible and buyable.
 
 ## Build Sequence & Dependencies
 
-Native GitHub "blocked by" relationships gate these issues; the sequencing tracker (#25) holds the full DAG. Critical path:
+Native GitHub "blocked by" relationships gate these issues; the [backlog dependency DAG](docs/backlog-dag.md) (tracker #25) holds the full topological view with live status. Critical path:
 
 `#2 → #4 → #10 → #13 → #19` — durable queue → auth split → review triggers → command protocol → reference demo.
 
@@ -140,8 +140,14 @@ Build waves (topological):
 
 ## Current Focus
 
-1. Land the hosted MVP hardening branch.
-2. Build persistent task state and idempotency.
-3. Move familiar routing from global TOML toward installation-scoped config.
-4. Make Cave oversight central in the public story and product loop.
-5. Borrow ClawSweeper's conservative GitHub bot ergonomics: edited status comments, maintainer steering commands, and live-state rechecks before mutation.
+The moat → hosted-V1 engineering backlog is drained — the operating-loop spine,
+hosted control plane, GitHub correctness, and worker-fleet isolation have all
+shipped (see the [backlog DAG](docs/backlog-dag.md) for the full ledger). What
+remains is sequenced by the hosted beta gates and go-to-market, not code
+dependencies:
+
+1. **#14 Branch Gardener** — the last scheduled-hygiene skill (in progress).
+2. **#16 (GTM)** — landing page + beta waitlist (pricing #17 has shipped —
+   see [docs/pricing.md](docs/pricing.md)).
+3. Harden toward the hosted beta gates in [HOSTED.md](HOSTED.md) and stand up
+   the hosted control plane on top of the now-durable, tenant-scoped adapter.
