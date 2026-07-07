@@ -64,6 +64,12 @@ pub struct MemoryPolicy {
     pub approval_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u32>,
+    /// Revoked memory keys/prefixes (issue #6). The adapter refuses to read or
+    /// write anything matching one of these, and passes them to the runtime so
+    /// it can stop surfacing them — but the adapter's refusal is the guarantee,
+    /// not the runtime's cooperation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied: Vec<String>,
 }
 
 /// Inputs the adapter derives before computing a policy.
@@ -76,6 +82,8 @@ pub struct PolicyInputs<'a> {
     pub trust: TrustScope,
     pub approval_required: bool,
     pub retention_days: Option<u32>,
+    /// Revoked key prefixes for this installation/repo.
+    pub denied: Vec<String>,
 }
 
 /// Computes the memory policy for one invocation, **deny-by-default**: returns
@@ -100,6 +108,7 @@ pub fn compute_policy(input: PolicyInputs) -> Option<MemoryPolicy> {
         write_scopes,
         approval_required,
         retention_days: input.retention_days,
+        denied: input.denied,
     })
 }
 
@@ -140,6 +149,13 @@ fn approval_forced(trust: TrustScope) -> bool {
     matches!(trust, TrustScope::Collaborator)
 }
 
+/// True when `target` falls under a revoked key/prefix. A denied entry matches
+/// its exact key and everything beneath it, so revoking `repo/o/r/` clears the
+/// whole repo namespace and revoking a full key clears just that entry.
+fn is_revoked(policy: &MemoryPolicy, target: &str) -> bool {
+    policy.denied.iter().any(|prefix| target.starts_with(prefix))
+}
+
 /// Why the adapter refused a memory read or write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRejection {
@@ -173,6 +189,14 @@ pub fn validate_memory_used(
     }
 
     for entry in &used.read {
+        if is_revoked(policy, &entry.id) {
+            rejections.push(MemoryRejection {
+                op: MemoryOp::Read,
+                target: entry.id.clone(),
+                reason: "memory has been revoked".to_string(),
+            });
+            continue;
+        }
         if let Some(reason) = check_access(policy, &entry.scope, &entry.id, &policy.read_scopes) {
             rejections.push(MemoryRejection {
                 op: MemoryOp::Read,
@@ -183,6 +207,14 @@ pub fn validate_memory_used(
     }
 
     for write in &used.proposed {
+        if is_revoked(policy, &write.key) {
+            rejections.push(MemoryRejection {
+                op: MemoryOp::Write,
+                target: write.key.clone(),
+                reason: "memory has been revoked".to_string(),
+            });
+            continue;
+        }
         if let Some(reason) = check_access(policy, &write.scope, &write.key, &policy.write_scopes) {
             rejections.push(MemoryRejection {
                 op: MemoryOp::Write,
@@ -260,6 +292,7 @@ mod tests {
             trust,
             approval_required: false,
             retention_days: Some(365),
+            denied: vec![],
         }
     }
 
@@ -318,6 +351,46 @@ mod tests {
                 .starts_with("rejected:"),
             "fork write should be recorded as rejected"
         );
+    }
+
+    #[test]
+    fn revoked_memory_is_refused_for_read_and_write() {
+        let policy = compute_policy(PolicyInputs {
+            denied: vec!["repo/acme/billing/secrets/".to_string()],
+            ..inputs(TrustScope::Maintainer, true)
+        })
+        .unwrap();
+
+        let used = used_with(
+            // Write under the revoked prefix.
+            vec![proposed("repo", "repo/acme/billing/secrets/api", "pending")],
+            // Read under the revoked prefix.
+            vec![MemoryEntryRef {
+                id: "repo/acme/billing/secrets/db".to_string(),
+                scope: "repo".to_string(),
+            }],
+        );
+        let rejections = validate_memory_used(&policy, &used, never_secret);
+        assert_eq!(rejections.len(), 2, "both the read and write are revoked");
+        assert!(rejections.iter().all(|r| r.reason.contains("revoked")));
+
+        // A non-revoked key under the same repo is still fine.
+        let ok = used_with(
+            vec![proposed("repo", "repo/acme/billing/conventions/x", "pending")],
+            vec![],
+        );
+        assert!(validate_memory_used(&policy, &ok, never_secret).is_empty());
+    }
+
+    #[test]
+    fn revoked_prefixes_serialize_into_the_policy_for_the_runtime() {
+        let policy = compute_policy(PolicyInputs {
+            denied: vec!["repo/acme/billing/x".to_string()],
+            ..inputs(TrustScope::Maintainer, true)
+        })
+        .unwrap();
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(value["denied"][0], "repo/acme/billing/x");
     }
 
     #[test]

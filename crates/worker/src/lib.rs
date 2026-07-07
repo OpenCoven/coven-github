@@ -747,6 +747,19 @@ async fn run_and_publish(
     // review target and actor: a fork PR is untrusted content and can never
     // write durable memory, overriding even a maintainer trigger.
     let repo_full = format!("{}/{}", task.repo_owner, task.repo_name);
+    // Revoked memory for this repo (issue #6): the adapter refuses these on the
+    // result and passes them to the runtime so it stops surfacing them.
+    let denied = if config.memory.enabled_for(&repo_full) {
+        store
+            .revocations_for(task.installation_id, &repo_full)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(task_id = %task.id, "failed to load memory revocations: {e:#}");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     let memory_policy = memory::compute_policy(memory::PolicyInputs {
         enabled: config.memory.enabled_for(&repo_full),
         installation_id: task.installation_id,
@@ -754,6 +767,7 @@ async fn run_and_publish(
         trust: memory::derive_trust(targets.head_is_fork, task.commander.is_some()),
         approval_required: config.memory.approval_required_for(&repo_full),
         retention_days: config.memory.retention_days,
+        denied,
     });
     let brief = brief::build(
         task,

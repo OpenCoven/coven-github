@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Handle to the durable store. Cheap to clone; all clones share one writer
 /// connection.
@@ -562,6 +562,74 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Records a memory revocation for an installation/repo (issue #6). The
+    /// target is a key or prefix; the worker refuses matching reads/writes and
+    /// forwards it to the runtime as a denial list.
+    pub async fn record_revocation(
+        &self,
+        installation_id: u64,
+        repo: &str,
+        target: &str,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let (repo, target) = (repo.to_string(), target.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO memory_revocations (at, installation_id, repo, target)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![now_rfc3339(), installation_id, repo, target],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Revoked targets for an installation/repo, for the policy denial list.
+    pub async fn revocations_for(&self, installation_id: u64, repo: &str) -> Result<Vec<String>> {
+        let conn = self.conn.clone();
+        let repo = repo.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT target FROM memory_revocations
+                 WHERE installation_id = ?1 AND repo = ?2
+                 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![installation_id, repo], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Purges all memory records for an installation (issue #6 delete-on-
+    /// uninstall). Returns the number of activity + revocation rows removed.
+    pub async fn delete_memory_for_installation(&self, installation_id: u64) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            let a = tx.execute(
+                "DELETE FROM memory_activity WHERE installation_id = ?1",
+                params![installation_id],
+            )?;
+            let r = tx.execute(
+                "DELETE FROM memory_revocations WHERE installation_id = ?1",
+                params![installation_id],
+            )?;
+            tx.commit()?;
+            Ok(a + r)
+        })
+        .await
+        .expect("store task panicked")
+    }
+}
+
 /// One recorded memory operation for the inspect/audit trail (issue #6).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MemoryActivity {
@@ -731,6 +799,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply schema v4")?;
     }
+    if version < 5 {
+        // v5: memory revocations (issue #6). A revoked key/prefix is refused on
+        // future reads/writes and passed to the runtime as a denial list.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE memory_revocations (
+              id              INTEGER PRIMARY KEY AUTOINCREMENT,
+              at              TEXT NOT NULL,
+              installation_id INTEGER NOT NULL,
+              repo            TEXT NOT NULL,
+              target          TEXT NOT NULL
+            );
+            CREATE INDEX memory_revocations_scope
+              ON memory_revocations(installation_id, repo);
+            "#,
+        )
+        .context("failed to apply schema v5")?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -881,6 +967,58 @@ mod tests {
         // Newest first: the rejected row was inserted second.
         assert_eq!(all[0].outcome, "rejected:out_of_scope");
         assert!(!all[0].at.is_empty(), "the store stamps the timestamp");
+    }
+
+    #[tokio::test]
+    async fn revocations_are_recorded_and_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_revocation(1, "OpenCoven/billing", "repo/OpenCoven/billing/secrets/")
+            .await
+            .unwrap();
+        store
+            .record_revocation(1, "OpenCoven/web", "repo/OpenCoven/web/x")
+            .await
+            .unwrap();
+
+        let billing = store.revocations_for(1, "OpenCoven/billing").await.unwrap();
+        assert_eq!(billing, vec!["repo/OpenCoven/billing/secrets/"]);
+        // A different repo, and a different installation, are isolated.
+        assert!(store.revocations_for(1, "OpenCoven/other").await.unwrap().is_empty());
+        assert!(store.revocations_for(2, "OpenCoven/billing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_on_uninstall_purges_activity_and_revocations() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_memory_activity(vec![memory_row(1, "OpenCoven/a", "repo/OpenCoven/a/x", "accepted")])
+            .await
+            .unwrap();
+        store.record_revocation(1, "OpenCoven/a", "repo/OpenCoven/a/x").await.unwrap();
+        // Another installation is untouched.
+        store
+            .record_memory_activity(vec![memory_row(2, "OpenCoven/b", "repo/OpenCoven/b/y", "accepted")])
+            .await
+            .unwrap();
+
+        let removed = store.delete_memory_for_installation(1).await.unwrap();
+        assert_eq!(removed, 2, "one activity + one revocation");
+        assert!(store
+            .list_memory(Some(ApiScope { installation_id: 1, repos: None }))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.revocations_for(1, "OpenCoven/a").await.unwrap().is_empty());
+        // Installation 2 survives.
+        assert_eq!(
+            store
+                .list_memory(Some(ApiScope { installation_id: 2, repos: None }))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
