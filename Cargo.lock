@@ -400,6 +400,7 @@ dependencies = [
  "anyhow",
  "coven-github-api",
  "coven-github-config",
+ "coven-github-gardener",
  "coven-github-store",
  "serde",
  "serde_json",

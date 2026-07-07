@@ -14,6 +14,7 @@ use coven_github_store::{Store, Terminal, TerminalState};
 
 pub mod backend;
 pub mod brief;
+pub(crate) mod gardener_exec;
 pub mod findings;
 pub mod memory;
 pub mod redact;
@@ -176,12 +177,8 @@ async fn execute_task_with_minter(
                     familiar.bot_username.trim_end_matches("[bot]")
                 )
             };
-            let marker = status_comment::marker(
-                &familiar.id,
-                &task.repo_owner,
-                &task.repo_name,
-                *pr_number,
-            );
+            let marker =
+                status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, *pr_number);
             status_comment::upsert(
                 api_base_url,
                 &orchestration,
@@ -234,9 +231,11 @@ async fn execute_task_with_minter(
         }
 
         if let TaskKind::GardenRun { report_issue } = &task.kind {
-            execute_garden_run(
+            gardener_exec::execute_garden_run(
+                config,
                 api_base_url,
                 &orchestration,
+                minter,
                 &store,
                 &task,
                 familiar,
@@ -285,12 +284,8 @@ async fn execute_task_with_minter(
             // Below-write commander: decline on the status surface, do no work.
             info!(task_id = %task.id, "declining command from a commander without write access");
             if let Some(number) = surface_number(&task.kind) {
-                let marker = status_comment::marker(
-                    &familiar.id,
-                    &task.repo_owner,
-                    &task.repo_name,
-                    number,
-                );
+                let marker =
+                    status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
                 let body = decline_body(&task);
                 if let Err(e) = status_comment::upsert(
                     api_base_url,
@@ -404,12 +399,8 @@ async fn execute_task_with_minter(
                 .await
                 .ok();
             if let Some(number) = surface_number(&task.kind) {
-                let marker = status_comment::marker(
-                    &familiar.id,
-                    &task.repo_owner,
-                    &task.repo_name,
-                    number,
-                );
+                let marker =
+                    status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
                 let body = format!(
                     "Status: superseded\n\nThe PR head moved from `{}` to `{}` while the \
                      review ran, so these findings no longer describe the current diff. \
@@ -451,10 +442,7 @@ async fn execute_task_with_minter(
         }
         Ok(published) => {
             let disp = disposition(&published.result);
-            store
-                .finish(&task.id, terminal_of(&published))
-                .await
-                .ok();
+            store.finish(&task.id, terminal_of(&published)).await.ok();
             // Findings pass the deterministic publication gates before any
             // surface sees them (issue #11): scope, severity policy, dedupe.
             // The digest always lands on the Check Run; policy can add the
@@ -511,20 +499,15 @@ async fn execute_task_with_minter(
             }
             // Terminal state on the marker-backed status surface (issue #13).
             if let Some(number) = surface_number(&task.kind) {
-                let marker = status_comment::marker(
-                    &familiar.id,
-                    &task.repo_owner,
-                    &task.repo_name,
-                    number,
+                let marker =
+                    status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
+                let mut body = final_status_body(
+                    config,
+                    &task.id,
+                    &published.result,
+                    published.opened_pr,
+                    &published.cited_memory,
                 );
-                let mut body =
-                    final_status_body(
-                        config,
-                        &task.id,
-                        &published.result,
-                        published.opened_pr,
-                        &published.cited_memory,
-                    );
                 if let Some(report) = &advisory {
                     body = format!("{body}\n\n{report}");
                 }
@@ -571,12 +554,8 @@ async fn execute_task_with_minter(
                 .await
                 .ok();
             if let Some(number) = surface_number(&task.kind) {
-                let marker = status_comment::marker(
-                    &familiar.id,
-                    &task.repo_owner,
-                    &task.repo_name,
-                    number,
-                );
+                let marker =
+                    status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
                 let body = redact::redact(
                     &format!("Status: failed\n\nTask failed: {e}"),
                     &[&orchestration],
@@ -707,8 +686,8 @@ fn memory_activity_rows(
             .map(|r| format!("rejected:{}", r.reason))
             .unwrap_or_else(|| "accepted".to_string())
     };
-    let row = |op: &str, target: &str, scope: &str, outcome: String| {
-        coven_github_store::MemoryActivity {
+    let row =
+        |op: &str, target: &str, scope: &str, outcome: String| coven_github_store::MemoryActivity {
             at: String::new(),
             installation_id,
             repo: repo.to_string(),
@@ -717,8 +696,7 @@ fn memory_activity_rows(
             target: target.to_string(),
             scope: scope.to_string(),
             outcome,
-        }
-    };
+        };
     let mut rows = Vec::new();
     for entry in &used.read {
         rows.push(row(
@@ -912,8 +890,13 @@ async fn run_and_publish(
         }
         // Record every reported read/write with the adapter's verdict so a
         // customer can inspect what memory a familiar used on their repo (#6).
-        let activity =
-            memory_activity_rows(task.installation_id, &repo_full, &task.id, used, &rejections);
+        let activity = memory_activity_rows(
+            task.installation_id,
+            &repo_full,
+            &task.id,
+            used,
+            &rejections,
+        );
         if let Err(e) = store.record_memory_activity(activity).await {
             warn!(task_id = %task.id, "failed to record memory activity: {e:#}");
         }
@@ -1061,12 +1044,8 @@ async fn open_draft_pr(
             // the user's view.
             warn!(task_id = %task.id, "failed to open PR: {e:#}");
             if let Some(number) = surface_number(&task.kind) {
-                let marker = status_comment::marker(
-                    &familiar.id,
-                    &task.repo_owner,
-                    &task.repo_name,
-                    number,
-                );
+                let marker =
+                    status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
                 let msg = redact::redact(
                     &format!(
                         "Status: failed\n\nI pushed `{branch}` but could not open the PR automatically: {e}. Open the branch manually or check the App's pull-request permission."
@@ -1380,19 +1359,15 @@ fn final_status_body(
             "Status: needs input\n\n{}\n\nReply on this thread to continue. Session: {session}",
             result.summary
         ),
-        SessionStatus::Failure => format!(
-            "Status: failed\n\n{}\n\nSession: {session}",
-            result.summary
-        ),
+        SessionStatus::Failure => {
+            format!("Status: failed\n\n{}\n\nSession: {session}", result.summary)
+        }
         SessionStatus::Success | SessionStatus::Partial => match opened_pr {
             Some(pr_number) => format!(
                 "Status: done\n\n{}\n\nPR #{pr_number} opened. Session: {session}",
                 result.summary
             ),
-            None => format!(
-                "Status: done\n\n{}\n\nSession: {session}",
-                result.summary
-            ),
+            None => format!("Status: done\n\n{}\n\nSession: {session}", result.summary),
         },
     };
     // Disclose which memory entries influenced this review (issue #6).
@@ -1416,44 +1391,6 @@ fn pr_title(result: &SessionResult, task: &Task) -> String {
     )
 }
 
-async fn execute_garden_run(
-    api_base_url: &str,
-    orchestration: &str,
-    store: &Store,
-    task: &Task,
-    familiar: &FamiliarConfig,
-    report_issue: Option<u64>,
-) -> Result<()> {
-    if let Some(number) = report_issue {
-        let marker =
-            status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, number);
-        let body = "Status: accepted\n\nBranch Gardener run accepted, but execution is not \
-                    implemented yet. No branches were changed.";
-        status_comment::upsert(
-            api_base_url,
-            orchestration,
-            &task.repo_owner,
-            &task.repo_name,
-            number,
-            &marker,
-            body,
-        )
-        .await?;
-    }
-
-    store
-        .finish(
-            &task.id,
-            Terminal {
-                state: TerminalState::Completed,
-                summary: Some("branch gardener run accepted but not implemented".to_string()),
-                ..Terminal::default()
-            },
-        )
-        .await?;
-    Ok(())
-}
-
 /// True when the task carries a commander whose repository permission is
 /// below write (issue #13). Auto-triggered tasks (no commander) always pass.
 async fn commander_below_write(
@@ -1472,7 +1409,10 @@ async fn commander_below_write(
         commander,
     )
     .await?;
-    Ok(!matches!(permission.as_str(), "admin" | "maintain" | "write"))
+    Ok(!matches!(
+        permission.as_str(),
+        "admin" | "maintain" | "write"
+    ))
 }
 
 /// Status-surface body for a below-write commander.
@@ -2333,8 +2273,7 @@ cat > "$5" <<EOF
 EOF
 exit 0
 "#;
-        let root =
-            std::env::temp_dir().join(format!("coven-github-pub-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("coven-github-pub-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("test dir should be created");
         let script_path = root.join("fake-coven-code.sh");
         fs::write(&script_path, script).expect("script should be written");
@@ -2658,8 +2597,7 @@ exit 0
         let check_patches: Vec<String> = requests
             .iter()
             .filter(|r| {
-                r.method.as_str() == "PATCH"
-                    && r.url.path() == "/repos/OpenCoven/demo/check-runs/7"
+                r.method.as_str() == "PATCH" && r.url.path() == "/repos/OpenCoven/demo/check-runs/7"
             })
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
@@ -2684,7 +2622,9 @@ exit 0
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
         assert!(
-            comment_posts.iter().any(|b| b.contains("Status: superseded")),
+            comment_posts
+                .iter()
+                .any(|b| b.contains("Status: superseded")),
             "status surface must say superseded: {comment_posts:?}"
         );
         assert!(
@@ -2703,16 +2643,19 @@ mod command_and_marker_tests {
     use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ORCHESTRATION: &str = "ghs_orchestration0000000000000000000000";
+    const AGENT_GIT: &str = "ghs_agentgit000000000000000000000000000";
+    const PUBLICATION: &str = "ghs_publication0000000000000000000000";
 
     fn fixed_minter() -> Minter {
-        Minter::Fixed(HashMap::from([(
-            TokenRole::Orchestration,
-            ORCHESTRATION.to_string(),
-        )]))
+        Minter::Fixed(HashMap::from([
+            (TokenRole::Orchestration, ORCHESTRATION.to_string()),
+            (TokenRole::AgentGit, AGENT_GIT.to_string()),
+            (TokenRole::Publication, PUBLICATION.to_string()),
+        ]))
     }
 
     fn config(api_base_url: String) -> Config {
@@ -2753,6 +2696,24 @@ mod command_and_marker_tests {
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         }
+    }
+
+    fn config_with_gardener(
+        api_base_url: String,
+        enabled: bool,
+        autonomy: &str,
+        draft_pr_label: Option<&str>,
+    ) -> Config {
+        let mut config = config(api_base_url);
+        config.gardener = coven_github_config::GardenerConfig {
+            enabled,
+            autonomy: autonomy.to_string(),
+            schedule: "0 4 * * *".to_string(),
+            exclude: vec!["keep/*".to_string()],
+            draft_pr_label: draft_pr_label.map(str::to_string),
+            repos: HashMap::new(),
+        };
+        config
     }
 
     fn task(kind: TaskKind, commander: Option<&str>) -> Task {
@@ -2860,10 +2821,11 @@ mod command_and_marker_tests {
     async fn below_write_commander_is_declined_before_any_work() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/OpenCoven/demo/collaborators/drive-by/permission"))
+            .and(path(
+                "/repos/OpenCoven/demo/collaborators/drive-by/permission",
+            ))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"permission": "read"})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"permission": "read"})),
             )
             .mount(&server)
             .await;
@@ -2916,30 +2878,98 @@ mod command_and_marker_tests {
             .find(|r| r.method.as_str() == "POST")
             .expect("decline should land on the status surface");
         let body = String::from_utf8_lossy(&posted.body);
-        assert!(
-            body.contains("Status: declined"),
-            "decline body: {body}"
-        );
+        assert!(body.contains("Status: declined"), "decline body: {body}");
         // The durable record stays honest: terminal, with the decline noted.
         let states = store.task_states().await.expect("states");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].1, "completed");
     }
 
+    fn repo_metadata_mock(default_branch: &str) -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "default_branch": default_branch })),
+            )
+    }
+
+    fn branch(name: &str, sha: &str, protected: bool) -> serde_json::Value {
+        serde_json::json!({ "name": name, "commit": { "sha": sha }, "protected": protected })
+    }
+
+    fn branches_mock(branches: Vec<serde_json::Value>) -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/branches"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(branches))
+    }
+
+    fn compare_mock(branch: &str, ahead: u64, behind: u64, authors: &[&str]) -> Mock {
+        let commits: Vec<_> = authors
+            .iter()
+            .map(|login| serde_json::json!({ "author": { "login": login } }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/OpenCoven/demo/compare/main...{branch}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ahead_by": ahead,
+                "behind_by": behind,
+                "commits": commits,
+            })))
+    }
+
+    fn pulls_by_head_mock(branch: &str, pulls: Vec<serde_json::Value>) -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/pulls"))
+            .and(query_param("state", "all"))
+            .and(query_param("head", format!("OpenCoven:{branch}")))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pulls))
+    }
+
+    fn pull(number: u64, state: &str, merged: bool) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "state": state,
+            "merged_at": if merged { serde_json::Value::String("2026-07-07T00:00:00Z".to_string()) } else { serde_json::Value::Null },
+            "draft": false,
+        })
+    }
+
+    fn branch_sha_mock(branch: &str, sha: &str) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/OpenCoven/demo/branches/{branch}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "commit": { "sha": sha } })),
+            )
+    }
+
+    async fn mount_report_comment_mocks(server: &MockServer, issue: u64) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/OpenCoven/demo/issues/{issue}/comments"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/repos/OpenCoven/demo/issues/{issue}/comments"
+            )))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn drive_by_garden_run_is_declined_before_stub() {
         let server = MockServer::start().await;
         permission_mock("drive-by", "read").mount(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
-            .mount(&server)
-            .await;
+        mount_report_comment_mocks(&server, 42).await;
 
         let store = Store::open_in_memory().expect("store");
         let garden = task(
@@ -2951,14 +2981,25 @@ mod command_and_marker_tests {
         .with_id("garden-task");
         seed(&store, "dl-garden-declined", &garden).await;
 
-        execute_task_with_minter(&config(server.uri()), store.clone(), garden, &fixed_minter())
-            .await
-            .expect("declined garden run is not an error");
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "prune-dead", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("declined garden run is not an error");
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert!(
             !requests.iter().any(|r| r.url.path().contains("check-runs")),
             "no Check Run may be created for a declined garden command"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.url.path() == "/repos/OpenCoven/demo"),
+            "the garden scan must not run below the gate"
         );
         let posted = requests
             .iter()
@@ -2967,8 +3008,8 @@ mod command_and_marker_tests {
         let body = String::from_utf8_lossy(&posted.body);
         assert!(body.contains("Status: declined"), "decline body: {body}");
         assert!(
-            !body.contains("accepted"),
-            "the garden stub must not run below the gate: {body}"
+            !body.contains("Branch Gardener"),
+            "the garden runner must not run below the gate: {body}"
         );
 
         let states: std::collections::HashMap<String, String> =
@@ -2980,16 +3021,7 @@ mod command_and_marker_tests {
     async fn maintainer_garden_run_posts_stub_without_check_run_or_session() {
         let server = MockServer::start().await;
         permission_mock("octocat", "write").mount(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
-            .mount(&server)
-            .await;
+        mount_report_comment_mocks(&server, 42).await;
 
         let store = Store::open_in_memory().expect("store");
         let garden = task(
@@ -3001,27 +3033,461 @@ mod command_and_marker_tests {
         .with_id("garden-task");
         seed(&store, "dl-garden", &garden).await;
 
-        execute_task_with_minter(&config(server.uri()), store.clone(), garden, &fixed_minter())
-            .await
-            .expect("garden stub should complete cleanly");
+        execute_task_with_minter(
+            &config(server.uri()),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("disabled gardener should complete cleanly");
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert!(
             !requests.iter().any(|r| r.url.path().contains("check-runs")),
-            "garden stub is adapter-only — no Check Run"
+            "garden is adapter-only — no Check Run"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.url.path() == "/repos/OpenCoven/demo"),
+            "disabled gardener must not scan the repo"
         );
         let posted = requests
             .iter()
             .find(|r| r.method.as_str() == "POST")
-            .expect("stub status should land on the report surface");
+            .expect("disabled status should land on the report surface");
         let body = String::from_utf8_lossy(&posted.body);
-        assert!(body.contains("Status: accepted"), "accepted status body: {body}");
-        assert!(body.contains("not implemented yet"), "stub must be honest: {body}");
+        assert!(body.contains("not enabled"), "disabled status body: {body}");
+        assert!(
+            body.contains("gardener"),
+            "body should point at gardener config: {body}"
+        );
 
         let states: std::collections::HashMap<String, String> =
             store.task_states().await.unwrap().into_iter().collect();
         assert_eq!(states["garden-task"], "completed");
     }
+
+    #[tokio::test]
+    async fn propose_garden_run_does_not_delete_dead_branches_and_surfaces_prless() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        mount_report_comment_mocks(&server, 42).await;
+        repo_metadata_mock("main").mount(&server).await;
+        branches_mock(vec![
+            branch("main", "sha-main", false),
+            branch("dead", "sha-dead", false),
+            branch("prless", "sha-prless", false),
+        ])
+        .mount(&server)
+        .await;
+        compare_mock("dead", 0, 0, &[]).mount(&server).await;
+        pulls_by_head_mock("dead", vec![]).mount(&server).await;
+        compare_mock("prless", 2, 0, &["alice", "bob"])
+            .mount(&server)
+            .await;
+        pulls_by_head_mock("prless", vec![]).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/pulls"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"number": 17})),
+            )
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-propose");
+        seed(&store, "dl-garden-propose", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "propose", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("propose garden run should complete");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "DELETE"),
+            "propose tier must not issue delete requests: {requests:?}"
+        );
+        let pr_post = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/repos/OpenCoven/demo/pulls")
+            .expect("prless branch should be surfaced as a draft PR");
+        let pr_body: serde_json::Value = serde_json::from_slice(&pr_post.body).expect("PR JSON");
+        assert_eq!(pr_body["draft"], true);
+        assert_eq!(pr_body["base"], "main");
+        assert_eq!(pr_body["head"], "prless");
+        let comment = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/42/comments"
+            })
+            .expect("report comment should be posted");
+        let body = String::from_utf8_lossy(&comment.body);
+        assert!(body.contains("Would prune"), "body: {body}");
+        assert!(body.contains("`dead`"), "body: {body}");
+        assert!(body.contains("draft PR #17"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn prune_dead_garden_run_deletes_dead_and_merged_but_not_active_or_prless() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        mount_report_comment_mocks(&server, 42).await;
+        repo_metadata_mock("main").mount(&server).await;
+        branches_mock(vec![
+            branch("main", "sha-main", false),
+            branch("dead", "sha-dead", false),
+            branch("merged", "sha-merged", false),
+            branch("active", "sha-active", false),
+            branch("prless", "sha-prless", false),
+        ])
+        .mount(&server)
+        .await;
+        compare_mock("dead", 0, 0, &[]).mount(&server).await;
+        pulls_by_head_mock("dead", vec![]).mount(&server).await;
+        compare_mock("merged", 0, 0, &[]).mount(&server).await;
+        pulls_by_head_mock("merged", vec![pull(7, "closed", true)])
+            .mount(&server)
+            .await;
+        compare_mock("active", 0, 1, &[]).mount(&server).await;
+        pulls_by_head_mock("active", vec![pull(8, "open", false)])
+            .mount(&server)
+            .await;
+        compare_mock("prless", 1, 0, &["alice"])
+            .mount(&server)
+            .await;
+        pulls_by_head_mock("prless", vec![]).mount(&server).await;
+        branch_sha_mock("dead", "sha-dead").mount(&server).await;
+        branch_sha_mock("merged", "sha-merged").mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/repos/OpenCoven/demo/git/refs/heads/dead"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/repos/OpenCoven/demo/git/refs/heads/merged"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/pulls"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"number": 18})),
+            )
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-prune");
+        seed(&store, "dl-garden-prune", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "prune-dead", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("prune garden run should complete");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let deleted: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![
+                "/repos/OpenCoven/demo/git/refs/heads/dead".to_string(),
+                "/repos/OpenCoven/demo/git/refs/heads/merged".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_sha_guard_skips_delete_and_counts_prune_skipped_moved() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        mount_report_comment_mocks(&server, 42).await;
+        repo_metadata_mock("main").mount(&server).await;
+        branches_mock(vec![
+            branch("main", "sha-main", false),
+            branch("dead", "sha-old", false),
+        ])
+        .mount(&server)
+        .await;
+        compare_mock("dead", 0, 0, &[]).mount(&server).await;
+        pulls_by_head_mock("dead", vec![]).mount(&server).await;
+        branch_sha_mock("dead", "sha-new").mount(&server).await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-moved");
+        seed(&store, "dl-garden-moved", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "prune-dead", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("moved SHA should not abort run");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "DELETE"),
+            "moved branch must not be deleted"
+        );
+        let comment = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/42/comments"
+            })
+            .expect("report comment should be posted");
+        let body = String::from_utf8_lossy(&comment.body);
+        assert!(body.contains("| prune-skipped-moved | 1 |"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn prless_branch_opens_draft_pr_and_applies_configured_label() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        mount_report_comment_mocks(&server, 42).await;
+        repo_metadata_mock("main").mount(&server).await;
+        branches_mock(vec![
+            branch("main", "sha-main", false),
+            branch("prless", "sha-prless", false),
+        ])
+        .mount(&server)
+        .await;
+        compare_mock("prless", 3, 0, &["alice", "bob", "carol"])
+            .mount(&server)
+            .await;
+        pulls_by_head_mock("prless", vec![]).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/pulls"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"number": 17})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/17/labels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-surface");
+        seed(&store, "dl-garden-surface", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "propose", Some("branch-gardener")),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("surface garden run should complete");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let pr_post = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/repos/OpenCoven/demo/pulls")
+            .expect("draft PR should be opened");
+        let pr_body: serde_json::Value = serde_json::from_slice(&pr_post.body).expect("PR JSON");
+        assert_eq!(pr_body["draft"], true);
+        assert_eq!(pr_body["base"], "main");
+        assert_eq!(pr_body["title"], "Surface branch prless");
+        assert!(
+            pr_body["body"]
+                .as_str()
+                .unwrap()
+                .contains("3 commit(s) ahead"),
+            "PR body: {pr_body}"
+        );
+        let labels = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/17/labels"
+            })
+            .expect("configured label should be applied to new PR");
+        let label_body: serde_json::Value =
+            serde_json::from_slice(&labels.body).expect("labels JSON");
+        assert_eq!(label_body["labels"], serde_json::json!(["branch-gardener"]));
+    }
+
+    #[tokio::test]
+    async fn bot_only_prless_branch_is_skipped_without_opening_pr() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        mount_report_comment_mocks(&server, 42).await;
+        repo_metadata_mock("main").mount(&server).await;
+        branches_mock(vec![
+            branch("main", "sha-main", false),
+            branch("bot-only", "sha-bot", false),
+        ])
+        .mount(&server)
+        .await;
+        compare_mock("bot-only", 2, 0, &["dependabot[bot]", "renovate[bot]"])
+            .mount(&server)
+            .await;
+        pulls_by_head_mock("bot-only", vec![]).mount(&server).await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-bot-only");
+        seed(&store, "dl-garden-bot-only", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "propose", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("bot-only run should complete");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/pulls"),
+            "bot-only prless branch must not be surfaced"
+        );
+        let comment = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/42/comments"
+            })
+            .expect("report comment should be posted");
+        let body = String::from_utf8_lossy(&comment.body);
+        assert!(body.contains("bot-only-prless"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn scheduled_garden_run_posts_no_comment_and_finishes_with_real_summary() {
+        let server = MockServer::start().await;
+        repo_metadata_mock("main").mount(&server).await;
+        branches_mock(vec![branch("main", "sha-main", false)])
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden =
+            task(TaskKind::GardenRun { report_issue: None }, None).with_id("garden-scheduled");
+        seed(&store, "dl-garden-scheduled", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "propose", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("scheduled garden run should complete");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("/issues/")),
+            "scheduled gardener runs must not upsert status comments"
+        );
+        let states: std::collections::HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["garden-scheduled"], "completed");
+    }
+
+    #[tokio::test]
+    async fn scan_failure_marks_task_failed_and_posts_failure_comment_without_deletes() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "write").mount(&server).await;
+        mount_report_comment_mocks(&server, 42).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let store = Store::open_in_memory().expect("store");
+        let garden = task(
+            TaskKind::GardenRun {
+                report_issue: Some(42),
+            },
+            Some("octocat"),
+        )
+        .with_id("garden-scan-failure");
+        seed(&store, "dl-garden-scan-failure", &garden).await;
+
+        execute_task_with_minter(
+            &config_with_gardener(server.uri(), true, "prune-dead", None),
+            store.clone(),
+            garden,
+            &fixed_minter(),
+        )
+        .await
+        .expect("scan failure should be recorded, not propagated");
+
+        let states: std::collections::HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["garden-scan-failure"], "failed");
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "DELETE"),
+            "scan failure must not delete branches"
+        );
+        let comment = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/repos/OpenCoven/demo/issues/42/comments"
+            })
+            .expect("failure comment should be posted");
+        let body = String::from_utf8_lossy(&comment.body);
+        assert!(body.contains("Status: failed"), "body: {body}");
+        assert!(body.contains("scan failed"), "body: {body}");
+    }
+
     async fn seed(store: &Store, delivery_id: &str, task: &Task) {
         store
             .record_delivery(
@@ -3091,9 +3557,14 @@ mod command_and_marker_tests {
             .with_id("cancel-task");
         seed(&store, "dl-c", &cancel).await;
 
-        execute_task_with_minter(&config(server.uri()), store.clone(), cancel, &fixed_minter())
-            .await
-            .expect("declined cancel is not an error");
+        execute_task_with_minter(
+            &config(server.uri()),
+            store.clone(),
+            cancel,
+            &fixed_minter(),
+        )
+        .await
+        .expect("declined cancel is not an error");
 
         let states: std::collections::HashMap<String, String> =
             store.task_states().await.unwrap().into_iter().collect();
@@ -3124,9 +3595,14 @@ mod command_and_marker_tests {
             task(TaskKind::CancelReviews { pr_number: 88 }, Some("octocat")).with_id("cancel-task");
         seed(&store, "dl-c", &cancel).await;
 
-        execute_task_with_minter(&config(server.uri()), store.clone(), cancel, &fixed_minter())
-            .await
-            .expect("cancel should succeed");
+        execute_task_with_minter(
+            &config(server.uri()),
+            store.clone(),
+            cancel,
+            &fixed_minter(),
+        )
+        .await
+        .expect("cancel should succeed");
 
         let states: std::collections::HashMap<String, String> =
             store.task_states().await.unwrap().into_iter().collect();
@@ -3275,7 +3751,9 @@ mod publication_gate_tests {
             .mount(&server)
             .await;
 
-        let script = format!("#!/usr/bin/env bash\ncat > \"$5\" <<'RESULT'\n{RESULT_JSON}\nRESULT\nexit 0\n");
+        let script = format!(
+            "#!/usr/bin/env bash\ncat > \"$5\" <<'RESULT'\n{RESULT_JSON}\nRESULT\nexit 0\n"
+        );
         let root =
             std::env::temp_dir().join(format!("coven-github-gates-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("test dir");
@@ -3353,7 +3831,10 @@ mod publication_gate_tests {
         requests
     }
 
-    fn policy(min_severity: Option<&str>, publish: Option<&str>) -> coven_github_config::ReviewConfig {
+    fn policy(
+        min_severity: Option<&str>,
+        publish: Option<&str>,
+    ) -> coven_github_config::ReviewConfig {
         coven_github_config::ReviewConfig {
             familiar: Some("cody".to_string()),
             pull_request: true,
@@ -3371,13 +3852,15 @@ mod publication_gate_tests {
         let terminal = requests
             .iter()
             .filter(|r| {
-                r.method.as_str() == "PATCH"
-                    && r.url.path() == "/repos/OpenCoven/demo/check-runs/7"
+                r.method.as_str() == "PATCH" && r.url.path() == "/repos/OpenCoven/demo/check-runs/7"
             })
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .next_back()
             .expect("terminal check patch");
-        assert!(terminal.contains("Off-by-one"), "digest published: {terminal}");
+        assert!(
+            terminal.contains("Off-by-one"),
+            "digest published: {terminal}"
+        );
         assert!(
             !terminal.contains("Speculative"),
             "out-of-scope finding must be withheld: {terminal}"
@@ -3411,7 +3894,10 @@ mod publication_gate_tests {
             .expect("PR review must be submitted");
         let body = String::from_utf8_lossy(&review_post.body);
         assert!(body.contains("REQUEST_CHANGES"), "verdict: {body}");
-        assert!(body.contains("Off-by-one"), "digest in verdict body: {body}");
+        assert!(
+            body.contains("Off-by-one"),
+            "digest in verdict body: {body}"
+        );
         // The verdict is write-authority work: publication token, never
         // orchestration (issue #4 boundary).
         let auth = review_post
