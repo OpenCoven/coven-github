@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Contract-conformant stand-in for `coven-code --headless` (demo, issue #19).
+
+Speaks headless contract v2 (`docs/headless-contract.md`): reads the tokenless
+session brief from `--context`, writes the structured result envelope to
+`--output`, and exits 0. Instead of running a real agent session, it fabricates
+a small, plausible fix in the familiar's voice so the adapter's publication
+path (Check Run, status comment, draft PR) can be demonstrated offline.
+
+It also proves two security invariants of the real integration on every run:
+
+  * the brief is tokenless — no credential material appears in the JSON;
+  * git authority arrives only via the COVEN_GIT_TOKEN environment variable.
+"""
+
+import json
+import os
+import sys
+
+
+def parse_args(argv):
+    args = {"headless": False, "context": None, "output": None}
+    it = iter(argv)
+    for arg in it:
+        if arg == "--headless":
+            args["headless"] = True
+        elif arg == "--context":
+            args["context"] = next(it, None)
+        elif arg == "--output":
+            args["output"] = next(it, None)
+    if not (args["headless"] and args["context"] and args["output"]):
+        sys.exit("usage: fake-coven-code --headless --context BRIEF --output RESULT")
+    return args
+
+
+def no_review():
+    return {
+        "mode": "none",
+        "evidence_status": "not_applicable",
+        "reviewed_files": [],
+        "supporting_files": [],
+        "findings": [],
+        "tests_run": [
+            {
+                "command": "cargo test -p auth refresh",
+                "status": "passed",
+                "output_summary": "9/9 passing",
+            }
+        ],
+        "no_findings_reason": None,
+        "limitations": [],
+    }
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+    with open(args["context"], encoding="utf-8") as f:
+        raw_brief = f.read()
+    brief = json.loads(raw_brief)
+
+    if brief.get("contract_version") != "2":
+        sys.exit(f"unsupported brief contract_version: {brief.get('contract_version')}")
+
+    # Invariant checks (issue #4): tokenless brief, env-injected git authority.
+    git_token = os.environ.get("COVEN_GIT_TOKEN", "")
+    if not git_token:
+        sys.exit("COVEN_GIT_TOKEN missing — the worker must inject git authority")
+    if git_token in raw_brief:
+        sys.exit("SECURITY: git token leaked into the session brief")
+    print(
+        "fake-coven-code: brief is tokenless; git authority arrived via env only",
+        file=sys.stderr,
+    )
+
+    familiar = brief["familiar"]["display_name"]
+    task = brief["task"]
+    kind = task["kind"]
+
+    if kind == "fix_issue":
+        number = task["issue_number"]
+        branch = f"cody/fix-issue-{number}"
+        summary = (
+            f"Fixed the OAuth token refresh by adding a 60-second "
+            f"clock-skew buffer (issue #{number})."
+        )
+        pr_body = (
+            f"## Hey, I'm {familiar} \U0001f43e\n\n"
+            f"Issue #{number} traced to the OAuth refresh path not accounting "
+            f"for clock skew between the client and the auth server. I added a "
+            f"60-second buffer to the expiry check and regression tests for "
+            f"both skew directions.\n\n"
+            f"**Changed:** `src/auth/refresh.rs` (+14 / -3)\n"
+            f"**Tests:** 9/9 passing (2 new regression cases)\n\n"
+            f"I kept the diff scoped to the refresh path; the token store "
+            f"itself is untouched. Shout if you want the buffer configurable."
+        )
+        commits = [
+            {
+                "sha": "f1e2d3c4b5a6",
+                "message": f"fix: add clock-skew buffer to OAuth refresh (#{number})",
+            }
+        ]
+        files = ["src/auth/refresh.rs", "src/auth/refresh_test.rs"]
+    elif kind == "address_review_comment":
+        number = task["pr_number"]
+        branch = f"cody/pr-{number}-feedback"
+        summary = f"Addressed review feedback on PR #{number}."
+        pr_body = (
+            f"## {familiar} here \U0001f43e\n\n"
+            f"Follow-up for the review feedback on #{number} — renamed the "
+            f"helper and added the missing error-path test."
+        )
+        commits = [
+            {"sha": "0a1b2c3d4e5f", "message": "refactor: address review feedback"}
+        ]
+        files = ["src/auth/refresh.rs"]
+    else:
+        sys.exit(f"demo runtime does not handle task kind: {kind}")
+
+    result = {
+        "contract_version": "2",
+        "status": "success",
+        "branch": branch,
+        "commits": commits,
+        "files_changed": files,
+        "summary": summary,
+        "pr_body": pr_body,
+        "review": no_review(),
+        "exit_reason": None,
+    }
+    with open(args["output"], "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    print(f"fake-coven-code: wrote result for {kind} -> {branch}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
