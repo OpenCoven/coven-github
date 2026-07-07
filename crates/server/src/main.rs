@@ -132,6 +132,26 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // Task-history retention sweep (issue #12): expire terminal tasks
+            // older than the configured horizon; in-flight work is never touched.
+            if let Some(retention_days) = config.storage.task_retention_days {
+                let sweep_store = store.clone();
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                    loop {
+                        ticker.tick().await;
+                        match sweep_store.expire_terminal_tasks(retention_days).await {
+                            Ok(0) => {}
+                            Ok(expired) => {
+                                tracing::info!(expired, "expired terminal task rows past retention")
+                            }
+                            Err(e) => tracing::error!("task retention sweep failed: {e:#}"),
+                        }
+                    }
+                });
+            }
+
             // Build router.
             let state = AppState {
                 config: config.clone(),

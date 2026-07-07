@@ -108,4 +108,4 @@ Before accepting paid hosted customers, the service should have:
 - Worker timeout enforcement.
 - Containerized or sandboxed worker execution.
 - Secret redaction tests.
-- A documented data retention policy.
+- A documented data retention policy — see [Data retention, artifacts, and audit](data-retention.md).

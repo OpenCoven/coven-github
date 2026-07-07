@@ -3541,3 +3541,109 @@ mod cleanup_tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(test)]
+mod audit_redaction_tests {
+    use super::*;
+    use coven_github_api::{
+        CommitInfo, ReviewResult, SessionResult, SessionStatus, Task, TaskKind,
+        HEADLESS_CONTRACT_VERSION,
+    };
+    use coven_github_store::{Delivery, Routing, Store, Terminal, TerminalState};
+
+    const TOKEN: &str = "ghs_realTOKENrealTOKENrealTOKEN01";
+
+    fn result_smeared_with_token() -> SessionResult {
+        SessionResult {
+            contract_version: HEADLESS_CONTRACT_VERSION.to_string(),
+            status: SessionStatus::Success,
+            branch: Some(format!("cody/leak-{TOKEN}")),
+            commits: vec![CommitInfo {
+                sha: "abc".to_string(),
+                message: format!("commit mentioning {TOKEN}"),
+            }],
+            files_changed: vec![],
+            summary: format!("summary with {TOKEN} inside"),
+            pr_body: format!("pr body quoting {TOKEN}"),
+            review: ReviewResult::none(),
+            exit_reason: None,
+            memory_used: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_raw_token_survives_in_durable_stores() {
+        // Sanity: the raw result really does carry the token, so the assertions
+        // below are not vacuous — and the pattern scanner detects it.
+        let raw = result_smeared_with_token();
+        assert!(raw.summary.contains(TOKEN));
+        assert_ne!(redact::redact(&raw.summary, &[]), raw.summary);
+
+        // The worker sanitizes the envelope before anything is persisted.
+        let mut result = result_smeared_with_token();
+        redact::sanitize_result(&mut result, &[TOKEN]);
+
+        let store = Store::open_in_memory().unwrap();
+        let task = Task {
+            id: "t1".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+            },
+        };
+        store
+            .record_delivery(
+                Delivery {
+                    delivery_id: "d1".to_string(),
+                    event: "issues".to_string(),
+                    action: Some("assigned".to_string()),
+                    installation_id: Some(1),
+                    repo: Some("OpenCoven/demo".to_string()),
+                    payload_hash: "h".to_string(),
+                },
+                Routing::Task(&task),
+            )
+            .await
+            .unwrap();
+        store.claim_next(&Default::default()).await.unwrap();
+        // Persist terminal state exactly as the worker does: summary/branch from
+        // the sanitized envelope, detail through redact.
+        store
+            .finish(
+                "t1",
+                Terminal {
+                    state: TerminalState::Completed,
+                    result_status: Some("success".to_string()),
+                    branch: result.branch.clone(),
+                    pr_number: None,
+                    summary: Some(result.summary.clone()),
+                    detail: Some(redact::redact(&format!("error leaked {TOKEN}"), &[TOKEN])),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Scan every adapter-generated durable text field.
+        let stored = store.all_stored_text().await.unwrap();
+        assert!(!stored.is_empty());
+        for value in &stored {
+            assert!(!value.contains(TOKEN), "raw token leaked into store: {value}");
+            assert_eq!(
+                redact::redact(value, &[]),
+                *value,
+                "a token pattern survived into a durable artifact: {value}"
+            );
+        }
+        // Redaction actually happened (not just an empty store).
+        assert!(
+            stored.iter().any(|v| v.contains(redact::REDACTED)),
+            "expected redacted markers in the stored artifacts"
+        );
+    }
+}
