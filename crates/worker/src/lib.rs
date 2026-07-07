@@ -3,7 +3,6 @@
 use anyhow::Result;
 use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use coven_github_api::{
@@ -13,6 +12,7 @@ use coven_github_api::{
 use coven_github_config::{Config, FamiliarConfig};
 use coven_github_store::{Store, Terminal, TerminalState};
 
+pub mod backend;
 pub mod brief;
 pub mod findings;
 pub mod memory;
@@ -783,15 +783,16 @@ async fn run_and_publish(
     let brief = brief::build(
         task,
         familiar,
-        workspace,
+        // The brief travels into the sandbox: reference the workspace as the
+        // runtime will see it (issue #5).
+        &backend::Backend::from_config(&config.worker).workspace_view(workspace),
         &targets.default_branch,
         review.as_ref(),
         memory_policy
             .as_ref()
             .map(|p| serde_json::to_value(p).expect("memory policy serializes")),
     );
-    let brief_path = workspace.join("session-brief.json");
-    let result_path = workspace.join("result.json");
+    let brief_path = workspace.join(backend::BRIEF_FILE);
     let brief_json = serde_json::to_string_pretty(&brief)?;
     // Belt-and-braces on top of the serialization guard test: refuse to hand
     // the agent a brief that somehow embeds a live credential.
@@ -847,8 +848,8 @@ async fn run_and_publish(
     // retried; exit 1 (gave up) and exit 3 (needs input) are terminal.
     let mut result = run_session(
         config,
-        &brief_path,
-        &result_path,
+        workspace,
+        &task.id,
         &agent_git,
         config.worker.max_retries,
     )
@@ -1138,15 +1139,15 @@ enum Attempt {
 
 async fn run_session(
     config: &Config,
-    brief_path: &Path,
-    result_path: &Path,
+    workspace: &Path,
+    task_id: &str,
     git_token: &str,
     max_retries: u32,
 ) -> Result<SessionResult> {
     run_session_with_backoff(
         config,
-        brief_path,
-        result_path,
+        workspace,
+        task_id,
         git_token,
         max_retries,
         RETRY_BACKOFF_BASE,
@@ -1160,15 +1161,15 @@ async fn run_session(
 /// retry boundary is exit 2 / timeout / signal, never exit 1 or 3.
 async fn run_session_with_backoff(
     config: &Config,
-    brief_path: &Path,
-    result_path: &Path,
+    workspace: &Path,
+    task_id: &str,
     git_token: &str,
     max_retries: u32,
     backoff_base: Duration,
 ) -> Result<SessionResult> {
     let mut attempts = 0u32;
     loop {
-        match run_coven_code(config, brief_path, result_path, git_token).await {
+        match run_coven_code(config, workspace, task_id, git_token).await {
             Attempt::Completed(result) => return Ok(*result),
             Attempt::RetrySafe(e) if attempts < max_retries => {
                 attempts += 1;
@@ -1180,63 +1181,57 @@ async fn run_session_with_backoff(
     }
 }
 
+/// Runs one session attempt through the configured backend (issue #5) and
+/// classifies the outcome per the exit-code contract
+/// (`docs/headless-contract.md` §4).
 async fn run_coven_code(
     config: &Config,
-    brief_path: &Path,
-    result_path: &Path,
+    workspace: &Path,
+    task_id: &str,
     git_token: &str,
 ) -> Attempt {
-    let child = Command::new(&config.worker.coven_code_bin)
-        .arg("--headless")
-        .arg("--context")
-        .arg(brief_path)
-        .arg("--output")
-        .arg(result_path)
-        // Git auth is injected via the environment, never written to the
-        // session brief or any durable artifact (issue #4).
-        .env("COVEN_GIT_TOKEN", git_token)
-        .spawn();
-
-    let mut child = match child {
-        Ok(child) => child,
-        Err(e) => return Attempt::RetrySafe(anyhow::anyhow!("failed to spawn coven-code: {e}")),
-    };
-
-    let status = match tokio::time::timeout(
-        Duration::from_secs(config.worker.timeout_secs),
-        child.wait(),
-    )
-    .await
+    let backend = backend::Backend::from_config(&config.worker);
+    let result_path = workspace.join(backend::RESULT_FILE);
+    match backend
+        .run(&config.worker, workspace, task_id, git_token)
+        .await
     {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
-            return Attempt::RetrySafe(anyhow::anyhow!("failed to await coven-code: {e}"))
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Attempt::RetrySafe(anyhow::anyhow!(
-                "coven-code timed out after {} seconds",
-                config.worker.timeout_secs
-            ));
-        }
-    };
-
-    match status.code() {
         // Terminal outcomes. result.json MUST be present and parseable for these
         // exit codes; if it isn't, the runtime misbehaved — fall back to a
         // retry-safe failure rather than silently losing the task.
-        Some(code @ (0 | 1 | 3)) => match read_result(result_path).await {
-            Ok(result) => Attempt::Completed(Box::new(result)),
-            Err(e) => Attempt::RetrySafe(anyhow::anyhow!(
-                "coven-code exited {code} but result.json was unusable: {e}"
-            )),
-        },
-        Some(2) => Attempt::RetrySafe(anyhow::anyhow!("coven-code infra error (exit 2)")),
-        Some(code) => Attempt::RetrySafe(anyhow::anyhow!(
-            "coven-code exited with unexpected code {code}"
+        backend::LaunchOutcome::Exited(Some(code @ (0 | 1 | 3))) => {
+            match read_result(&result_path).await {
+                Ok(result) => Attempt::Completed(Box::new(result)),
+                Err(e) => Attempt::RetrySafe(anyhow::anyhow!(
+                    "coven-code exited {code} but result.json was unusable: {e}"
+                )),
+            }
+        }
+        backend::LaunchOutcome::Exited(Some(2)) => {
+            Attempt::RetrySafe(anyhow::anyhow!("coven-code infra error (exit 2)"))
+        }
+        backend::LaunchOutcome::Exited(Some(code)) => {
+            // Resource-limit terminations must be visible in failure states
+            // (issue #5): name the sandbox explanation when there is one.
+            match backend.explains_kill(code) {
+                Some(reason) => Attempt::RetrySafe(anyhow::anyhow!(
+                    "coven-code exited with unexpected code {code}: {reason}"
+                )),
+                None => Attempt::RetrySafe(anyhow::anyhow!(
+                    "coven-code exited with unexpected code {code}"
+                )),
+            }
+        }
+        backend::LaunchOutcome::Exited(None) => {
+            Attempt::RetrySafe(anyhow::anyhow!("coven-code killed by signal"))
+        }
+        backend::LaunchOutcome::TimedOut => Attempt::RetrySafe(anyhow::anyhow!(
+            "coven-code timed out after {} seconds",
+            config.worker.timeout_secs
         )),
-        None => Attempt::RetrySafe(anyhow::anyhow!("coven-code killed by signal")),
+        backend::LaunchOutcome::Failed(message) => {
+            Attempt::RetrySafe(anyhow::anyhow!("{message}"))
+        }
     }
 }
 
@@ -1892,6 +1887,9 @@ mod disposition_tests {
                 workspace_root: PathBuf::from("/tmp/coven-github-test"),
                 timeout_secs: 30,
                 max_retries: 1,
+            backend: coven_github_config::WorkerBackendKind::Host,
+            container: coven_github_config::ContainerConfig::default(),
+            allow_host_backend: false,
             },
             familiars: vec![],
             review: coven_github_config::ReviewConfig::default(),
@@ -2011,6 +2009,9 @@ mod process_tests {
                 // The timeout test overrides this to a short value on purpose.
                 timeout_secs: 30,
                 max_retries,
+                backend: coven_github_config::WorkerBackendKind::Host,
+                container: coven_github_config::ContainerConfig::default(),
+                allow_host_backend: false,
             },
             familiars: vec![FamiliarConfig {
                 id: "cody".to_string(),
@@ -2055,11 +2056,10 @@ mod process_tests {
         // This test specifically exercises the kill-on-timeout path.
         config.worker.timeout_secs = 1;
         let brief_path = root.join("session-brief.json");
-        let result_path = root.join("result.json");
         fs::write(&brief_path, "{}").expect("brief should be written");
 
         let started = Instant::now();
-        let attempt = run_coven_code(&config, &brief_path, &result_path, "test-token").await;
+        let attempt = run_coven_code(&config, &root, "task-timeout", "test-token").await;
 
         assert!(matches!(attempt, Attempt::RetrySafe(_)));
         assert!(
@@ -2077,10 +2077,9 @@ mod process_tests {
         let (root, path) = scratch("exit0", &script);
         let config = test_config(path, root.clone(), 0);
         let brief = root.join("session-brief.json");
-        let result = root.join("result.json");
         fs::write(&brief, "{}").unwrap();
 
-        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        let attempt = run_coven_code(&config, &root, "task-x", "tok").await;
         match attempt {
             Attempt::Completed(r) => assert_eq!(r.status, SessionStatus::Success),
             Attempt::RetrySafe(e) => panic!("expected Completed, got RetrySafe: {e:#}"),
@@ -2095,10 +2094,9 @@ mod process_tests {
         let (root, path) = scratch("exit3", &script);
         let config = test_config(path, root.clone(), 0);
         let brief = root.join("session-brief.json");
-        let result = root.join("result.json");
         fs::write(&brief, "{}").unwrap();
 
-        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        let attempt = run_coven_code(&config, &root, "task-x", "tok").await;
         match attempt {
             Attempt::Completed(r) => assert_eq!(r.status, SessionStatus::NeedsInput),
             Attempt::RetrySafe(e) => panic!("exit 3 must be terminal, got RetrySafe: {e:#}"),
@@ -2111,10 +2109,9 @@ mod process_tests {
         let (root, path) = scratch("exit2", "#!/usr/bin/env bash\nexit 2\n");
         let config = test_config(path, root.clone(), 0);
         let brief = root.join("session-brief.json");
-        let result = root.join("result.json");
         fs::write(&brief, "{}").unwrap();
 
-        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        let attempt = run_coven_code(&config, &root, "task-x", "tok").await;
         assert!(matches!(attempt, Attempt::RetrySafe(_)));
         let _ = fs::remove_dir_all(root);
     }
@@ -2130,13 +2127,12 @@ mod process_tests {
         let (root, path) = scratch("exit1", &script);
         let config = test_config(path, root.clone(), 2); // budget of 2 retries
         let brief = root.join("session-brief.json");
-        let result = root.join("result.json");
         fs::write(&brief, "{}").unwrap();
 
         let session = run_session_with_backoff(
             &config,
-            &brief,
-            &result,
+            &root,
+            "task-x",
             "tok",
             config.worker.max_retries,
             Duration::from_millis(1),
@@ -2163,13 +2159,12 @@ mod process_tests {
         let (root, path) = scratch("exit2-retries", &script);
         let config = test_config(path, root.clone(), 2);
         let brief = root.join("session-brief.json");
-        let result = root.join("result.json");
         fs::write(&brief, "{}").unwrap();
 
         let err = run_session_with_backoff(
             &config,
-            &brief,
-            &result,
+            &root,
+            "task-x",
             "tok",
             config.worker.max_retries,
             Duration::from_millis(1),
@@ -2193,10 +2188,9 @@ mod process_tests {
         let (root, path) = scratch("exit0-noresult", "#!/usr/bin/env bash\nexit 0\n");
         let config = test_config(path, root.clone(), 0);
         let brief = root.join("session-brief.json");
-        let result = root.join("result.json");
         fs::write(&brief, "{}").unwrap();
 
-        let attempt = run_coven_code(&config, &brief, &result, "tok").await;
+        let attempt = run_coven_code(&config, &root, "task-x", "tok").await;
         assert!(matches!(attempt, Attempt::RetrySafe(_)));
         let _ = fs::remove_dir_all(root);
     }
@@ -2294,6 +2288,9 @@ exit 0
                 workspace_root: root.clone(),
                 timeout_secs: 30,
                 max_retries: 0,
+            backend: coven_github_config::WorkerBackendKind::Host,
+            container: coven_github_config::ContainerConfig::default(),
+            allow_host_backend: false,
             },
             familiars: vec![familiar.clone()],
             review: coven_github_config::ReviewConfig::default(),
@@ -2518,6 +2515,9 @@ exit 0
                 workspace_root: root.clone(),
                 timeout_secs: 30,
                 max_retries: 0,
+            backend: coven_github_config::WorkerBackendKind::Host,
+            container: coven_github_config::ContainerConfig::default(),
+            allow_host_backend: false,
             },
             familiars: vec![FamiliarConfig {
                 id: "cody".to_string(),
@@ -2654,6 +2654,9 @@ mod command_and_marker_tests {
                 workspace_root: PathBuf::from("/nonexistent/workspaces"),
                 timeout_secs: 1,
                 max_retries: 0,
+            backend: coven_github_config::WorkerBackendKind::Host,
+            container: coven_github_config::ContainerConfig::default(),
+            allow_host_backend: false,
             },
             familiars: vec![FamiliarConfig {
                 id: "cody".to_string(),
@@ -3119,6 +3122,9 @@ mod publication_gate_tests {
                 workspace_root: root.clone(),
                 timeout_secs: 30,
                 max_retries: 0,
+            backend: coven_github_config::WorkerBackendKind::Host,
+            container: coven_github_config::ContainerConfig::default(),
+            allow_host_backend: false,
             },
             familiars: vec![FamiliarConfig {
                 id: "cody".to_string(),
@@ -3156,6 +3162,12 @@ mod publication_gate_tests {
         )
         .await
         .expect("review must publish cleanly");
+
+        // Success path: the per-task workspace is destroyed (issue #5).
+        assert!(
+            !root.join("task-gates").exists(),
+            "workspace must be removed after a successful run"
+        );
 
         let requests = server.received_requests().await.expect("requests");
         let _ = fs::remove_dir_all(root);
@@ -3249,6 +3261,284 @@ mod publication_gate_tests {
                 .any(|b| b.contains("Status: done") && b.contains("Off-by-one")),
             "advisory digest must ride the status comment: {comment_bodies:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod container_backend_tests {
+    //! Container backend behavior through a fake docker CLI (issue #5): the
+    //! isolation argv is used, the token travels by environment only, the
+    //! result copies out of the bind-mounted workspace, and timeout kills
+    //! the container by name.
+    use super::*;
+    use coven_github_config::{ContainerConfig, WorkerBackendKind};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// Fake docker: records argv + the forwarded token env, then emulates a
+    /// session by writing result.json into the `-v host:/workspace` mount.
+    const FAKE_DOCKER: &str = r#"#!/usr/bin/env bash
+dir="$(dirname "$0")"
+printf '%s\n' "$*" >> "$dir/docker-invocations.log"
+printf '%s\n' "${COVEN_GIT_TOKEN:-unset}" >> "$dir/docker-env.log"
+if [ "$1" = "kill" ]; then exit 0; fi
+host=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-v" ]; then host="${arg%%:*}"; fi
+  prev="$arg"
+done
+cat > "$host/result.json" <<'RESULT'
+{"contract_version":"2","status":"success","branch":null,"commits":[],"files_changed":[],"summary":"containerized run","pr_body":"","review":{"mode":"none","evidence_status":"not_applicable","reviewed_files":[],"supporting_files":[],"findings":[],"tests_run":[],"no_findings_reason":null,"limitations":[]},"exit_reason":null,"memory_used":null}
+RESULT
+exit 0
+"#;
+
+    fn scratch(name: &str, script: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("coven-container-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("dir");
+        let bin = root.join("fake-docker.sh");
+        fs::write(&bin, script).expect("script");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+        (root, bin)
+    }
+
+    fn container_config(docker_bin: PathBuf, workspace_root: PathBuf) -> Config {
+        let mut config = test_container_base(workspace_root);
+        config.worker.backend = WorkerBackendKind::Container;
+        config.worker.container = ContainerConfig {
+            docker_bin,
+            ..ContainerConfig::default()
+        };
+        config
+    }
+
+    fn test_container_base(workspace_root: PathBuf) -> Config {
+        use coven_github_config::{GitHubAppConfig, ServerConfig, WorkerConfig};
+        Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("private.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: None,
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: PathBuf::from("/nonexistent/never-used-in-container-mode"),
+                workspace_root,
+                timeout_secs: 30,
+                max_retries: 0,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: false,
+            },
+            familiars: vec![],
+            review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn container_run_uses_the_isolation_profile_and_env_only_token() {
+        let (root, docker) = scratch("run", FAKE_DOCKER);
+        let workspace = root.join("ws");
+        fs::create_dir_all(&workspace).expect("ws");
+        let config = container_config(docker, root.clone());
+
+        let attempt = run_coven_code(&config, &workspace, "task-c1", "secret-git-token").await;
+        match attempt {
+            Attempt::Completed(result) => assert_eq!(result.summary, "containerized run"),
+            Attempt::RetrySafe(e) => panic!("expected completion, got {e:#}"),
+        }
+
+        let argv = fs::read_to_string(root.join("docker-invocations.log")).expect("argv log");
+        assert!(argv.contains("--read-only"), "hardened profile used: {argv}");
+        assert!(argv.contains("--cap-drop ALL"), "{argv}");
+        assert!(argv.contains("--memory 2g"), "{argv}");
+        assert!(
+            !argv.contains("secret-git-token"),
+            "the git token must never appear in docker argv: {argv}"
+        );
+        let env = fs::read_to_string(root.join("docker-env.log")).expect("env log");
+        assert!(
+            env.contains("secret-git-token"),
+            "the token must reach the CLI environment for -e forwarding: {env}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn container_timeout_kills_the_container_by_name() {
+        // This fake docker never writes a result and sleeps past the timeout.
+        let sleeper = r#"#!/usr/bin/env bash
+dir="$(dirname "$0")"
+printf '%s\n' "$*" >> "$dir/docker-invocations.log"
+if [ "$1" = "kill" ]; then exit 0; fi
+sleep 5
+"#;
+        let (root, docker) = scratch("timeout", sleeper);
+        let workspace = root.join("ws");
+        fs::create_dir_all(&workspace).expect("ws");
+        let mut config = container_config(docker, root.clone());
+        config.worker.timeout_secs = 1;
+
+        let started = std::time::Instant::now();
+        let attempt = run_coven_code(&config, &workspace, "task-c2", "tok").await;
+        assert!(matches!(attempt, Attempt::RetrySafe(_)));
+        assert!(started.elapsed().as_secs() < 4, "must stop near the timeout");
+
+        let argv = fs::read_to_string(root.join("docker-invocations.log")).expect("argv log");
+        assert!(
+            argv.lines().any(|l| l.starts_with("kill coven-task-task-c2-")),
+            "the container must be killed by name after timeout: {argv}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    //! Workspace teardown on the failure path (issue #5). The success path is
+    //! asserted inside `publication_gate_tests::run_review`.
+    use super::*;
+    use coven_github_api::installation::TokenRole;
+    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn workspace_is_destroyed_when_the_session_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commit": { "sha": "abc123" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/check-runs"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 7})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/OpenCoven/demo/check-runs/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/OpenCoven/demo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        // Infra failure (exit 2) with a zero retry budget: the session errors.
+        let root =
+            std::env::temp_dir().join(format!("coven-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("dir");
+        let script = root.join("fake-coven-code.sh");
+        fs::write(&script, "#!/usr/bin/env bash\nexit 2\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let config = Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                cave_base_url: None,
+            },
+            github: GitHubAppConfig {
+                app_id: 1,
+                private_key_path: PathBuf::from("/nonexistent/never-read.pem"),
+                webhook_secret: "secret".to_string(),
+                api_base_url: Some(server.uri()),
+            },
+            worker: WorkerConfig {
+                concurrency: 1,
+                coven_code_bin: script,
+                workspace_root: root.clone(),
+                timeout_secs: 30,
+                max_retries: 0,
+                backend: coven_github_config::WorkerBackendKind::Host,
+                container: coven_github_config::ContainerConfig::default(),
+                allow_host_backend: false,
+            },
+            familiars: vec![FamiliarConfig {
+                id: "cody".to_string(),
+                display_name: "Cody".to_string(),
+                bot_username: "coven-cody[bot]".to_string(),
+                model: None,
+                skills: vec![],
+                trigger_labels: vec![],
+            }],
+            review: coven_github_config::ReviewConfig::default(),
+            storage: coven_github_config::StorageConfig::default(),
+            memory: coven_github_config::MemoryConfig::default(),
+            api: coven_github_config::ApiConfig::default(),
+            installations: vec![],
+        };
+        let task = Task {
+            id: "task-cleanup".to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: None,
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+            },
+        };
+        let minter = Minter::Fixed(HashMap::from([
+            (
+                TokenRole::Orchestration,
+                "ghs_orchestration0000000000000000000000".to_string(),
+            ),
+            (
+                TokenRole::AgentGit,
+                "ghs_agentgit000000000000000000000000000".to_string(),
+            ),
+        ]));
+
+        let outcome = execute_task_with_minter(
+            &config,
+            Store::open_in_memory().expect("store"),
+            task,
+            &minter,
+        )
+        .await;
+        assert!(outcome.is_ok(), "failure is handled, not propagated: {outcome:?}");
+
+        // The workspace — which held the brief and any partial clone — is gone.
+        assert!(
+            !root.join("task-cleanup").exists(),
+            "workspace must be removed after a failed run"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
 

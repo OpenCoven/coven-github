@@ -1025,6 +1025,9 @@ mod tests {
                     workspace_root: PathBuf::from("/tmp/coven-github-test"),
                     timeout_secs: 60,
                     max_retries: 0,
+                backend: coven_github_config::WorkerBackendKind::Host,
+                container: coven_github_config::ContainerConfig::default(),
+                allow_host_backend: false,
                 },
                 familiars: vec![FamiliarConfig {
                     id: "cody".to_string(),
