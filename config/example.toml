@@ -24,6 +24,18 @@ max_retries = 2     # Retries for infra errors (exit code 2)
 # SQLite file — keep it on a persistent volume; parents are created at start.
 path = "data/coven-github.db"
 
+# ── Task API auth (issue #3) ────────────────────────────────────────────────
+# Gate GET /api/github/tasks. "open" = unauthenticated (local development
+# ONLY — never expose publicly). "token" = bearer tokens required, fail
+# closed; the hosted posture.
+# [api]
+# mode = "token"
+# service_token = "GENERATE_LONG_RANDOM"   # operator-wide visibility
+# [[api.tenants]]
+# token = "GENERATE_LONG_RANDOM"           # one installation's visibility
+# installation_id = 123456
+# repos = ["your-org/your-repo"]           # optional narrower scope
+
 # ── Familiar configuration ──────────────────────────────────────────────────
 # Add one [[familiars]] block per familiar you want to expose as a GitHub bot.
 

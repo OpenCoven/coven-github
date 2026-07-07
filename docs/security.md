@@ -86,7 +86,7 @@ Tenant-scoped data:
 - Task history, status, branch, PR, and Check Run links.
 - Optional familiar memory, if enabled by the customer.
 
-The public task API must not return cross-installation data. The current in-memory `/api/github/tasks` path is suitable for local development and Cave polling, but hosted usage needs tenant-scoped authentication before launch.
+The public task API must not return cross-installation data. `/api/github/tasks` is gated by the `[api]` config section (issue #3): `mode = "open"` keeps it unauthenticated for local development and Cave polling — never expose that publicly — while `mode = "token"` fails closed and requires bearer tokens. A `service_token` grants the operator full visibility; each `[[api.tenants]]` token is scoped server-side to one installation id (optionally narrowed to specific repositories). Unauthorized calls receive a uniform `401 unauthorized` that reveals nothing about existing data, and every read — allowed or denied — is recorded in the store's `api_audit` table with caller, scope, action, and result.
 
 ## Model and Memory Boundaries
 

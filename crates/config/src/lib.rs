@@ -19,6 +19,10 @@ pub struct Config {
     /// Hosted memory governance policy (issue #6). Absent section = memory off.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Task API authentication (issue #3). Absent section = open mode, which
+    /// is only safe for local development.
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 /// Hosted memory governance policy (issue #6). Off by default; opting in is a
@@ -69,6 +73,40 @@ impl MemoryConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Task API access control. See `docs/security.md`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ApiConfig {
+    /// `open` (unauthenticated; local development only) or `token`
+    /// (bearer tokens required; fail closed — the hosted posture).
+    #[serde(default)]
+    pub mode: ApiMode,
+    /// Operator-wide token with visibility across every installation
+    /// (self-hosted Cave polling).
+    pub service_token: Option<String>,
+    /// Tenant tokens scoped to a single installation (and optionally to a
+    /// subset of its repositories).
+    #[serde(default)]
+    pub tenants: Vec<TenantToken>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiMode {
+    #[default]
+    Open,
+    Token,
+}
+
+/// A bearer token granting read access to one installation's tasks.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TenantToken {
+    pub token: String,
+    pub installation_id: u64,
+    /// Optional narrower scope: only these `owner/name` repositories.
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 /// Durable store location. See `docs/durable-task-store.md`.
@@ -367,6 +405,52 @@ impl Config {
             ));
         }
 
+        // ── Task API auth (issue #3) ────────────────────────────────────
+        match self.api.mode {
+            ApiMode::Open => {
+                if self.api.service_token.is_some() || !self.api.tenants.is_empty() {
+                    out.push(Diagnostic::warning(
+                        "api.mode",
+                        "tokens are configured but api.mode is 'open' — they are ignored; set api.mode = \"token\" to enforce them.",
+                    ));
+                } else {
+                    out.push(Diagnostic::warning(
+                        "api.mode",
+                        "the task API is unauthenticated (api.mode = \"open\") — fine for local development, never expose it publicly; hosted deployments must use \"token\".",
+                    ));
+                }
+            }
+            ApiMode::Token => {
+                if self.api.service_token.is_none() && self.api.tenants.is_empty() {
+                    out.push(Diagnostic::error(
+                        "api.mode",
+                        "api.mode is 'token' but no api.service_token or [[api.tenants]] tokens are configured — every task API call would fail.",
+                    ));
+                }
+            }
+        }
+        let mut seen_api_tokens = std::collections::HashSet::new();
+        for candidate in self
+            .api
+            .service_token
+            .iter()
+            .chain(self.api.tenants.iter().map(|t| &t.token))
+        {
+            let trimmed = candidate.trim();
+            if trimmed.len() < 16 {
+                out.push(Diagnostic::warning(
+                    "api.tenants[].token",
+                    "an API token is shorter than 16 characters — use a long random string.",
+                ));
+            }
+            if !trimmed.is_empty() && !seen_api_tokens.insert(trimmed) {
+                out.push(Diagnostic::error(
+                    "api.tenants[].token",
+                    "duplicate API token — two scopes would be indistinguishable at the boundary.",
+                ));
+            }
+        }
+
         // ── Review policy ───────────────────────────────────────────────
         let known_ids: std::collections::HashSet<&str> =
             self.familiars.iter().map(|f| f.id.as_str()).collect();
@@ -495,6 +579,12 @@ fn next_step_for(field: &str, _message: &str) -> &'static str {
         "memory.approval_required" => {
             "Keep memory.approval_required = true so learned facts need maintainer review, or accept the risk deliberately."
         }
+        "api.mode" => {
+            "Set api.mode = \"token\" and configure api.service_token and/or [[api.tenants]] tokens for hosted use."
+        }
+        "api.tenants[].token" => {
+            "Generate long random tokens (e.g. openssl rand -hex 32) and keep each scope's token unique."
+        }
         _ => "Update this config field, then rerun coven-github doctor.",
     }
 }
@@ -595,6 +685,7 @@ mod tests {
             review: ReviewConfig::default(),
             storage: StorageConfig::default(),
             memory: MemoryConfig::default(),
+            api: ApiConfig::default(),
         }
     }
 
@@ -867,6 +958,55 @@ mod tests {
         assert!(errs.contains(&"worker.coven_code_bin"));
         assert!(errs.contains(&"worker.concurrency"));
         assert!(errs.contains(&"familiars"));
+    }
+
+    #[test]
+    fn token_mode_without_tokens_is_an_error_and_open_mode_warns() {
+        let dir = tmpdir();
+        let pem = write_pem(&dir);
+        let bin = write_bin(&dir);
+        let mut cfg = config_with(
+            GitHubAppConfig {
+                app_id: 123,
+                private_key_path: pem,
+                webhook_secret: "a-long-random-webhook-secret".into(),
+                api_base_url: None,
+            },
+            WorkerConfig {
+                concurrency: 4,
+                coven_code_bin: bin,
+                workspace_root: dir.clone(),
+                timeout_secs: 600,
+                max_retries: 2,
+            },
+            vec![good_familiar()],
+        );
+
+        // Default open mode: a warning, not an error.
+        let diags = cfg.check();
+        assert!(errors(&diags).is_empty(), "diags: {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.field == "api.mode" && d.message.contains("unauthenticated")),
+            "open mode must warn: {diags:?}"
+        );
+
+        // Token mode with nothing to match against would deny every call.
+        cfg.api.mode = ApiMode::Token;
+        let diags = cfg.check();
+        assert!(
+            errors(&diags).contains(&"api.mode"),
+            "token mode without tokens must error: {diags:?}"
+        );
+
+        // A configured tenant token clears the error.
+        cfg.api.tenants = vec![TenantToken {
+            token: "a-long-random-api-token".into(),
+            installation_id: 1,
+            repos: vec![],
+        }];
+        assert!(errors(&cfg.check()).is_empty());
     }
 
     #[test]
