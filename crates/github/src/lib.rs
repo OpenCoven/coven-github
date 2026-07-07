@@ -238,6 +238,11 @@ pub enum TaskKind {
         issue_number: u64,
         body: String,
     },
+    /// Adapter-only cancellation of queued PR reviews (issue #13). The worker
+    /// gates the commander's write access before tombstoning anything.
+    CancelReviews {
+        pr_number: u64,
+    },
 }
 
 /// Structured result envelope written by coven-code --headless.

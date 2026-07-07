@@ -115,32 +115,90 @@ async fn execute_task_with_minter(
         .as_deref()
         .unwrap_or(DEFAULT_API_BASE_URL);
 
-    // Command replies are adapter-only (issue #13): update the status surface
-    // and finish — no coven-code session, no Check Run.
-    if let TaskKind::CommandReply { issue_number, body } = &task.kind {
-        let orchestration = minter.mint(TokenRole::Orchestration).await?;
-        let marker =
-            status_comment::marker(&familiar.id, &task.repo_owner, &task.repo_name, *issue_number);
-        status_comment::upsert(
-            api_base_url,
-            &orchestration,
-            &task.repo_owner,
-            &task.repo_name,
-            *issue_number,
-            &marker,
-            body,
-        )
-        .await?;
-        store
-            .finish(
-                &task.id,
-                Terminal {
-                    state: TerminalState::Completed,
-                    ..Terminal::default()
-                },
+    // Adapter-only command surfaces (issue #13): replies, acknowledgements,
+    // and cancellations run without a coven-code session or Check Run — but
+    // gated acknowledgements and cancellations still verify the commander's
+    // write access first, so a drive-by comment earns a decline, not an act.
+    match &task.kind {
+        TaskKind::CommandReply { issue_number, body } => {
+            let orchestration = minter.mint(TokenRole::Orchestration).await?;
+            let reply = if commander_below_write(api_base_url, &orchestration, &task).await? {
+                info!(task_id = %task.id, "declining gated reply for a commander without write access");
+                decline_body(&task)
+            } else {
+                body.clone()
+            };
+            let marker = status_comment::marker(
+                &familiar.id,
+                &task.repo_owner,
+                &task.repo_name,
+                *issue_number,
+            );
+            status_comment::upsert(
+                api_base_url,
+                &orchestration,
+                &task.repo_owner,
+                &task.repo_name,
+                *issue_number,
+                &marker,
+                &reply,
             )
             .await?;
-        return Ok(());
+            store
+                .finish(
+                    &task.id,
+                    Terminal {
+                        state: TerminalState::Completed,
+                        ..Terminal::default()
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
+        TaskKind::CancelReviews { pr_number } => {
+            let orchestration = minter.mint(TokenRole::Orchestration).await?;
+            let reply = if commander_below_write(api_base_url, &orchestration, &task).await? {
+                info!(task_id = %task.id, "declining cancel for a commander without write access");
+                decline_body(&task)
+            } else {
+                // The tombstone happens only past the gate: queued reviews of
+                // this PR yield; in-flight work finishes (#8 covers staleness).
+                let key = format!("{}/{}#{pr_number}", task.repo_owner, task.repo_name);
+                let cancelled = store.cancel_queued(&key).await?;
+                format!(
+                    "Cancelled {cancelled} queued review(s) for PR #{pr_number}. Work already \
+                     running will finish; `@{} review` re-arms the lane.",
+                    familiar.bot_username.trim_end_matches("[bot]")
+                )
+            };
+            let marker = status_comment::marker(
+                &familiar.id,
+                &task.repo_owner,
+                &task.repo_name,
+                *pr_number,
+            );
+            status_comment::upsert(
+                api_base_url,
+                &orchestration,
+                &task.repo_owner,
+                &task.repo_name,
+                *pr_number,
+                &marker,
+                &reply,
+            )
+            .await?;
+            store
+                .finish(
+                    &task.id,
+                    Terminal {
+                        state: TerminalState::Completed,
+                        ..Terminal::default()
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     info!(task_id = %task.id, familiar = %familiar.id, "starting task");
@@ -156,17 +214,17 @@ async fn execute_task_with_minter(
 
         // Maintainer permission gate (issue #13): command-initiated work needs
         // write access on the repo before the adapter spends anything on it.
-        if let Some(commander) = &task.commander {
-            let permission = repo::get_collaborator_permission_with_base_url(
-                api_base_url,
-                &orchestration,
-                &task.repo_owner,
-                &task.repo_name,
-                commander,
-            )
-            .await?;
-            if !matches!(permission.as_str(), "admin" | "maintain" | "write") {
-                return Ok(Prepared::Declined { orchestration });
+        if commander_below_write(api_base_url, &orchestration, &task).await? {
+            return Ok(Prepared::Declined { orchestration });
+        }
+
+        // A now-authorized command review supersedes older queued reviews of
+        // the same PR. Auto reviews tombstone at insert; command reviews wait
+        // for this gate so unauthorized commenters can't displace queued work.
+        if task.commander.is_some() {
+            if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+                let key = format!("{}/{}#{pr_number}", task.repo_owner, task.repo_name);
+                store.supersede_queued_except(&key, &task.id).await?;
             }
         }
 
@@ -215,10 +273,7 @@ async fn execute_task_with_minter(
                     &task.repo_name,
                     number,
                 );
-                let body = format!(
-                    "Status: declined\n\nMaintainer commands need write access to {}/{}.",
-                    task.repo_owner, task.repo_name
-                );
+                let body = decline_body(&task);
                 if let Err(e) = status_comment::upsert(
                     api_base_url,
                     &orchestration,
@@ -1123,6 +1178,35 @@ fn pr_title(result: &SessionResult, task: &Task) -> String {
     )
 }
 
+/// True when the task carries a commander whose repository permission is
+/// below write (issue #13). Auto-triggered tasks (no commander) always pass.
+async fn commander_below_write(
+    api_base_url: &str,
+    orchestration: &str,
+    task: &Task,
+) -> Result<bool> {
+    let Some(commander) = &task.commander else {
+        return Ok(false);
+    };
+    let permission = repo::get_collaborator_permission_with_base_url(
+        api_base_url,
+        orchestration,
+        &task.repo_owner,
+        &task.repo_name,
+        commander,
+    )
+    .await?;
+    Ok(!matches!(permission.as_str(), "admin" | "maintain" | "write"))
+}
+
+/// Status-surface body for a below-write commander.
+fn decline_body(task: &Task) -> String {
+    format!(
+        "Status: declined\n\nMaintainer commands need write access to {}/{}.",
+        task.repo_owner, task.repo_name
+    )
+}
+
 fn task_title(kind: &TaskKind) -> String {
     match kind {
         TaskKind::FixIssue {
@@ -1142,6 +1226,9 @@ fn task_title(kind: &TaskKind) -> String {
             ..
         } => format!("Review PR #{pr_number}: {pr_title}"),
         TaskKind::CommandReply { issue_number, .. } => format!("Reply on #{issue_number}"),
+        TaskKind::CancelReviews { pr_number } => {
+            format!("Cancel queued reviews on PR #{pr_number}")
+        }
     }
 }
 
@@ -1181,7 +1268,8 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
         }
         TaskKind::FixIssue { .. }
         | TaskKind::RespondToMention { .. }
-        | TaskKind::CommandReply { .. } => {
+        | TaskKind::CommandReply { .. }
+        | TaskKind::CancelReviews { .. } => {
             let head_sha = repo::get_branch_sha_with_base_url(
                 api_base_url,
                 token,
@@ -1207,7 +1295,8 @@ fn surface_number(kind: &TaskKind) -> Option<u64> {
         | TaskKind::RespondToMention { issue_number, .. }
         | TaskKind::CommandReply { issue_number, .. } => Some(*issue_number),
         TaskKind::AddressReviewComment { pr_number, .. }
-        | TaskKind::ReviewPullRequest { pr_number, .. } => Some(*pr_number),
+        | TaskKind::ReviewPullRequest { pr_number, .. }
+        | TaskKind::CancelReviews { pr_number } => Some(*pr_number),
     }
 }
 
@@ -2507,5 +2596,173 @@ mod command_and_marker_tests {
         let states = store.task_states().await.expect("states");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].1, "completed");
+    }
+    async fn seed(store: &Store, delivery_id: &str, task: &Task) {
+        store
+            .record_delivery(
+                coven_github_store::Delivery {
+                    delivery_id: delivery_id.to_string(),
+                    event: "issue_comment".to_string(),
+                    action: Some("created".to_string()),
+                    installation_id: Some(1),
+                    repo: Some("OpenCoven/demo".to_string()),
+                    payload_hash: "h".to_string(),
+                },
+                coven_github_store::Routing::Task(task),
+            )
+            .await
+            .expect("seed task row");
+    }
+
+    fn permission_mock(login: &str, permission: &str) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/OpenCoven/demo/collaborators/{login}/permission"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "permission": permission })),
+            )
+    }
+
+    fn comment_mocks() -> (Mock, Mock) {
+        (
+            Mock::given(method("GET"))
+                .and(path("/repos/OpenCoven/demo/issues/88/comments"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([]))),
+            Mock::given(method("POST"))
+                .and(path("/repos/OpenCoven/demo/issues/88/comments"))
+                .respond_with(
+                    ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})),
+                ),
+        )
+    }
+
+    fn queued_review(id: &str) -> Task {
+        task(
+            TaskKind::ReviewPullRequest {
+                pr_number: 88,
+                pr_title: "t".to_string(),
+                reason: "synchronize".to_string(),
+            },
+            None,
+        )
+        .with_id(id)
+    }
+
+    /// A drive-by `cancel` must decline at the gate and leave queued reviews
+    /// untouched (issue #13 privilege fix).
+    #[tokio::test]
+    async fn drive_by_cancel_is_declined_and_tombstones_nothing() {
+        let server = MockServer::start().await;
+        permission_mock("drive-by", "read").mount(&server).await;
+        let (get_comments, post_comment) = comment_mocks();
+        get_comments.mount(&server).await;
+        post_comment.mount(&server).await;
+
+        let store = Store::open_in_memory().expect("store");
+        seed(&store, "dl-q", &queued_review("victim")).await;
+        let cancel = task(TaskKind::CancelReviews { pr_number: 88 }, Some("drive-by"))
+            .with_id("cancel-task");
+        seed(&store, "dl-c", &cancel).await;
+
+        execute_task_with_minter(&config(server.uri()), store.clone(), cancel, &fixed_minter())
+            .await
+            .expect("declined cancel is not an error");
+
+        let states: std::collections::HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["victim"], "queued", "no tombstone below the gate");
+        assert_eq!(states["cancel-task"], "completed");
+        let requests = server.received_requests().await.expect("requests");
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("decline posted");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(body.contains("Status: declined"), "body: {body}");
+    }
+
+    /// A maintainer `cancel` passes the gate, tombstones the queued review,
+    /// and acknowledges with the count.
+    #[tokio::test]
+    async fn maintainer_cancel_tombstones_queued_reviews_past_the_gate() {
+        let server = MockServer::start().await;
+        permission_mock("octocat", "admin").mount(&server).await;
+        let (get_comments, post_comment) = comment_mocks();
+        get_comments.mount(&server).await;
+        post_comment.mount(&server).await;
+
+        let store = Store::open_in_memory().expect("store");
+        seed(&store, "dl-q", &queued_review("victim")).await;
+        let cancel =
+            task(TaskKind::CancelReviews { pr_number: 88 }, Some("octocat")).with_id("cancel-task");
+        seed(&store, "dl-c", &cancel).await;
+
+        execute_task_with_minter(&config(server.uri()), store.clone(), cancel, &fixed_minter())
+            .await
+            .expect("cancel should succeed");
+
+        let states: std::collections::HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["victim"], "superseded");
+        let requests = server.received_requests().await.expect("requests");
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("ack posted");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(body.contains("Cancelled 1 queued review"), "body: {body}");
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("check-runs")),
+            "cancel is adapter-only — no Check Run"
+        );
+    }
+
+    /// Memory acknowledgements carry the commander and decline below write.
+    #[tokio::test]
+    async fn drive_by_memory_ack_is_declined() {
+        let server = MockServer::start().await;
+        permission_mock("drive-by", "read").mount(&server).await;
+        let (get_comments, post_comment) = comment_mocks();
+        get_comments.mount(&server).await;
+        post_comment.mount(&server).await;
+
+        execute_task_with_minter(
+            &config(server.uri()),
+            Store::open_in_memory().expect("store"),
+            task(
+                TaskKind::CommandReply {
+                    issue_number: 88,
+                    body: "Noted, but memory persistence is not wired up yet".to_string(),
+                },
+                Some("drive-by"),
+            ),
+            &fixed_minter(),
+        )
+        .await
+        .expect("declined ack is not an error");
+
+        let requests = server.received_requests().await.expect("requests");
+        let posted = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("reply posted");
+        let body = String::from_utf8_lossy(&posted.body);
+        assert!(body.contains("Status: declined"), "body: {body}");
+        assert!(!body.contains("Noted"), "the ungated ack must not leak");
+    }
+}
+
+/// Test-only convenience for retargeting a task id.
+#[cfg(test)]
+trait WithId {
+    fn with_id(self, id: &str) -> Self;
+}
+#[cfg(test)]
+impl WithId for Task {
+    fn with_id(mut self, id: &str) -> Self {
+        self.id = id.to_string();
+        self
     }
 }

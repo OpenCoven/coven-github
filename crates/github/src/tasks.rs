@@ -63,6 +63,9 @@ pub fn surface_of(kind: &TaskKind) -> (u64, String) {
         TaskKind::CommandReply { issue_number, .. } => {
             (*issue_number, format!("Reply on #{issue_number}"))
         }
+        TaskKind::CancelReviews { pr_number } => {
+            (*pr_number, format!("Cancel queued reviews on PR #{pr_number}"))
+        }
     }
 }
 
