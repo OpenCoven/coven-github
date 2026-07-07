@@ -247,12 +247,17 @@ pub struct StorageConfig {
     /// SQLite database path; parent directories are created at startup.
     #[serde(default = "default_storage_path")]
     pub path: PathBuf,
+    /// Days to retain terminal task history before a periodic sweep deletes it
+    /// (issue #12). Absent = keep indefinitely. In-flight tasks are never
+    /// expired.
+    pub task_retention_days: Option<u32>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: default_storage_path(),
+            task_retention_days: None,
         }
     }
 }

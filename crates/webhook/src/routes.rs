@@ -511,12 +511,36 @@ pub async fn handle_webhook(
         {
             Ok(Recorded::New) => {
                 if let Some(id) = installation_id {
-                    match state.store.delete_memory_for_installation(id).await {
-                        Ok(purged) => {
-                            info!(installation_id = id, purged, "purged memory on uninstall")
-                        }
-                        Err(e) => error!("failed to purge memory on uninstall: {e:#}"),
-                    }
+                    // Purge both memory (issue #6) and task artifacts (issue
+                    // #12) for the departing tenant. Idempotent: a redelivery
+                    // finds nothing left to remove.
+                    let memory = state
+                        .store
+                        .delete_memory_for_installation(id)
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("failed to purge memory on uninstall: {e:#}");
+                            0
+                        });
+                    let tasks = state
+                        .store
+                        .delete_tasks_for_installation(id)
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("failed to purge task artifacts on uninstall: {e:#}");
+                            0
+                        });
+                    info!(installation_id = id, memory, tasks, "purged tenant data on uninstall");
+                    // Audit what was deleted (issue #12).
+                    let _ = state
+                        .store
+                        .record_api_read(
+                            &format!("installation:{id}"),
+                            &id.to_string(),
+                            "delete_on_uninstall",
+                            &format!("memory:{memory},tasks:{tasks}"),
+                        )
+                        .await;
                 }
                 (StatusCode::OK, Json(json!({"ok": true}))).into_response()
             }
@@ -1746,6 +1770,13 @@ mod delivery_idempotency_tests {
                 .unwrap()
                 .len(),
             1
+        );
+
+        // The purge (memory + task artifacts) is audited (issue #12).
+        let audit = state.store.api_audit_entries().await.unwrap();
+        assert!(
+            audit.iter().any(|(_, _, action, _)| action == "delete_on_uninstall"),
+            "the uninstall purge must leave an audit record: {audit:?}"
         );
     }
 

@@ -23,6 +23,7 @@ max_retries = 2     # Retries for infra errors (exit code 2)
 # Durable adapter state: webhook deliveries (idempotency) and task records.
 # SQLite file — keep it on a persistent volume; parents are created at start.
 path = "data/coven-github.db"
+# task_retention_days = 90   # expire terminal task history after N days (issue #12); omit to keep forever
 
 # ── Task API auth (issue #3) ────────────────────────────────────────────────
 # Gate GET /api/github/tasks. "open" = unauthenticated (local development
