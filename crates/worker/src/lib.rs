@@ -630,20 +630,15 @@ async fn run_and_publish(
     };
     // Compute the memory governance policy (issue #6). Deny-by-default: unless
     // the installation opts memory in for this repo, this is None and no policy
-    // is stamped, so the runtime does no memory work. Trust: a commander here
-    // already passed the #13 write-access gate (below-write is declined
-    // earlier), so a command carries maintainer trust; auto-triggered work gets
-    // the safe collaborator default. Fork-PR hardening is a follow-up.
+    // is stamped, so the runtime does no memory work. Trust is derived from the
+    // review target and actor: a fork PR is untrusted content and can never
+    // write durable memory, overriding even a maintainer trigger.
     let repo_full = format!("{}/{}", task.repo_owner, task.repo_name);
     let memory_policy = memory::compute_policy(memory::PolicyInputs {
         enabled: config.memory.enabled_for(&repo_full),
         installation_id: task.installation_id,
         repo: &repo_full,
-        trust: if task.commander.is_some() {
-            memory::TrustScope::Maintainer
-        } else {
-            memory::TrustScope::Collaborator
-        },
+        trust: memory::derive_trust(targets.head_is_fork, task.commander.is_some()),
         approval_required: config.memory.approval_required_for(&repo_full),
         retention_days: config.memory.retention_days,
     });
@@ -1279,6 +1274,9 @@ struct ResolvedTargets {
     base_ref: String,
     /// Immutable commit SHA the Check Run attaches to.
     head_sha: String,
+    /// True when this task reviews a fork PR — untrusted content that can never
+    /// write durable memory (issue #6). Always false for non-PR tasks.
+    head_is_fork: bool,
 }
 
 /// Resolves the repository default branch and the immutable target refs a task
@@ -1303,6 +1301,7 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
                 default_branch: meta.default_branch,
                 base_ref: refs.base_ref,
                 head_sha: refs.head_sha,
+                head_is_fork: refs.head_is_fork,
             })
         }
         TaskKind::FixIssue { .. }
@@ -1321,6 +1320,7 @@ async fn resolve_targets(api_base_url: &str, token: &str, task: &Task) -> Result
                 base_ref: meta.default_branch.clone(),
                 default_branch: meta.default_branch,
                 head_sha,
+                head_is_fork: false,
             })
         }
     }
@@ -2128,6 +2128,7 @@ exit 0
             default_branch: "main".to_string(),
             base_ref: "main".to_string(),
             head_sha: "abc123".to_string(),
+            head_is_fork: false,
         };
         let workspace = root.join("ws");
 

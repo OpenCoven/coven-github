@@ -103,6 +103,24 @@ pub fn compute_policy(input: PolicyInputs) -> Option<MemoryPolicy> {
     })
 }
 
+/// Derives the actor trust level for a memory decision (issue #6).
+///
+/// A fork PR is untrusted **content** — planted facts could be written into
+/// durable memory to poison later reviews — so `head_is_fork` maps to
+/// [`TrustScope::ForkPr`] and **overrides** the actor's own standing, even a
+/// maintainer who triggered the review. Otherwise a commander (who already
+/// passed the #13 write-access gate) is a maintainer, and auto-triggered work
+/// gets the safe collaborator default.
+pub fn derive_trust(head_is_fork: bool, has_commander: bool) -> TrustScope {
+    if head_is_fork {
+        TrustScope::ForkPr
+    } else if has_commander {
+        TrustScope::Maintainer
+    } else {
+        TrustScope::Collaborator
+    }
+}
+
 /// Default `(read, write)` namespace grants per trust level (contract's table).
 /// The load-bearing rule: `ForkPr` and `External` get **no** write scope, so a
 /// hostile fork PR can never poison durable memory.
@@ -270,6 +288,24 @@ mod tests {
     #[test]
     fn memory_disabled_yields_no_policy() {
         assert!(compute_policy(inputs(TrustScope::Maintainer, false)).is_none());
+    }
+
+    #[test]
+    fn fork_review_overrides_actor_trust() {
+        // A fork PR is untrusted content: even a maintainer command reviewing it
+        // is ForkPr (never writes), while a same-repo command is Maintainer.
+        assert_eq!(derive_trust(true, true), TrustScope::ForkPr);
+        assert_eq!(derive_trust(true, false), TrustScope::ForkPr);
+        assert_eq!(derive_trust(false, true), TrustScope::Maintainer);
+        assert_eq!(derive_trust(false, false), TrustScope::Collaborator);
+
+        // And the fork grant carries through to no write scope.
+        let policy = compute_policy(PolicyInputs {
+            trust: derive_trust(true, true),
+            ..inputs(TrustScope::Maintainer, true)
+        })
+        .unwrap();
+        assert!(policy.write_scopes.is_empty(), "fork review must never write");
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct PullRequestRefs {
     pub head_sha: String,
     pub base_ref: String,
     pub base_sha: String,
+    /// True when the PR head lives in a different repository than the base — a
+    /// cross-repo (fork) PR carrying untrusted content. Drives the memory
+    /// trust decision (issue #6): fork content can never write durable memory.
+    pub head_is_fork: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,11 +43,31 @@ struct PullRequestMetaResponse {
     base: PrRef,
 }
 
+impl PullRequestMetaResponse {
+    /// A PR is a fork PR when its head repository differs from its base. A
+    /// missing head repo means the fork was deleted — treated as a fork
+    /// (untrusted) so memory stays fail-closed.
+    fn head_is_fork(&self) -> bool {
+        match (self.head.repo.as_ref(), self.base.repo.as_ref()) {
+            (Some(head), Some(base)) => head.id != base.id,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PrRef {
     #[serde(rename = "ref")]
     ref_name: String,
     sha: String,
+    /// The repository the ref lives in; absent when a fork has been deleted.
+    #[serde(default)]
+    repo: Option<PrRepoRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrRepoRef {
+    id: u64,
 }
 
 /// Fetches repository metadata (default branch, etc.).
@@ -137,11 +161,13 @@ pub async fn get_pull_request_refs_with_base_url(
     )
     .await?;
     let body: PullRequestMetaResponse = response.json().await?;
+    let head_is_fork = body.head_is_fork();
     Ok(PullRequestRefs {
         head_ref: body.head.ref_name,
         head_sha: body.head.sha,
         base_ref: body.base.ref_name,
         base_sha: body.base.sha,
+        head_is_fork,
     })
 }
 
@@ -274,6 +300,38 @@ mod tests {
         assert_eq!(body.head.sha, "headsha");
         assert_eq!(body.base.ref_name, "develop");
         assert_eq!(body.base.sha, "basesha");
+    }
+
+    #[test]
+    fn same_repo_pr_is_not_a_fork() {
+        let body: PullRequestMetaResponse = serde_json::from_value(json!({
+            "head": { "ref": "feature", "sha": "h", "repo": { "id": 1 } },
+            "base": { "ref": "main", "sha": "b", "repo": { "id": 1 } }
+        }))
+        .unwrap();
+        assert!(!body.head_is_fork());
+    }
+
+    #[test]
+    fn cross_repo_pr_is_a_fork() {
+        let body: PullRequestMetaResponse = serde_json::from_value(json!({
+            "head": { "ref": "feature", "sha": "h", "repo": { "id": 2 } },
+            "base": { "ref": "main", "sha": "b", "repo": { "id": 1 } }
+        }))
+        .unwrap();
+        assert!(body.head_is_fork());
+    }
+
+    #[test]
+    fn deleted_or_absent_head_repo_is_treated_as_a_fork() {
+        // A fork whose repo was deleted (head.repo null) is untrusted — memory
+        // must stay fail-closed rather than assume same-repo.
+        let body: PullRequestMetaResponse = serde_json::from_value(json!({
+            "head": { "ref": "feature", "sha": "h" },
+            "base": { "ref": "main", "sha": "b", "repo": { "id": 1 } }
+        }))
+        .unwrap();
+        assert!(body.head_is_fork());
     }
 }
 
