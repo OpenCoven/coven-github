@@ -481,7 +481,13 @@ async fn execute_task_with_minter(
                     number,
                 );
                 let mut body =
-                    final_status_body(config, &task.id, &published.result, published.opened_pr);
+                    final_status_body(
+                        config,
+                        &task.id,
+                        &published.result,
+                        published.opened_pr,
+                        &published.cited_memory,
+                    );
                 if let Some(report) = &advisory {
                     body = format!("{body}\n\n{report}");
                 }
@@ -586,6 +592,9 @@ struct Published {
     /// at `current_sha`. Publication must mark the task superseded instead of
     /// presenting stale findings as current.
     stale: Option<StaleRefs>,
+    /// Memory entry ids the review read and the adapter accepted — cited on
+    /// the status surface for transparency (issue #6).
+    cited_memory: Vec<String>,
 }
 
 /// Evidence of a mid-session head move on a reviewed PR.
@@ -852,6 +861,7 @@ async fn run_and_publish(
     // granted (issue #6). The runtime's self-report is not trusted on its own:
     // any read or write outside scope — including a fork PR that tried to write
     // durable memory — is refused here before it can be persisted.
+    let mut cited_memory: Vec<String> = Vec::new();
     if let (Some(policy), Some(used)) = (&memory_policy, &result.memory_used) {
         let rejections =
             memory::validate_memory_used(policy, used, |text| redact::redact(text, &[]) != text);
@@ -869,6 +879,18 @@ async fn run_and_publish(
         if let Err(e) = store.record_memory_activity(activity).await {
             warn!(task_id = %task.id, "failed to record memory activity: {e:#}");
         }
+        // Cite the reads the adapter accepted (not refused/revoked) so the
+        // review discloses which memory influenced it (issue #6).
+        cited_memory = used
+            .read
+            .iter()
+            .filter(|r| {
+                !rejections
+                    .iter()
+                    .any(|rj| rj.op == memory::MemoryOp::Read && rj.target == r.id)
+            })
+            .map(|r| r.id.clone())
+            .collect();
     }
 
     // Stale-ref gate (issue #8): review findings are only valid for the head
@@ -900,6 +922,7 @@ async fn run_and_publish(
                     reviewed_sha: targets.head_sha.clone(),
                     current_sha: refs.head_sha,
                 }),
+                cited_memory,
             });
         }
     }
@@ -963,6 +986,7 @@ async fn run_and_publish(
         opened_pr,
         changed_files: review.map(|r| r.files).unwrap_or_default(),
         stale: None,
+        cited_memory,
     })
 }
 
@@ -1316,9 +1340,10 @@ fn final_status_body(
     task_id: &str,
     result: &SessionResult,
     opened_pr: Option<u64>,
+    cited_memory: &[String],
 ) -> String {
     let session = cave_session_url(config, task_id);
-    match result.status {
+    let body = match result.status {
         SessionStatus::NeedsInput => format!(
             "Status: needs input\n\n{}\n\nReply on this thread to continue. Session: {session}",
             result.summary
@@ -1337,6 +1362,17 @@ fn final_status_body(
                 result.summary
             ),
         },
+    };
+    // Disclose which memory entries influenced this review (issue #6).
+    if cited_memory.is_empty() {
+        body
+    } else {
+        let cited = cited_memory
+            .iter()
+            .map(|id| format!("`{id}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{body}\n\nMemory used: {cited}")
     }
 }
 
@@ -1913,7 +1949,7 @@ mod disposition_tests {
             exit_reason: None,
             memory_used: None,
         };
-        let done = final_status_body(&config, "task-42", &result, Some(17));
+        let done = final_status_body(&config, "task-42", &result, Some(17), &[]);
         assert!(done.starts_with("Status: done"));
         assert!(done.contains("PR #17 opened"));
         assert!(done.contains("https://cave.example.test/sessions/task-42"));
@@ -1921,10 +1957,21 @@ mod disposition_tests {
             !done.contains('✅') && !done.contains('→'),
             "status body should stay concise and actionable: {done}"
         );
+        assert!(!done.contains("Memory used"), "no citation without memory");
+
+        // A review that read memory cites the entries it used (issue #6).
+        let cited = final_status_body(
+            &config,
+            "task-42",
+            &result,
+            Some(17),
+            &["repo/acme/billing/conventions/x".to_string()],
+        );
+        assert!(cited.contains("Memory used: `repo/acme/billing/conventions/x`"));
 
         let mut needs_input = result.clone();
         needs_input.status = SessionStatus::NeedsInput;
-        let waiting = final_status_body(&config, "task-42", &needs_input, None);
+        let waiting = final_status_body(&config, "task-42", &needs_input, None, &[]);
         assert!(waiting.starts_with("Status: needs input"));
         assert!(waiting.contains("Reply on this thread"));
     }
