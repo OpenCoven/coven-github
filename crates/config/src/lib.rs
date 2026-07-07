@@ -1688,6 +1688,9 @@ mod tests {
                 workspace_root: PathBuf::from("."),
                 timeout_secs: 600,
                 max_retries: 2,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: true,
             },
             vec![good_familiar()],
         )
@@ -1782,6 +1785,9 @@ mod tests {
                 workspace_root: PathBuf::from("."),
                 timeout_secs: 600,
                 max_retries: 2,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: true,
             },
             vec![good_familiar()],
         );
@@ -1815,6 +1821,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: true,
             },
             vec![good_familiar()],
         );
@@ -1885,6 +1894,9 @@ mod tests {
                 workspace_root: dir.clone(),
                 timeout_secs: 600,
                 max_retries: 2,
+                backend: WorkerBackendKind::Host,
+                container: ContainerConfig::default(),
+                allow_host_backend: true,
             },
             vec![good_familiar()],
         );

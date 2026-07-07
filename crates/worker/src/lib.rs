@@ -4006,6 +4006,7 @@ exit 0
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         }
@@ -4162,6 +4163,7 @@ mod cleanup_tests {
             review: coven_github_config::ReviewConfig::default(),
             storage: coven_github_config::StorageConfig::default(),
             memory: coven_github_config::MemoryConfig::default(),
+            gardener: coven_github_config::GardenerConfig::default(),
             api: coven_github_config::ApiConfig::default(),
             installations: vec![],
         };
