@@ -114,6 +114,8 @@ STUB_PID=$!
 RUST_LOG=info "$ROOT/target/debug/coven-github" serve \
   --config "$DEMO_DIR/config.toml" > "$DEMO_DIR/server.log" 2>&1 &
 SERVER_PID=$!
+# Detach both from job control so shutdown doesn't print 'Terminated' noise.
+disown "$STUB_PID" "$SERVER_PID"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
