@@ -178,6 +178,22 @@ impl Store {
         .await
     }
 
+    /// Removes a delivery record, releasing its idempotency claim. Used to
+    /// compensate when task persistence fails after the delivery was recorded,
+    /// so GitHub's redelivery re-processes the event instead of being deduped
+    /// against a claim with no task behind it.
+    pub async fn delete_delivery(&self, delivery_id: &str) -> Result<()> {
+        let delivery_id = delivery_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM webhook_deliveries WHERE delivery_id = ?1",
+                [delivery_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Number of persisted tasks. Test/observability helper.
     pub async fn count_tasks(&self) -> Result<i64> {
         self.with_conn(|conn| {

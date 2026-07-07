@@ -12,6 +12,8 @@ use tracing::{info, warn};
 
 use coven_github_api::{tasks::TaskStore, GitHubEvent, Task, TaskKind};
 use coven_github_config::Config;
+use coven_github_store::{DeliveryRecord, DeliveryOutcome, Store};
+use sha2::{Digest, Sha256};
 
 use crate::{
     commands::{parse_mention, Command, MentionKind, COMMAND_LIST},
@@ -27,6 +29,8 @@ pub struct AppState {
     /// Channel for dispatching tasks to the worker pool.
     pub task_tx: tokio::sync::mpsc::Sender<Task>,
     pub task_store: TaskStore,
+    /// Durable store: delivery idempotency and queued-task persistence (#2).
+    pub store: Store,
 }
 
 /// GET /api/github/tasks — current task state for CovenCave polling.
@@ -79,7 +83,21 @@ pub async fn handle_webhook(
         }
     };
 
-    // 3. Parse payload.
+    // 3. Read the delivery id. GitHub always sends it; a caller that doesn't is
+    // not GitHub, and without it we cannot deduplicate redeliveries (#2).
+    let delivery_id = match headers.get("x-github-delivery").and_then(|v| v.to_str().ok()) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => {
+            warn!("webhook missing x-github-delivery");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing delivery id"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 4. Parse payload.
     let payload: WebhookPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -92,6 +110,38 @@ pub async fn handle_webhook(
         }
     };
 
+    // 5. Idempotency gate: claim the delivery before doing any work. A
+    // redelivery of an already-recorded id is a no-op — this is what stops
+    // duplicate sessions, comments, and PRs on GitHub's retries.
+    let record = DeliveryRecord {
+        delivery_id: delivery_id.clone(),
+        event: event_type.clone(),
+        action: payload.action.clone(),
+        installation_id: payload.installation.as_ref().map(|i| i.id as i64),
+        repo: payload
+            .repository
+            .as_ref()
+            .map(|r| format!("{}/{}", r.owner.login, r.name)),
+        payload_hash: hex::encode(Sha256::digest(&body)),
+    };
+    match state.store.record_delivery(record).await {
+        Ok(DeliveryOutcome::New) => {}
+        Ok(DeliveryOutcome::Duplicate) => {
+            info!(delivery_id, "duplicate webhook delivery — skipping");
+            return (StatusCode::OK, Json(json!({"ok": true, "duplicate": true}))).into_response();
+        }
+        Err(e) => {
+            // Could not durably claim the delivery — do not acknowledge success;
+            // 500 lets GitHub retry later.
+            warn!(delivery_id, "failed to record delivery: {e:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "storage unavailable"})),
+            )
+                .into_response();
+        }
+    }
+
     let event = parse_event(&event_type, &payload);
     info!(?event_type, "received webhook event");
 
@@ -99,29 +149,74 @@ pub async fn handle_webhook(
     // explicitly so operators get a clear signal the endpoint is wired up.
     if matches!(event, GitHubEvent::Ping) {
         info!("webhook ping received — endpoint configured");
+        record_routing(&state.store, &delivery_id, "ignored:ping").await;
         return (StatusCode::OK, Json(json!({"ok": true, "pong": true}))).into_response();
     }
+    let is_unsupported = matches!(event, GitHubEvent::Unsupported { .. });
 
-    // 4. Route event → task.
-    if let Some(task) = event_to_task(&state, event).await {
-        let task_id = task.id.clone();
-        // Register auto-reviews BEFORE enqueueing so the worker can never
-        // dequeue a task that a newer event has already superseded (#10).
-        if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
-            let repo = format!("{}/{}", task.repo_owner, task.repo_name);
-            state
-                .task_store
-                .register_pr_review(&repo, *pr_number, &task_id)
-                .await;
+    // 6. Route event → task, and persist the outcome durably before acking.
+    match event_to_task(&state, event).await {
+        Some(task) => {
+            let supersede_key = match &task.kind {
+                TaskKind::ReviewPullRequest { pr_number, .. } => {
+                    Some(format!("{}/{}#{}", task.repo_owner, task.repo_name, pr_number))
+                }
+                _ => None,
+            };
+            // Persist the task (state=queued) before dispatch. If this fails we
+            // must not leave the delivery claimed with no task behind it, or a
+            // GitHub retry would dedupe and silently lose the work — so release
+            // the claim and return 500 for GitHub to retry.
+            if let Err(e) = state.store.insert_task(&task, &delivery_id, supersede_key).await {
+                warn!(task_id = %task.id, "failed to persist task: {e:#}");
+                state.store.delete_delivery(&delivery_id).await.ok();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "storage unavailable"})),
+                )
+                    .into_response();
+            }
+            record_routing(&state.store, &delivery_id, &format!("task:{}", task.id)).await;
+
+            let task_id = task.id.clone();
+            // Register auto-reviews BEFORE enqueueing so the worker can never
+            // dequeue a task that a newer event has already superseded (#10).
+            if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
+                let repo = format!("{}/{}", task.repo_owner, task.repo_name);
+                state
+                    .task_store
+                    .register_pr_review(&repo, *pr_number, &task_id)
+                    .await;
+            }
+            // Phase 1 keeps the mpsc for dispatch; the task is already durable,
+            // so a full channel is recoverable (Phase 2's claim loop reloads
+            // queued rows) rather than silently lost.
+            if state.task_tx.try_send(task).is_err() {
+                warn!(task_id, "worker channel full — task persisted as queued for recovery");
+            } else {
+                info!(task_id, "task enqueued");
+            }
         }
-        if state.task_tx.try_send(task).is_err() {
-            warn!(task_id, "task queue full — dropping task");
-        } else {
-            info!(task_id, "task enqueued");
+        None => {
+            let reason = if is_unsupported {
+                "ignored:unsupported"
+            } else {
+                "ignored:no_route"
+            };
+            record_routing(&state.store, &delivery_id, reason).await;
         }
     }
 
     (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
+/// Best-effort routing annotation on a delivery record. A failure here does not
+/// change correctness (the delivery is already claimed and any task is already
+/// durable); it only leaves the audit column stale, so we log and move on.
+async fn record_routing(store: &Store, delivery_id: &str, routing: &str) {
+    if let Err(e) = store.set_delivery_routing(delivery_id, routing).await {
+        warn!(delivery_id, "failed to record delivery routing: {e:#}");
+    }
 }
 
 /// Maps a parsed event to a worker task, or returns None if not actionable.
@@ -489,6 +584,7 @@ mod tests {
             }),
             task_tx,
             task_store: TaskStore::default(),
+            store: Store::open_in_memory().expect("in-memory store"),
         }
     }
 
@@ -1068,5 +1164,143 @@ mod command_routing_tests {
             task.kind,
             TaskKind::CommandReply { ref body, .. } if body.contains("needs a pull request")
         ));
+    }
+}
+
+#[cfg(test)]
+mod webhook_route_tests {
+    use super::tests::app_state;
+    use super::*;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use hmac::{Hmac, Mac};
+
+    fn signed_headers(body: &[u8], event: &str, delivery: Option<&str>) -> HeaderMap {
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut h = HeaderMap::new();
+        h.insert("x-hub-signature-256", sig.parse().unwrap());
+        h.insert("x-github-event", event.parse().unwrap());
+        if let Some(d) = delivery {
+            h.insert("x-github-delivery", d.parse().unwrap());
+        }
+        h
+    }
+
+    async fn call(
+        state: &AppState,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = handle_webhook(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn issue_assigned_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "action": "assigned",
+            "installation": { "id": 123 },
+            "repository": { "name": "coven-code", "owner": { "login": "OpenCoven" } },
+            "issue": { "number": 42, "title": "Fix auth", "body": "broken" },
+            "assignee": { "login": "coven-cody[bot]" }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_delivery_id_is_rejected_and_nothing_is_persisted() {
+        let state = app_state();
+        let body = issue_assigned_body();
+        let headers = signed_headers(&body, "issues", None);
+
+        let (status, _) = call(&state, headers, body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.store.count_tasks().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_delivery_persists_a_queued_task_and_records_routing() {
+        let state = app_state();
+        let body = issue_assigned_body();
+        let headers = signed_headers(&body, "issues", Some("delivery-a"));
+
+        let (status, json) = call(&state, headers, body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+        assert_eq!(state.store.count_tasks().await.unwrap(), 1);
+        let routing = state.store.delivery_routing("delivery-a").await.unwrap();
+        assert!(
+            routing.as_deref().unwrap_or_default().starts_with("task:"),
+            "routing should point at the task: {routing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_a_delivery_id_does_not_create_a_second_task() {
+        let state = app_state();
+        let body = issue_assigned_body();
+
+        let (s1, j1) = call(
+            &state,
+            signed_headers(&body, "issues", Some("delivery-dup")),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(s1, StatusCode::OK);
+        assert!(j1.get("duplicate").is_none());
+        assert_eq!(state.store.count_tasks().await.unwrap(), 1);
+
+        // Same delivery id again — the idempotency gate.
+        let (s2, j2) = call(
+            &state,
+            signed_headers(&body, "issues", Some("delivery-dup")),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(j2["duplicate"], true);
+        assert_eq!(
+            state.store.count_tasks().await.unwrap(),
+            1,
+            "a redelivered webhook must not create a second task"
+        );
+    }
+
+    #[tokio::test]
+    async fn unactionable_event_records_ignored_routing_without_a_task() {
+        let state = app_state();
+        // `issues` with an action we don't route parses as Unsupported.
+        let body = serde_json::to_vec(&json!({
+            "action": "closed",
+            "installation": { "id": 123 },
+            "repository": { "name": "coven-code", "owner": { "login": "OpenCoven" } },
+            "issue": { "number": 42, "title": "t", "body": "b" }
+        }))
+        .unwrap();
+        let headers = signed_headers(&body, "issues", Some("delivery-ignored"));
+
+        let (status, _) = call(&state, headers, body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.store.count_tasks().await.unwrap(), 0);
+        assert_eq!(
+            state
+                .store
+                .delivery_routing("delivery-ignored")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ignored:unsupported")
+        );
     }
 }
