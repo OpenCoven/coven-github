@@ -111,6 +111,27 @@ async fn main() -> Result<()> {
                 worker::run(worker_config, worker_store, worker_notify).await;
             });
 
+            // Memory retention sweep (issue #6): when a retention horizon is
+            // configured, periodically expire audit rows older than it. The
+            // first tick fires immediately, so a stale audit is trimmed at boot.
+            if let Some(retention_days) = config.memory.retention_days {
+                let sweep_store = store.clone();
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                    loop {
+                        ticker.tick().await;
+                        match sweep_store.expire_memory_activity(retention_days).await {
+                            Ok(0) => {}
+                            Ok(expired) => {
+                                tracing::info!(expired, "expired memory activity past retention")
+                            }
+                            Err(e) => tracing::error!("memory retention sweep failed: {e:#}"),
+                        }
+                    }
+                });
+            }
+
             // Build router.
             let state = AppState {
                 config: config.clone(),
