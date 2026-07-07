@@ -7,13 +7,15 @@
 //! runtime.
 
 use anyhow::{Context, Result};
+use coven_github_api::tasks::{surface_of, TaskListItem, TaskListStatus};
 use coven_github_api::{Task, TaskKind};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Handle to the durable store. Cheap to clone; all clones share one writer
 /// connection.
@@ -147,6 +149,300 @@ impl Store {
         .await
         .expect("store task panicked")
     }
+
+    /// Atomically claims the oldest queued task, marking it `running` and
+    /// opening an attempt record. Returns `None` when the queue is empty.
+    /// Tombstoned (`superseded`) rows are never claimable.
+    pub async fn claim_next(&self) -> Result<Option<Task>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let now = now_rfc3339();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let claimed = tx
+                .query_row(
+                    "UPDATE tasks
+                       SET state = 'running', attempts = attempts + 1, updated_at = ?1
+                     WHERE id = (SELECT id FROM tasks
+                                 WHERE state = 'queued'
+                                 ORDER BY created_at, id LIMIT 1)
+                     RETURNING id, installation_id, repo, familiar_id, kind,
+                               commander, attempts",
+                    params![now],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, u32>(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((id, installation_id, repo, familiar_id, kind_json, commander, attempt)) =
+                claimed
+            else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            tx.execute(
+                "INSERT INTO task_attempts (task_id, attempt, started_at)
+                 VALUES (?1, ?2, ?3)",
+                params![id, attempt, now],
+            )?;
+            tx.commit()?;
+
+            let (repo_owner, repo_name) = repo
+                .split_once('/')
+                .map(|(o, n)| (o.to_string(), n.to_string()))
+                .unwrap_or_else(|| (repo.clone(), String::new()));
+            let kind: TaskKind =
+                serde_json::from_str(&kind_json).context("stored task kind is unreadable")?;
+            Ok(Some(Task {
+                id,
+                installation_id,
+                repo_owner,
+                repo_name,
+                familiar_id,
+                commander,
+                kind,
+            }))
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Records the Check Run URL once pre-flight created it.
+    pub async fn set_check_run_url(&self, task_id: &str, url: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let (task_id, url) = (task_id.to_string(), url.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "UPDATE tasks SET check_run_url = ?1, updated_at = ?2 WHERE id = ?3",
+                params![url, now_rfc3339(), task_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Moves a task to its terminal state and closes the open attempt.
+    /// Idempotent and safe on unknown ids (0 rows updated).
+    pub async fn finish(&self, task_id: &str, terminal: Terminal) -> Result<()> {
+        let conn = self.conn.clone();
+        let task_id = task_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let now = now_rfc3339();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE tasks
+                   SET state = ?1, result_status = ?2, branch = ?3, pr_number = ?4,
+                       summary = ?5, updated_at = ?6
+                 WHERE id = ?7",
+                params![
+                    terminal.state.as_str(),
+                    terminal.result_status,
+                    terminal.branch,
+                    terminal.pr_number,
+                    terminal.summary,
+                    now,
+                    task_id,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE task_attempts SET ended_at = ?1, outcome = ?2, detail = ?3
+                 WHERE task_id = ?4 AND ended_at IS NULL",
+                params![now, terminal.state.as_str(), terminal.detail, task_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Startup recovery: any `running` row belongs to a dead process (one
+    /// process owns the store). Requeue it — or fail it once its claim
+    /// attempts reach `max_attempts`, so a crash-looping task cannot poison
+    /// the queue. Returns `(requeued, failed)`.
+    pub async fn recover_interrupted(&self, max_attempts: u32) -> Result<(usize, usize)> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let now = now_rfc3339();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE task_attempts SET ended_at = ?1, outcome = 'interrupted'
+                 WHERE ended_at IS NULL",
+                params![now],
+            )?;
+            let failed = tx.execute(
+                "UPDATE tasks SET state = 'failed', updated_at = ?1,
+                        summary = COALESCE(summary, 'interrupted repeatedly; giving up')
+                 WHERE state = 'running' AND attempts >= ?2",
+                params![now, max_attempts],
+            )?;
+            let requeued = tx.execute(
+                "UPDATE tasks SET state = 'queued', updated_at = ?1
+                 WHERE state = 'running'",
+                params![now],
+            )?;
+            tx.commit()?;
+            Ok((requeued, failed))
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// Tombstones every still-queued task for a supersession key (the
+    /// maintainer `cancel` command). Returns how many were cancelled.
+    pub async fn cancel_queued(&self, supersede_key: &str) -> Result<usize> {
+        let conn = self.conn.clone();
+        let key = supersede_key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let n = conn.execute(
+                "UPDATE tasks SET state = 'superseded', updated_at = ?1
+                 WHERE supersede_key = ?2 AND state = 'queued'",
+                params![now_rfc3339(), key],
+            )?;
+            Ok(n)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
+    /// The Cave oversight projection: every non-reply task, newest first.
+    /// `familiar_names` maps familiar ids to display names (config-owned).
+    pub async fn cave_list(
+        &self,
+        familiar_names: HashMap<String, String>,
+    ) -> Result<Vec<TaskListItem>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id, repo, familiar_id, kind, state, result_status,
+                        branch, pr_number, check_run_url, updated_at
+                 FROM tasks
+                 WHERE json_extract(kind, '$.kind') <> 'command_reply'
+                 ORDER BY updated_at DESC, id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })?;
+            let mut items = Vec::new();
+            for row in rows {
+                let (
+                    id,
+                    repo,
+                    familiar_id,
+                    kind_json,
+                    state,
+                    result_status,
+                    branch,
+                    pr_number,
+                    check_run_url,
+                    updated_at,
+                ) = row?;
+                let kind: TaskKind = serde_json::from_str(&kind_json)
+                    .context("stored task kind is unreadable")?;
+                let (issue_number, issue_title) = surface_of(&kind);
+                let status = project_status(&state, result_status.as_deref(), pr_number);
+                items.push(TaskListItem {
+                    id: id.clone(),
+                    repo: repo.clone(),
+                    issue_number,
+                    issue_title,
+                    branch,
+                    pr_number,
+                    pr_url: pr_number.map(|n| format!("https://github.com/{repo}/pull/{n}")),
+                    status,
+                    familiar_id: familiar_id.clone(),
+                    familiar_name: familiar_names
+                        .get(&familiar_id)
+                        .cloned()
+                        .unwrap_or(familiar_id),
+                    session_id: Some(id),
+                    updated_at,
+                    check_run_url,
+                });
+            }
+            Ok(items)
+        })
+        .await
+        .expect("store task panicked")
+    }
+}
+
+/// Terminal transition applied by [`Store::finish`].
+#[derive(Debug, Clone, Default)]
+pub struct Terminal {
+    pub state: TerminalState,
+    /// Session result classification: `success` / `partial` / `failure` /
+    /// `needs_input`. `None` for adapter-only outcomes (replies, declines).
+    pub result_status: Option<String>,
+    pub branch: Option<String>,
+    pub pr_number: Option<u64>,
+    pub summary: Option<String>,
+    /// Attempt detail (already redacted by the caller).
+    pub detail: Option<String>,
+}
+
+/// Durable terminal states a claimed task can reach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TerminalState {
+    #[default]
+    Completed,
+    Failed,
+    /// The target moved or a newer event replaced this task (issues #8/#10).
+    Superseded,
+}
+
+impl TerminalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            TerminalState::Completed => "completed",
+            TerminalState::Failed => "failed",
+            TerminalState::Superseded => "superseded",
+        }
+    }
+}
+
+/// Maps durable machine state (+ result classification) to the Cave status.
+fn project_status(
+    state: &str,
+    result_status: Option<&str>,
+    pr_number: Option<u64>,
+) -> TaskListStatus {
+    match state {
+        "queued" => TaskListStatus::Queued,
+        "running" => TaskListStatus::Running,
+        "superseded" => TaskListStatus::Superseded,
+        "failed" => TaskListStatus::Failed,
+        // completed: a PR or an open question needs a human next.
+        _ if result_status == Some("needs_input") || pr_number.is_some() => {
+            TaskListStatus::Review
+        }
+        _ => TaskListStatus::Done,
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -202,6 +498,11 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )
         .context("failed to apply schema v1")?;
+    }
+    if version < 2 {
+        // v2: terminal result classification for the Cave projection.
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN result_status TEXT;")
+            .context("failed to apply schema v2")?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -436,5 +737,195 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 999);
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn delivery(id: &str) -> Delivery {
+        Delivery {
+            delivery_id: id.to_string(),
+            event: "issues".to_string(),
+            action: Some("assigned".to_string()),
+            installation_id: Some(1),
+            repo: Some("OpenCoven/demo".to_string()),
+            payload_hash: "h".to_string(),
+        }
+    }
+
+    fn fix_task(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            installation_id: 1,
+            repo_owner: "OpenCoven".to_string(),
+            repo_name: "demo".to_string(),
+            familiar_id: "cody".to_string(),
+            commander: Some("octocat".to_string()),
+            kind: TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "Fix auth".to_string(),
+                issue_body: "b".to_string(),
+            },
+        }
+    }
+
+    fn review_task(id: &str, pr: u64) -> Task {
+        Task {
+            kind: TaskKind::ReviewPullRequest {
+                pr_number: pr,
+                pr_title: "t".to_string(),
+                reason: "synchronize".to_string(),
+            },
+            commander: None,
+            ..fix_task(id)
+        }
+    }
+
+    async fn enqueue(store: &Store, delivery_id: &str, task: &Task) {
+        store
+            .record_delivery(delivery(delivery_id), Routing::Task(task))
+            .await
+            .expect("enqueue");
+    }
+
+    #[tokio::test]
+    async fn claims_are_fifo_and_reconstruct_the_task() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &fix_task("t1")).await;
+        enqueue(&store, "d2", &fix_task("t2")).await;
+
+        let first = store.claim_next().await.unwrap().expect("first claim");
+        assert_eq!(first.id, "t1");
+        assert_eq!(first.repo_owner, "OpenCoven");
+        assert_eq!(first.repo_name, "demo");
+        assert_eq!(first.commander.as_deref(), Some("octocat"));
+        assert!(matches!(
+            first.kind,
+            TaskKind::FixIssue { issue_number: 42, .. }
+        ));
+
+        let second = store.claim_next().await.unwrap().expect("second claim");
+        assert_eq!(second.id, "t2");
+        assert!(store.claim_next().await.unwrap().is_none(), "queue drained");
+    }
+
+    #[tokio::test]
+    async fn superseded_rows_are_never_claimed() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &review_task("old", 88)).await;
+        enqueue(&store, "d2", &review_task("new", 88)).await;
+
+        let claimed = store.claim_next().await.unwrap().expect("claim");
+        assert_eq!(claimed.id, "new", "the tombstoned review must be skipped");
+        assert!(store.claim_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_reaches_terminal_state_and_closes_the_attempt() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &fix_task("t1")).await;
+        let task = store.claim_next().await.unwrap().expect("claim");
+        store
+            .finish(
+                &task.id,
+                Terminal {
+                    state: TerminalState::Completed,
+                    result_status: Some("success".to_string()),
+                    branch: Some("cody/fix-42".to_string()),
+                    pr_number: Some(9),
+                    summary: Some("done".to_string()),
+                    detail: None,
+                },
+            )
+            .await
+            .expect("finish");
+
+        let items = store
+            .cave_list(HashMap::from([("cody".to_string(), "Cody".to_string())]))
+            .await
+            .expect("list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, TaskListStatus::Review);
+        assert_eq!(items[0].pr_number, Some(9));
+        assert_eq!(
+            items[0].pr_url.as_deref(),
+            Some("https://github.com/OpenCoven/demo/pull/9")
+        );
+        assert_eq!(items[0].familiar_name, "Cody");
+        assert_eq!(items[0].issue_title, "Fix auth");
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_requeues_or_fails_by_attempt_budget() {
+        let store = Store::open_in_memory().expect("open");
+
+        // "spent" burns three claim attempts across simulated crashes.
+        enqueue(&store, "d1", &fix_task("spent")).await;
+        for _ in 0..2 {
+            let claimed = store.claim_next().await.unwrap().expect("claim spent");
+            assert_eq!(claimed.id, "spent");
+            store.recover_interrupted(99).await.expect("interim recovery");
+        }
+        let claimed = store.claim_next().await.unwrap().expect("third claim");
+        assert_eq!(claimed.id, "spent");
+
+        // "fresh" is claimed once; both are mid-run when the process dies.
+        enqueue(&store, "d2", &fix_task("fresh")).await;
+        let claimed = store.claim_next().await.unwrap().expect("claim fresh");
+        assert_eq!(claimed.id, "fresh");
+
+        // Boot with a budget of 3 claims: "spent" fails, "fresh" requeues.
+        let (requeued, failed) = store.recover_interrupted(3).await.expect("recovery");
+        assert_eq!((requeued, failed), (1, 1));
+        let states: HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["spent"], "failed");
+        assert_eq!(states["fresh"], "queued");
+
+        // The requeued task is claimable again; the failed one is not.
+        let reclaimed = store.claim_next().await.unwrap().expect("re-claim");
+        assert_eq!(reclaimed.id, "fresh");
+        assert!(store.claim_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_tombstones_only_queued_rows_for_the_key() {
+        let store = Store::open_in_memory().expect("open");
+        enqueue(&store, "d1", &review_task("running", 88)).await;
+        let claimed = store.claim_next().await.unwrap().expect("claim");
+        assert_eq!(claimed.id, "running");
+        enqueue(&store, "d2", &review_task("queued", 88)).await;
+        enqueue(&store, "d3", &review_task("other", 89)).await;
+
+        let n = store.cancel_queued("OpenCoven/demo#88").await.expect("cancel");
+        assert_eq!(n, 1, "only the queued row for PR 88 is cancellable");
+
+        let states: HashMap<String, String> =
+            store.task_states().await.unwrap().into_iter().collect();
+        assert_eq!(states["running"], "running", "in-flight work is untouched");
+        assert_eq!(states["queued"], "superseded");
+        assert_eq!(states["other"], "queued");
+    }
+
+    #[tokio::test]
+    async fn cave_list_hides_command_replies_and_orders_newest_first() {
+        let store = Store::open_in_memory().expect("open");
+        let reply = Task {
+            kind: TaskKind::CommandReply {
+                issue_number: 42,
+                body: "Status: done".to_string(),
+            },
+            commander: None,
+            ..fix_task("reply")
+        };
+        enqueue(&store, "d1", &fix_task("work")).await;
+        enqueue(&store, "d2", &reply).await;
+
+        let items = store.cave_list(HashMap::new()).await.expect("list");
+        assert_eq!(items.len(), 1, "adapter replies are not Cave tasks");
+        assert_eq!(items[0].id, "work");
+        assert_eq!(items[0].status, TaskListStatus::Queued);
     }
 }

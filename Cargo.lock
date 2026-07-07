@@ -333,7 +333,6 @@ name = "coven-github-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "jsonwebtoken",
  "reqwest",
  "serde",
@@ -391,6 +390,7 @@ dependencies = [
  "anyhow",
  "coven-github-api",
  "coven-github-config",
+ "coven-github-store",
  "serde",
  "serde_json",
  "tokio",

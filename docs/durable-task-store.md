@@ -1,7 +1,8 @@
 # Durable task store and delivery idempotency — design (issue #2)
 
-Status: **accepted** — phase 1 (store crate + delivery idempotency) is
-implemented; phases 2–3 below are pending.
+Status: **implemented** — phases 1–3 landed; the tasks table is the queue,
+claims are atomic, interrupted work is requeued at startup, and the Cave
+list is served from SQLite.
 
 ## Problem
 

@@ -31,8 +31,8 @@ flowchart LR
 | Capability | Self-hosted adapter | Hosted OpenCoven |
 |---|---|---|
 | GitHub App ingress | You run it | Managed |
-| Queue | In-process/dev path until configured | Durable queue |
-| Task state | Local/in-memory unless extended | Persistent history |
+| Queue | Durable SQLite queue built in | Managed durable queue |
+| Task state | Persistent across restarts (SQLite) | Persistent history at fleet scale |
 | Worker isolation | Operator-managed | Managed worker pool |
 | Familiar routing | Static config | Installation/repo scoped |
 | Familiar memory | Local/operator-managed | Optional cloud memory |

@@ -7,11 +7,9 @@ use axum::{
 };
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use coven_github_api::tasks::TaskStore;
 use coven_github_config::Config;
 use coven_github_webhook::routes::{handle_webhook, list_tasks, AppState};
 use coven_github_worker as worker;
@@ -86,30 +84,36 @@ async fn main() -> Result<()> {
 
             let config = Arc::new(config);
 
-            // Durable deliveries + tasks (issue #2): open before serving so a
-            // broken storage path fails the boot, not the first delivery.
+            // Durable deliveries + task queue (issue #2): open before serving
+            // so a broken storage path fails the boot, not the first delivery.
+            // Any `running` rows belong to a previous process — requeue them
+            // (or fail them once their attempts are spent).
             let store = coven_github_store::Store::open(&config.storage.path)?;
+            let (requeued, failed) = store
+                .recover_interrupted(config.worker.max_retries + 1)
+                .await?;
             tracing::info!(
+                requeued,
+                failed,
                 "durable store ready at {}",
                 config.storage.path.display()
             );
 
-            let (task_tx, task_rx) = mpsc::channel(256);
-            let task_store = TaskStore::default();
+            let notify = Arc::new(tokio::sync::Notify::new());
 
-            // Spawn worker pool.
+            // Spawn the worker claim loop.
             let worker_config = config.clone();
-            let worker_task_store = task_store.clone();
+            let worker_store = store.clone();
+            let worker_notify = notify.clone();
             tokio::spawn(async move {
-                worker::run(worker_config, worker_task_store, task_rx).await;
+                worker::run(worker_config, worker_store, worker_notify).await;
             });
 
             // Build router.
             let state = AppState {
                 config: config.clone(),
-                task_tx,
-                task_store,
                 store,
+                notify,
             };
 
             let app = Router::new()

@@ -7,11 +7,11 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use coven_github_api::{
-    check_run, installation, installation::TokenRole, pr, repo, tasks::TaskStore,
-    ReviewEvidenceStatus, ReviewMode, SessionResult, SessionStatus, Task, TaskKind,
-    DEFAULT_API_BASE_URL,
+    check_run, installation, installation::TokenRole, pr, repo, ReviewEvidenceStatus, ReviewMode,
+    SessionResult, SessionStatus, Task, TaskKind, DEFAULT_API_BASE_URL,
 };
 use coven_github_config::{Config, FamiliarConfig};
+use coven_github_store::{Store, Terminal, TerminalState};
 
 pub mod brief;
 pub mod redact;
@@ -24,46 +24,51 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Default Cave base URL used in familiar-voice comments when none is configured.
 const DEFAULT_CAVE_BASE_URL: &str = "https://cave.opencoven.ai";
 
-/// Runs the worker loop: pulls tasks and executes them concurrently.
+/// Runs the worker loop: claims queued tasks from the durable store and
+/// executes them concurrently (issue #2). `notify` is a wake-up signal from
+/// the webhook path; a poll-timeout backstops missed wake-ups.
 pub async fn run(
     config: std::sync::Arc<Config>,
-    task_store: TaskStore,
-    mut task_rx: tokio::sync::mpsc::Receiver<Task>,
+    store: Store,
+    notify: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.worker.concurrency));
 
-    while let Some(task) = task_rx.recv().await {
-        let config = config.clone();
-        let task_store = task_store.clone();
+    loop {
+        // Hold capacity BEFORE claiming so a claimed task is never parked
+        // behind a saturated pool while marked running.
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
-            // The semaphore is only ever closed on shutdown; stop pulling tasks.
             Err(_) => break,
         };
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = execute_task(&config, task_store, task).await {
-                error!("task execution error: {e:#}");
+        match store.claim_next().await {
+            Ok(Some(task)) => {
+                let config = config.clone();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = execute_task(&config, store, task).await {
+                        error!("task execution error: {e:#}");
+                    }
+                });
             }
-        });
+            Ok(None) => {
+                drop(permit);
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
+            Err(e) => {
+                drop(permit);
+                error!("failed to claim from the durable queue: {e:#}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
-async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Result<()> {
-    // A newer PR event may have superseded this queued review; skip silently
-    // before spending any GitHub calls on it (issue #10).
-    if let TaskKind::ReviewPullRequest { pr_number, .. } = &task.kind {
-        let repo = format!("{}/{}", task.repo_owner, task.repo_name);
-        if !task_store
-            .is_current_pr_review(&repo, *pr_number, &task.id)
-            .await
-        {
-            info!(task_id = %task.id, "PR review superseded by a newer event — skipping");
-            return Ok(());
-        }
-    }
-
+async fn execute_task(config: &Config, store: Store, task: Task) -> Result<()> {
     let api_base_url = config
         .github
         .api_base_url
@@ -77,7 +82,7 @@ async fn execute_task(config: &Config, task_store: TaskStore, task: Task) -> Res
         installation_id: task.installation_id,
         repo_name: task.repo_name.clone(),
     };
-    execute_task_with_minter(config, task_store, task, &minter).await
+    execute_task_with_minter(config, store, task, &minter).await
 }
 
 /// Pre-flight outcome: ready to work, or declined at the permission gate.
@@ -95,7 +100,7 @@ enum Prepared {
 /// Task execution past minter construction; tests inject `Minter::Fixed`.
 async fn execute_task_with_minter(
     config: &Config,
-    task_store: TaskStore,
+    store: Store,
     task: Task,
     minter: &Minter,
 ) -> Result<()> {
@@ -111,7 +116,7 @@ async fn execute_task_with_minter(
         .unwrap_or(DEFAULT_API_BASE_URL);
 
     // Command replies are adapter-only (issue #13): update the status surface
-    // and stop — no coven-code session, no Check Run, no task-store entry.
+    // and finish — no coven-code session, no Check Run.
     if let TaskKind::CommandReply { issue_number, body } = &task.kind {
         let orchestration = minter.mint(TokenRole::Orchestration).await?;
         let marker =
@@ -126,6 +131,15 @@ async fn execute_task_with_minter(
             body,
         )
         .await?;
+        store
+            .finish(
+                &task.id,
+                Terminal {
+                    state: TerminalState::Completed,
+                    ..Terminal::default()
+                },
+            )
+            .await?;
         return Ok(());
     }
 
@@ -219,22 +233,40 @@ async fn execute_task_with_minter(
                     warn!(task_id = %task.id, "failed to post decline: {e:#}");
                 }
             }
+            store
+                .finish(
+                    &task.id,
+                    Terminal {
+                        state: TerminalState::Completed,
+                        summary: Some("declined — maintainer commands need write access".into()),
+                        ..Terminal::default()
+                    },
+                )
+                .await?;
             return Ok(());
         }
         Err(e) => {
             error!(task_id = %task.id, "pre-flight failed before check run: {e:#}");
-            task_store
-                .register_failed(&task, &familiar.display_name)
-                .await;
+            store
+                .finish(
+                    &task.id,
+                    Terminal {
+                        state: TerminalState::Failed,
+                        detail: Some(redact::redact(&format!("{e:#}"), &[])),
+                        ..Terminal::default()
+                    },
+                )
+                .await
+                .ok();
             return Err(e);
         }
     };
 
     let repo = format!("{}/{}", task.repo_owner, task.repo_name);
-    let check_run_url = Some(format!("https://github.com/{repo}/runs/{check_id}"));
-    task_store
-        .mark_running(&task, &familiar.display_name, check_run_url)
-        .await;
+    let check_run_url = format!("https://github.com/{repo}/runs/{check_id}");
+    if let Err(e) = store.set_check_run_url(&task.id, &check_run_url).await {
+        warn!(task_id = %task.id, "failed to record check run url: {e:#}");
+    }
 
     // Everything past check creation is fallible but must not orphan the check
     // or leak the workspace. Run it, then finalize unconditionally below.
@@ -262,7 +294,20 @@ async fn execute_task_with_minter(
         // stale review output as if it covered the current head.
         Ok(published) if published.stale.is_some() => {
             let stale = published.stale.as_ref().expect("guarded by arm");
-            task_store.mark_superseded(&task.id).await;
+            store
+                .finish(
+                    &task.id,
+                    Terminal {
+                        state: TerminalState::Superseded,
+                        summary: Some(format!(
+                            "head moved {} -> {} mid-review",
+                            stale.reviewed_sha, stale.current_sha
+                        )),
+                        ..Terminal::default()
+                    },
+                )
+                .await
+                .ok();
             if let Some(number) = surface_number(&task.kind) {
                 let marker = status_comment::marker(
                     &familiar.id,
@@ -311,9 +356,10 @@ async fn execute_task_with_minter(
         }
         Ok(published) => {
             let disp = disposition(&published.result);
-            task_store
-                .mark_complete(&task.id, &repo, &published.result, published.opened_pr)
-                .await;
+            store
+                .finish(&task.id, terminal_of(&published))
+                .await
+                .ok();
             // Terminal state on the marker-backed status surface (issue #13).
             if let Some(number) = surface_number(&task.kind) {
                 let marker = status_comment::marker(
@@ -355,7 +401,17 @@ async fn execute_task_with_minter(
         }
         Err(e) => {
             error!(task_id = %task.id, "session failed: {e:#}");
-            task_store.mark_failed(&task.id).await;
+            store
+                .finish(
+                    &task.id,
+                    Terminal {
+                        state: TerminalState::Failed,
+                        detail: Some(redact::redact(&format!("{e:#}"), &[&orchestration])),
+                        ..Terminal::default()
+                    },
+                )
+                .await
+                .ok();
             if let Some(number) = surface_number(&task.kind) {
                 let marker = status_comment::marker(
                     &familiar.id,
@@ -763,6 +819,29 @@ struct Disposition {
     conclusion: check_run::CheckConclusion,
     title: &'static str,
     open_pr: bool,
+}
+
+/// Durable terminal record for a published session outcome (issue #2).
+fn terminal_of(published: &Published) -> Terminal {
+    let result = &published.result;
+    let state = match result.status {
+        SessionStatus::Failure => TerminalState::Failed,
+        _ => TerminalState::Completed,
+    };
+    let result_status = match result.status {
+        SessionStatus::Success => "success",
+        SessionStatus::Partial => "partial",
+        SessionStatus::Failure => "failure",
+        SessionStatus::NeedsInput => "needs_input",
+    };
+    Terminal {
+        state,
+        result_status: Some(result_status.to_string()),
+        branch: result.branch.clone(),
+        pr_number: published.opened_pr,
+        summary: Some(result.summary.clone()),
+        detail: None,
+    }
 }
 
 fn disposition(result: &SessionResult) -> Disposition {
@@ -1994,74 +2073,6 @@ exit 0
 }
 
 #[cfg(test)]
-mod supersession_tests {
-    use super::*;
-    use coven_github_config::{FamiliarConfig, GitHubAppConfig, ServerConfig, WorkerConfig};
-    use std::path::PathBuf;
-
-    /// A superseded queued review must return cleanly before any network or
-    /// filesystem work — the config below would fail loudly if touched.
-    #[tokio::test]
-    async fn superseded_pr_review_is_skipped_before_preflight() {
-        let config = Config {
-            server: ServerConfig {
-                bind: "127.0.0.1:0".to_string(),
-                cave_base_url: None,
-            },
-            github: GitHubAppConfig {
-                app_id: 1,
-                private_key_path: PathBuf::from("/nonexistent/never-read.pem"),
-                webhook_secret: "secret".to_string(),
-                api_base_url: Some("http://127.0.0.1:1".to_string()),
-            },
-            worker: WorkerConfig {
-                concurrency: 1,
-                coven_code_bin: PathBuf::from("/nonexistent/coven-code"),
-                workspace_root: PathBuf::from("/nonexistent/workspaces"),
-                timeout_secs: 1,
-                max_retries: 0,
-            },
-            familiars: vec![FamiliarConfig {
-                id: "cody".to_string(),
-                display_name: "Cody".to_string(),
-                bot_username: "coven-cody[bot]".to_string(),
-                model: None,
-                skills: vec![],
-                trigger_labels: vec![],
-            }],
-            review: coven_github_config::ReviewConfig::default(),
-            storage: coven_github_config::StorageConfig::default(),
-        };
-        let task = Task {
-            id: "task-old".to_string(),
-            installation_id: 1,
-            repo_owner: "OpenCoven".to_string(),
-            repo_name: "demo".to_string(),
-            familiar_id: "cody".to_string(),
-            commander: None,
-            kind: TaskKind::ReviewPullRequest {
-                pr_number: 88,
-                pr_title: "t".to_string(),
-                reason: "synchronize".to_string(),
-            },
-        };
-        let task_store = TaskStore::default();
-        task_store
-            .register_pr_review("OpenCoven/demo", 88, "task-newer")
-            .await;
-
-        execute_task(&config, task_store.clone(), task)
-            .await
-            .expect("superseded review should skip cleanly");
-
-        assert!(
-            task_store.list().await.is_empty(),
-            "a skipped review must not surface as a task in Cave"
-        );
-    }
-}
-
-#[cfg(test)]
 mod stale_ref_tests {
     use super::*;
     use coven_github_api::installation::TokenRole;
@@ -2205,14 +2216,29 @@ exit 0
                 reason: "synchronize".to_string(),
             },
         };
-        let task_store = TaskStore::default();
+        let store = Store::open_in_memory().expect("store");
+        // Seed the durable queued row the webhook path would have written.
+        store
+            .record_delivery(
+                coven_github_store::Delivery {
+                    delivery_id: "dl-stale".to_string(),
+                    event: "pull_request".to_string(),
+                    action: Some("synchronize".to_string()),
+                    installation_id: Some(1),
+                    repo: Some("OpenCoven/demo".to_string()),
+                    payload_hash: "h".to_string(),
+                },
+                coven_github_store::Routing::Task(&task),
+            )
+            .await
+            .expect("seed task row");
 
-        execute_task_with_minter(&config, task_store.clone(), task, &fixed_minter())
+        execute_task_with_minter(&config, store.clone(), task, &fixed_minter())
             .await
             .expect("stale review must complete cleanly");
 
         // Cave sees the honest terminal state.
-        let items = task_store.list().await;
+        let items = store.cave_list(HashMap::new()).await.expect("list");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, TaskListStatus::Superseded);
 
@@ -2340,7 +2366,7 @@ mod command_and_marker_tests {
 
         execute_task_with_minter(
             &config(server.uri()),
-            TaskStore::default(),
+            Store::open_in_memory().expect("store"),
             task(
                 TaskKind::CommandReply {
                     issue_number: 42,
@@ -2387,7 +2413,7 @@ mod command_and_marker_tests {
 
         execute_task_with_minter(
             &config(server.uri()),
-            TaskStore::default(),
+            Store::open_in_memory().expect("store"),
             task(
                 TaskKind::CommandReply {
                     issue_number: 42,
@@ -2435,22 +2461,33 @@ mod command_and_marker_tests {
             .mount(&server)
             .await;
 
-        let store = TaskStore::default();
-        execute_task_with_minter(
-            &config(server.uri()),
-            store.clone(),
-            task(
-                TaskKind::FixIssue {
-                    issue_number: 42,
-                    issue_title: "t".to_string(),
-                    issue_body: "b".to_string(),
+        let store = Store::open_in_memory().expect("store");
+        let task = task(
+            TaskKind::FixIssue {
+                issue_number: 42,
+                issue_title: "t".to_string(),
+                issue_body: "b".to_string(),
+            },
+            Some("drive-by"),
+        );
+        // Seed the durable queued row the webhook path would have written.
+        store
+            .record_delivery(
+                coven_github_store::Delivery {
+                    delivery_id: "dl-declined".to_string(),
+                    event: "issue_comment".to_string(),
+                    action: Some("created".to_string()),
+                    installation_id: Some(1),
+                    repo: Some("OpenCoven/demo".to_string()),
+                    payload_hash: "h".to_string(),
                 },
-                Some("drive-by"),
-            ),
-            &fixed_minter(),
-        )
-        .await
-        .expect("a declined command is not an error");
+                coven_github_store::Routing::Task(&task),
+            )
+            .await
+            .expect("seed task row");
+        execute_task_with_minter(&config(server.uri()), store.clone(), task, &fixed_minter())
+            .await
+            .expect("a declined command is not an error");
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert!(
@@ -2466,9 +2503,9 @@ mod command_and_marker_tests {
             body.contains("Status: declined"),
             "decline body: {body}"
         );
-        assert!(
-            store.list().await.is_empty(),
-            "declined commands must not surface as tasks"
-        );
+        // The durable record stays honest: terminal, with the decline noted.
+        let states = store.task_states().await.expect("states");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].1, "completed");
     }
 }

@@ -13,6 +13,7 @@ tracing.workspace = true
 uuid.workspace = true
 coven-github-api = { path = "../github" }
 coven-github-config = { path = "../config" }
+coven-github-store = { path = "../store" }
 
 [dev-dependencies]
 wiremock.workspace = true
