@@ -14,6 +14,7 @@ use coven_github_config::{Config, FamiliarConfig};
 use coven_github_store::{Store, Terminal, TerminalState};
 
 pub mod brief;
+pub mod memory;
 pub mod redact;
 pub mod status_comment;
 
