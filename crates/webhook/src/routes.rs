@@ -1003,6 +1003,8 @@ mod review_lane_tests {
             pull_request: true,
             include_drafts: false,
             audit_instruction: None,
+            min_severity: None,
+            publish: None,
             repos: std::collections::HashMap::new(),
         }
     }
@@ -1100,6 +1102,8 @@ mod review_lane_tests {
                 include_drafts: None,
                 familiar: None,
                 audit_instruction: None,
+                min_severity: None,
+                publish: None,
             },
         );
         let state = app_state_with_review(review);

@@ -63,6 +63,11 @@ trigger_labels = ["coven:fix", "coven:review"]  # Labels that trigger this famil
 # pull_request = true     # Review on opened/synchronize/reopened/ready_for_review
 # include_drafts = false  # Draft PRs are skipped unless explicitly labeled
 # audit_instruction = "Focus on correctness and security."
+# min_severity = "medium"        # Withhold findings below this severity
+#                                # (info | low | medium | high | critical)
+# publish = "check_run"          # Where gated findings go: check_run (default),
+#                                # advisory_comment (also on the status comment),
+#                                # request_changes (blocking PR review verdict)
 # [review.repos."OpenCoven/coven-code"]
 # pull_request = false    # Per-repo override
 
