@@ -53,7 +53,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             error!("healthz store probe failed: {e:#}");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"ok": false, "store": "unavailable"})),
+                Json(json!({"ok": false})),
             )
                 .into_response()
         }
