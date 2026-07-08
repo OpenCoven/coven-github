@@ -11,7 +11,7 @@
 # ready-to-edit Compose service.
 
 # ── Builder ─────────────────────────────────────────────────────────────────
-FROM rust:1.83-bookworm AS builder
+FROM rust:1-bookworm AS builder
 WORKDIR /app
 
 # Copy the whole workspace and build the release binary. (A cold build pulls the
