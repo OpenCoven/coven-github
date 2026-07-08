@@ -1,0 +1,77 @@
+# Production Docker Compose for hosted coven-github: adapter + TLS ingress
+# (Caddy) + continuous SQLite replication (Litestream → Cloudflare R2).
+#
+# Runbook: docs/hosted-deploy.md. Secrets come from ./.env (never committed);
+# copy .env.example and fill it in.
+#
+# Layout on the host (created by provision.sh):
+#   /opt/coven-github/
+#     compose.yaml            this file
+#     .env                    secrets (mode 0600)
+#     Caddyfile               TLS ingress
+#     litestream.yml          replication config
+#     config/production.toml  adapter config
+#     keys/app.pem            GitHub App private key (mode 0600)
+#     data/                   SQLite store (replicated)
+
+services:
+  coven-github:
+    image: ghcr.io/opencoven/coven-github:${COVEN_GITHUB_TAG:-latest}
+    command: ["serve", "--config", "/config/production.toml"]
+    restart: unless-stopped
+    expose:
+      - "3000"
+    volumes:
+      - ./config:/config:ro
+      - ./keys:/keys:ro
+      - ./data:/data
+      - ./workspaces:/tmp/coven-github-tasks
+      # Container worker backend: the adapter launches per-task hardened
+      # containers through the host Docker daemon (docs/container-isolation.md).
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The image runs unprivileged (uid 10001); grant the host docker group so
+    # the worker can drive the daemon. provision.sh fills DOCKER_GID in .env.
+    group_add:
+      - "${DOCKER_GID:?set in .env (getent group docker | cut -d: -f3)}"
+    environment:
+      RUST_LOG: "coven_github=info"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      WEBHOOK_DOMAIN: ${WEBHOOK_DOMAIN:?set in .env, e.g. gh.opencoven.ai}
+    depends_on:
+      - coven-github
+
+  litestream:
+    image: litestream/litestream:0.3
+    restart: unless-stopped
+    command: ["replicate", "-config", "/etc/litestream.yml"]
+    volumes:
+      - ./litestream.yml:/etc/litestream.yml:ro
+      - ./data:/data
+    environment:
+      LITESTREAM_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?set in .env}
+      LITESTREAM_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?set in .env}
+      R2_BUCKET: ${R2_BUCKET:?set in .env}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:?set in .env}
+    depends_on:
+      - coven-github
+
+volumes:
+  caddy-data:
+  caddy-config:
