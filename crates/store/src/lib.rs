@@ -703,6 +703,77 @@ impl Store {
         .expect("store task panicked")
     }
 
+    /// Records a `marketplace_purchase` delivery and applies its plan
+    /// transition in one transaction. "Delivery seen" and "plan applied" are
+    /// atomic: a storage failure can never mark the delivery as handled while
+    /// dropping the transition — a lost `cancelled` would leave an account
+    /// entitled forever, and a lost `purchased` would lock a paying customer
+    /// out with no redelivery able to repair either.
+    ///
+    /// `plan` = `None` records the delivery without a state change (pending
+    /// changes, unrecognized actions). Duplicates persist nothing further.
+    pub async fn record_delivery_with_plan(
+        &self,
+        delivery: Delivery,
+        reason: &str,
+        plan: Option<AccountPlan>,
+    ) -> Result<Recorded> {
+        let routing_label = format!("ignored:{reason}");
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let now = now_rfc3339();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = tx.execute(
+                "INSERT INTO webhook_deliveries
+                   (delivery_id, event, action, installation_id, repo, payload_hash, routing, received_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(delivery_id) DO NOTHING",
+                params![
+                    delivery.delivery_id,
+                    delivery.event,
+                    delivery.action,
+                    delivery.installation_id,
+                    delivery.repo,
+                    delivery.payload_hash,
+                    routing_label,
+                    now,
+                ],
+            )?;
+            if inserted == 0 {
+                tx.commit()?;
+                return Ok(Recorded::Duplicate);
+            }
+            if let Some(plan) = plan {
+                tx.execute(
+                    "INSERT INTO account_plans
+                       (account_id, account_login, plan_name, tier, state, source, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(account_id) DO UPDATE SET
+                       account_login = excluded.account_login,
+                       plan_name     = excluded.plan_name,
+                       tier          = excluded.tier,
+                       state         = excluded.state,
+                       source        = excluded.source,
+                       updated_at    = excluded.updated_at",
+                    params![
+                        plan.account_id,
+                        plan.account_login,
+                        plan.plan_name,
+                        plan.tier,
+                        plan.state,
+                        plan.source,
+                        now,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(Recorded::New)
+        })
+        .await
+        .expect("store task panicked")
+    }
+
     /// Upsert the account behind one installation (from `installation`
     /// webhook events) so installation → plan can be resolved.
     pub async fn record_installation_account(
@@ -2323,6 +2394,53 @@ mod entitlement_tests {
         let tiers = store.entitled_installation_tiers().await.unwrap();
         assert_eq!(tiers.get(&7).map(String::as_str), Some("team"));
         assert!(!tiers.contains_key(&8));
+    }
+
+
+    #[tokio::test]
+    async fn delivery_and_plan_transition_are_atomic_and_dedupe_together() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_installation_account(7, 42, "acme").await.unwrap();
+        let delivery = |id: &str| Delivery {
+            delivery_id: id.to_string(),
+            event: "marketplace_purchase".to_string(),
+            action: Some("purchased".to_string()),
+            installation_id: None,
+            repo: None,
+            payload_hash: "h".to_string(),
+        };
+
+        let first = store
+            .record_delivery_with_plan(
+                delivery("mp-1"),
+                "marketplace_purchase:purchased",
+                Some(plan(42, "team", "active")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, Recorded::New);
+        assert!(store.plan_for_installation(7).await.unwrap().unwrap().entitled());
+
+        // A redelivery of the same id must not reapply state — a later,
+        // newer transition would otherwise be clobbered by a stale replay.
+        let replay = store
+            .record_delivery_with_plan(
+                delivery("mp-1"),
+                "marketplace_purchase:purchased",
+                Some(plan(42, "starter", "cancelled")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, Recorded::Duplicate);
+        assert_eq!(store.plan_for_installation(7).await.unwrap().unwrap().tier, "team");
+
+        // `None` records the delivery without touching the plan.
+        let noop = store
+            .record_delivery_with_plan(delivery("mp-2"), "marketplace_purchase:pending_change", None)
+            .await
+            .unwrap();
+        assert_eq!(noop, Recorded::New);
+        assert_eq!(store.plan_for_installation(7).await.unwrap().unwrap().state, "active");
     }
 
     #[tokio::test]

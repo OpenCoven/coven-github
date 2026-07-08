@@ -831,10 +831,50 @@ async fn handle_marketplace_purchase(
     let action = payload.action.as_deref().unwrap_or("");
     let reason = format!("marketplace_purchase:{action}");
 
-    // Dedupe first: only a first-seen delivery may change plan state.
+    // Decide the transition first; the delivery record and the plan write
+    // then land in ONE store transaction, so a storage failure can never
+    // mark the delivery seen while dropping the transition (a redelivery
+    // would dedupe and the lost `cancelled`/`purchased` could never be
+    // recovered).
+    //
+    // Pending changes apply at the end of the billing cycle; GitHub sends a
+    // concrete `changed` event when they take effect. Nothing to do yet.
+    let transition = payload.marketplace_purchase.as_ref().and_then(|purchase| {
+        let plan_state = match action {
+            "purchased" | "changed" if purchase.on_free_trial => "trial",
+            "purchased" | "changed" => "active",
+            "cancelled" => "cancelled",
+            _ => return None,
+        };
+        let plan_name = purchase
+            .plan
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let tier = coven_github_config::PlanTier::parse(&plan_name);
+        Some((purchase, plan_state, plan_name, tier))
+    });
+    if payload.marketplace_purchase.is_none() {
+        warn!("marketplace_purchase delivery without a purchase object");
+    }
+
+    let record = transition
+        .as_ref()
+        .map(|(purchase, plan_state, plan_name, tier)| {
+            coven_github_store::AccountPlan {
+                account_id: purchase.account.id,
+                account_login: purchase.account.login.clone(),
+                plan_name: plan_name.clone(),
+                tier: tier.as_str().to_string(),
+                state: plan_state.to_string(),
+                source: "marketplace".to_string(),
+                updated_at: String::new(),
+            }
+        });
+
     match state
         .store
-        .record_delivery(delivery, Routing::Ignored(&reason))
+        .record_delivery_with_plan(delivery, &reason, record)
         .await
     {
         Ok(Recorded::New) => {}
@@ -845,43 +885,12 @@ async fn handle_marketplace_purchase(
         Err(e) => return storage_unavailable(e),
     }
 
-    let Some(purchase) = &payload.marketplace_purchase else {
-        warn!("marketplace_purchase delivery without a purchase object");
+    let Some((purchase, plan_state, plan_name, tier)) = transition else {
+        info!(action, "marketplace_purchase acknowledged without state change");
         return (StatusCode::OK, Json(json!({"ok": true, "ignored": reason})))
             .into_response();
     };
 
-    // Pending changes apply at the end of the billing cycle; GitHub sends a
-    // concrete `changed` event when they take effect. Nothing to do yet.
-    let plan_state = match action {
-        "purchased" | "changed" if purchase.on_free_trial => "trial",
-        "purchased" | "changed" => "active",
-        "cancelled" => "cancelled",
-        _ => {
-            info!(action, "marketplace_purchase acknowledged without state change");
-            return (StatusCode::OK, Json(json!({"ok": true, "ignored": reason})))
-                .into_response();
-        }
-    };
-
-    let plan_name = purchase
-        .plan
-        .as_ref()
-        .map(|p| p.name.clone())
-        .unwrap_or_default();
-    let tier = coven_github_config::PlanTier::parse(&plan_name);
-    let record = coven_github_store::AccountPlan {
-        account_id: purchase.account.id,
-        account_login: purchase.account.login.clone(),
-        plan_name: plan_name.clone(),
-        tier: tier.as_str().to_string(),
-        state: plan_state.to_string(),
-        source: "marketplace".to_string(),
-        updated_at: String::new(),
-    };
-    if let Err(e) = state.store.set_account_plan(record).await {
-        return storage_unavailable(e);
-    }
     info!(
         account = %purchase.account.login,
         plan = %plan_name,
@@ -889,7 +898,9 @@ async fn handle_marketplace_purchase(
         state = plan_state,
         "marketplace plan recorded"
     );
-    // Every plan transition lands in the audit trail (issue #12).
+    // Every plan transition lands in the audit trail (issue #12). Audit is
+    // observability, not entitlement state — failure logs but never 5xxs a
+    // delivery whose transition is already durable.
     if let Err(e) = state
         .store
         .record_api_read(
