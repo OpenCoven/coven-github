@@ -11,6 +11,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -1263,13 +1264,14 @@ def publish_result_if_configured(task, result_path, token):
 
 def publication_comment_body(task, result):
     status = result.get("status") or "unknown"
-    summary = result.get("summary") or "No summary returned."
-    pr_body = result.get("pr_body") or ""
     files_changed = result.get("files_changed") or []
     commits = result.get("commits") or []
     task_id = task.get("task_id") or ""
     evidence = task.get("review_evidence") or {}
     review = result.get("review") or {}
+    known_files = github_known_file_set(task, review)
+    summary = link_github_file_mentions(task, result.get("summary") or "No summary returned.", known_files)
+    pr_body = link_github_file_mentions(task, result.get("pr_body") or "", known_files)
 
     parts = [
         "## Cody dogfood result",
@@ -1295,10 +1297,14 @@ def publication_comment_body(task, result):
             ]
         )
         if changed_files:
-            parts.append("- Files: {}".format(", ".join("`{}`".format(f) for f in changed_files[:20])))
+            parts.append(
+                "- Files: {}".format(
+                    ", ".join(github_file_markdown(task, f) for f in changed_files[:20])
+                )
+            )
     else:
         parts.append("- No PR review evidence was captured for this run.")
-    parts.extend(structured_review_lines(review))
+    parts.extend(structured_review_lines(review, task, known_files))
     parts.extend(
         [
             "",
@@ -1309,6 +1315,179 @@ def publication_comment_body(task, result):
         ]
     )
     return "\n".join(parts)
+
+
+def github_blob_base(task):
+    repository = str(task.get("repository") or "").strip()
+    if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repository):
+        return None
+    evidence = task.get("review_evidence") or {}
+    ref = str(
+        evidence.get("head_sha")
+        or evidence.get("workspace_head_sha")
+        or task.get("default_branch")
+        or ""
+    ).strip()
+    if not ref:
+        return None
+    return "https://github.com/{}/blob/{}".format(repository, quote(ref, safe="/"))
+
+
+def parse_repo_relative_path(raw_path):
+    raw = str(raw_path)
+    display = raw.strip()
+    if not display or display != raw or re.search(r"[\s<>\[\]]", display):
+        return None
+    if display.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", display):
+        return None
+
+    path = display.replace("\\", "/")
+    line = None
+    end_line = None
+    line_match = re.match(r"^(.*):(\d+)(?:-(\d+))?$", path)
+    if line_match:
+        path = line_match.group(1)
+        line = int(line_match.group(2))
+        end_line = int(line_match.group(3)) if line_match.group(3) else None
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path):
+        return None
+    while path.startswith("./"):
+        path = path[2:]
+
+    segments = path.split("/")
+    filename = segments[-1] if segments else ""
+    if (
+        not path
+        or "//" in path
+        or any(not segment or segment in {".", ".."} for segment in segments)
+        or not re.search(r"\.[A-Za-z][A-Za-z0-9._-]{0,15}$", filename)
+    ):
+        return None
+    return {"display": display, "path": path, "line": line, "end_line": end_line}
+
+
+def github_file_markdown(task, raw_path, line_override=None):
+    target = parse_repo_relative_path(raw_path)
+    base = github_blob_base(task)
+    if not target or not base:
+        return "`{}`".format(raw_path)
+    encoded_path = "/".join(quote(segment, safe="") for segment in target["path"].split("/"))
+    line = line_override if line_override is not None else target["line"]
+    end_line = None if line_override is not None else target["end_line"]
+    if isinstance(line, int) and line > 0:
+        line_anchor = "#L{}".format(line)
+        if isinstance(end_line, int) and end_line > line:
+            line_anchor = "{}-L{}".format(line_anchor, end_line)
+    else:
+        line_anchor = ""
+    return "[`{}`]({}/{}{})".format(target["display"], base, encoded_path, line_anchor)
+
+
+def github_known_file_set(task, review=None):
+    known_files = set()
+    evidence = task.get("review_evidence") or {}
+    review = review or {}
+
+    def add_files(value):
+        if not isinstance(value, list):
+            return
+        for item in value:
+            target = parse_repo_relative_path(str(item))
+            if target:
+                known_files.add(target["path"])
+
+    add_files(evidence.get("changed_files"))
+    add_files(review.get("reviewed_files"))
+    add_files(review.get("supporting_files"))
+    return known_files
+
+
+def inline_code_with_github_file_links(task, raw_text):
+    raw_text = str(raw_text)
+    direct = github_file_markdown(task, raw_text)
+    if direct != "`{}`".format(raw_text):
+        return direct
+
+    linked_any = False
+    parts = []
+    for part in re.split(r"(\s+)", raw_text):
+        if not part or part.isspace():
+            parts.append(part)
+            continue
+        linked = github_file_markdown(task, part)
+        if linked != "`{}`".format(part):
+            linked_any = True
+            parts.append(linked)
+        else:
+            parts.append("`{}`".format(part))
+
+    return "".join(parts) if linked_any else "`{}`".format(raw_text)
+
+
+def bare_file_mention_allowed(task, raw_path, known_files):
+    target = parse_repo_relative_path(raw_path)
+    if not target:
+        return False
+    return "/" in target["path"] or target["path"] in known_files
+
+
+def link_bare_github_file_mentions(task, text, known_files):
+    markdown_link_pattern = re.compile(r"(\[[^\]]+\]\([^)]+\))")
+    bare_path_pattern = re.compile(
+        r"(^|[^\w./:\[\]()`-])"
+        r"([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z][A-Za-z0-9_-]{0,15}(?::\d+(?:-\d+)?)?)"
+        r"(?=$|[^\w/-])"
+    )
+
+    def replace_segment(segment):
+        def replace_match(match):
+            prefix = match.group(1)
+            raw_path = match.group(2)
+            if not bare_file_mention_allowed(task, raw_path, known_files):
+                return match.group(0)
+            linked = github_file_markdown(task, raw_path)
+            return match.group(0) if linked == "`{}`".format(raw_path) else "{}{}".format(prefix, linked)
+
+        return bare_path_pattern.sub(replace_match, segment)
+
+    return "".join(
+        segment if index % 2 == 1 else replace_segment(segment)
+        for index, segment in enumerate(markdown_link_pattern.split(str(text)))
+    )
+
+
+def link_github_file_mentions(task, text, known_files=None):
+    known_files = github_known_file_set(task) if known_files is None else known_files
+    fence_pattern = re.compile(r"(```[\s\S]*?```)")
+    segments = fence_pattern.split(str(text))
+
+    def replace_segment(segment):
+        def replace_match(match):
+            raw_path = match.group(1)
+            already_link_text = (
+                match.start() > 0
+                and segment[match.start() - 1] == "["
+                and segment[match.end() : match.end() + 2] == "]("
+            )
+            if already_link_text:
+                return match.group(0)
+            linked = inline_code_with_github_file_links(task, raw_path)
+            return match.group(0) if linked == "`{}`".format(raw_path) else linked
+
+        linked_inline_code = re.sub(r"`([^`\n]+)`", replace_match, segment)
+        return link_bare_github_file_mentions(task, linked_inline_code, known_files)
+
+    return "".join(
+        segment if index % 2 == 1 else replace_segment(segment)
+        for index, segment in enumerate(segments)
+    )
+
+
+def review_test_command_markdown(task, raw_command):
+    command = str(raw_command).strip()
+    if not command:
+        return "`unknown command`"
+    return inline_code_with_github_file_links(task, command)
 
 
 def review_fix_loop_lines(task):
@@ -1335,7 +1514,8 @@ def review_fix_loop_lines(task):
     return lines
 
 
-def structured_review_lines(review):
+def structured_review_lines(review, task, known_files=None):
+    known_files = github_known_file_set(task, review) if known_files is None else known_files
     if not review:
         return ["", "### Structured review", "- No structured review result was emitted."]
 
@@ -1351,7 +1531,7 @@ def structured_review_lines(review):
     if reviewed_files:
         lines.append(
             "- Reviewed file list: {}".format(
-                ", ".join("`{}`".format(path) for path in reviewed_files[:20])
+                ", ".join(github_file_markdown(task, path) for path in reviewed_files[:20])
             )
         )
         if len(reviewed_files) > 20:
@@ -1362,7 +1542,7 @@ def structured_review_lines(review):
     if supporting_files:
         lines.append(
             "- Supporting file list: {}".format(
-                ", ".join("`{}`".format(path) for path in supporting_files[:20])
+                ", ".join(github_file_markdown(task, path) for path in supporting_files[:20])
             )
         )
         if len(supporting_files) > 20:
@@ -1374,11 +1554,12 @@ def structured_review_lines(review):
         location = finding.get("file") or "unknown file"
         if finding.get("line") is not None:
             location = "{}:{}".format(location, finding.get("line"))
+        linked_location = github_file_markdown(task, location, finding.get("line"))
         lines.append(
             "  {}. `{}` {} - {}".format(
                 index,
                 finding.get("severity") or "unknown",
-                location,
+                linked_location,
                 finding.get("title") or "Untitled finding",
             )
         )
@@ -1387,16 +1568,17 @@ def structured_review_lines(review):
 
     no_findings_reason = review.get("no_findings_reason")
     if no_findings_reason:
-        lines.append("- No-findings reason: {}".format(no_findings_reason))
+        lines.append("- No-findings reason: {}".format(link_github_file_mentions(task, no_findings_reason, known_files)))
 
     tests_run = review.get("tests_run") or []
     lines.append("- Tests reported by runtime: {}".format(len(tests_run)))
     for test in tests_run[:10]:
         summary = test.get("output_summary")
-        suffix = " - {}".format(summary) if summary else ""
+        command = review_test_command_markdown(task, test.get("command") or "unknown command")
+        suffix = " - {}".format(link_github_file_mentions(task, summary, known_files)) if summary else ""
         lines.append(
-            "  - `{}`: `{}`{}".format(
-                test.get("command") or "unknown command",
+            "  - {}: `{}`{}".format(
+                command,
                 test.get("status") or "unknown",
                 suffix,
             )
