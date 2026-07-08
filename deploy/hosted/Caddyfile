@@ -1,0 +1,13 @@
+# TLS ingress for hosted coven-github. Caddy provisions and renews
+# Let's Encrypt certificates automatically for $WEBHOOK_DOMAIN.
+{$WEBHOOK_DOMAIN} {
+	encode gzip
+
+	# GitHub webhook deliveries and the tenant-scoped API.
+	reverse_proxy coven-github:3000
+
+	log {
+		output stdout
+		format console
+	}
+}
