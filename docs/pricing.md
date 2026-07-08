@@ -3,7 +3,8 @@
 Status: **proposed** — numbers below are a launch proposal for review, not a
 commitment. Everything a tier promises maps to an enforcement knob that
 already exists in the adapter, so the price sheet can never drift ahead of
-the product.
+the product. The Marketplace listing runbook that publishes these tiers
+lives in [marketplace-listing.md](marketplace-listing.md).
 
 ## Principles
 
@@ -58,7 +59,8 @@ the product.
 
 | Promise | Mechanism |
 |---|---|
-| Task caps / concurrency | `[installations.limits] max_tasks_per_day` (intake gate, audited as `ignored:quota_exceeded`) and `max_concurrent` (claim-time gate) — #15 |
+| Plan purchase → entitlement | `marketplace_purchase` webhook → per-account plan record, resolved per installation; `[billing] require_plan` gates intake for plan-less installations (`ignored:no_plan`) |
+| Task caps / concurrency | `[installations.limits] max_tasks_per_day` (intake gate, audited as `ignored:quota_exceeded`) and `max_concurrent` (claim-time gate) — #15; purchased plans supply tier defaults, explicit TOML wins |
 | Familiar count / routing | `[[installations]] familiars` allow-list + per-repo trigger policy — #7 |
 | Tenant data boundary | Fail-closed token-scoped task/usage/memory APIs, per-read audit — #3 |
 | Memory governance | `[memory]` opt-in, approval gates, retention_days, revoke + inspect — #6 |

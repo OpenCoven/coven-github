@@ -51,6 +51,15 @@ flowchart LR
 
 Launch with flat monthly tiers and task caps. Avoid pure usage billing until task duration and model-cost distribution are known. The concrete tier matrix, launch price proposal, and the enforcement mechanism behind every promised limit live in [docs/pricing.md](docs/pricing.md).
 
+The adapter enforces purchased plans directly: GitHub Marketplace
+`marketplace_purchase` webhooks record each account's plan, `installation`
+events map installations to their account, and intake plus the worker apply
+the tier's task caps and concurrency automatically. `[billing] require_plan`
+turns the hosted deployment into a paid gate — installations without an
+entitled plan (and no explicit `[[installations]]` entry) are recorded
+`ignored:no_plan`. Explicit TOML limits always win, which is how Dedicated
+contracts get custom numbers.
+
 ## Buyer Promise
 
 > Your familiar on your GitHub: the one that already knows your code, your team, and how you ship.
