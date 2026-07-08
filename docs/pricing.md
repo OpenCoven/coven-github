@@ -3,7 +3,8 @@
 Status: **proposed** — numbers below are a launch proposal for review, not a
 commitment. Everything a tier promises maps to an enforcement knob that
 already exists in the adapter, so the price sheet can never drift ahead of
-the product.
+the product. The Marketplace listing runbook that publishes these tiers
+lives in [marketplace-listing.md](marketplace-listing.md).
 
 ## Principles
 
