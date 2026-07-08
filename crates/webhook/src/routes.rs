@@ -614,6 +614,30 @@ pub async fn handle_webhook(
         };
     }
 
+    // Billing: `marketplace_purchase` deliveries carry plan changes for the
+    // purchasing *account*. Record the entitlement before acknowledging, and
+    // dedupe by delivery id like every other delivery.
+    if event_type == "marketplace_purchase" {
+        return handle_marketplace_purchase(&state, delivery, &payload).await;
+    }
+
+    // `installation` lifecycle events name the account behind the
+    // installation — the join key that resolves a Marketplace purchase to
+    // this tenant. Keep the mapping current on every such event.
+    if event_type == "installation" && payload.action.as_deref() != Some("deleted") {
+        if let Some(inst) = &payload.installation {
+            if let Some(account) = &inst.account {
+                if let Err(e) = state
+                    .store
+                    .record_installation_account(inst.id, account.id, &account.login)
+                    .await
+                {
+                    error!("failed to record installation account: {e:#}");
+                }
+            }
+        }
+    }
+
     // Installation removed → purge that tenant's durable memory records
     // (issue #6, delete-on-uninstall). Idempotent via the delivery id.
     if event_type == "installation" && payload.action.as_deref() == Some("deleted") {
@@ -645,6 +669,11 @@ pub async fn handle_webhook(
                             0
                         });
                     info!(installation_id = id, memory, tasks, "purged tenant data on uninstall");
+                    // Forget the account mapping too; the account's plan
+                    // survives for its other installations.
+                    if let Err(e) = state.store.delete_installation_account(id).await {
+                        error!("failed to forget installation account on uninstall: {e:#}");
+                    }
                     // Audit what was deleted (issue #12).
                     let _ = state
                         .store
@@ -670,13 +699,61 @@ pub async fn handle_webhook(
     //    delivery id must never dispatch twice (issue #2).
     match event_to_task(&state, event).await {
         Some(task) => {
+            // Entitlement resolution: explicit TOML limits win per field;
+            // otherwise a purchased plan supplies its tier defaults
+            // (docs/pricing.md). Neither = unlimited (self-hosted default).
+            let plan = match state.store.plan_for_installation(task.installation_id).await {
+                Ok(plan) => plan,
+                Err(e) => return storage_unavailable(e),
+            };
+            let entitled = plan.as_ref().filter(|p| p.entitled());
+
+            // The hosted monetization gate: with `billing.require_plan`, an
+            // installation must hold an entitled plan or an explicit
+            // [[installations]] entry (operator-vouched, e.g. Dedicated).
+            if state.config.billing.require_plan
+                && entitled.is_none()
+                && !state.config.installation_listed(task.installation_id)
+            {
+                warn!(
+                    installation_id = task.installation_id,
+                    "no entitled plan — delivery ignored"
+                );
+                if let Err(e) = state
+                    .store
+                    .record_delivery(delivery, Routing::Ignored("no_plan"))
+                    .await
+                {
+                    return storage_unavailable(e);
+                }
+                return (
+                    StatusCode::OK,
+                    Json(json!({"ok": true, "ignored": "no_plan"})),
+                )
+                    .into_response();
+            }
+
+            let tier = entitled.map(|p| {
+                let tier: coven_github_config::PlanTier =
+                    p.tier.parse().unwrap_or(coven_github_config::PlanTier::Unknown);
+                if tier == coven_github_config::PlanTier::Unknown {
+                    warn!(
+                        installation_id = task.installation_id,
+                        plan = %p.plan_name,
+                        "unclassified plan — applying Starter limits"
+                    );
+                }
+                tier
+            });
+            let limits = coven_github_config::effective_limits(
+                state.config.limits_for(task.installation_id),
+                tier,
+            );
+
             // Daily task cap (issue #15): over-quota installations get their
             // delivery recorded as ignored — visible in the audit trail — and
             // GitHub still hears 200 (the delivery itself succeeded).
-            if let Some(cap) = state
-                .config
-                .limits_for(task.installation_id)
-                .max_tasks_per_day
+            if let Some(cap) = limits.max_tasks_per_day
             {
                 let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
                 match state
@@ -740,6 +817,105 @@ pub async fn handle_webhook(
     }
 
     (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
+/// Handles a `marketplace_purchase` delivery: record the purchasing
+/// account's plan (billing entitlement), audit the transition, and
+/// acknowledge. Purchases key on the account; installations resolve to it
+/// through the mapping kept by `installation` events.
+async fn handle_marketplace_purchase(
+    state: &AppState,
+    delivery: Delivery,
+    payload: &WebhookPayload,
+) -> axum::response::Response {
+    let action = payload.action.as_deref().unwrap_or("");
+    let reason = format!("marketplace_purchase:{action}");
+
+    // Decide the transition first; the delivery record and the plan write
+    // then land in ONE store transaction, so a storage failure can never
+    // mark the delivery seen while dropping the transition (a redelivery
+    // would dedupe and the lost `cancelled`/`purchased` could never be
+    // recovered).
+    //
+    // Pending changes apply at the end of the billing cycle; GitHub sends a
+    // concrete `changed` event when they take effect. Nothing to do yet.
+    let transition = payload.marketplace_purchase.as_ref().and_then(|purchase| {
+        let plan_state = match action {
+            "purchased" | "changed" if purchase.on_free_trial => "trial",
+            "purchased" | "changed" => "active",
+            "cancelled" => "cancelled",
+            _ => return None,
+        };
+        let plan_name = purchase
+            .plan
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let tier = coven_github_config::PlanTier::parse(&plan_name);
+        Some((purchase, plan_state, plan_name, tier))
+    });
+    if payload.marketplace_purchase.is_none() {
+        warn!("marketplace_purchase delivery without a purchase object");
+    }
+
+    let record = transition
+        .as_ref()
+        .map(|(purchase, plan_state, plan_name, tier)| {
+            coven_github_store::AccountPlan {
+                account_id: purchase.account.id,
+                account_login: purchase.account.login.clone(),
+                plan_name: plan_name.clone(),
+                tier: tier.as_str().to_string(),
+                state: plan_state.to_string(),
+                source: "marketplace".to_string(),
+                updated_at: String::new(),
+            }
+        });
+
+    match state
+        .store
+        .record_delivery_with_plan(delivery, &reason, record)
+        .await
+    {
+        Ok(Recorded::New) => {}
+        Ok(Recorded::Duplicate) => {
+            return (StatusCode::OK, Json(json!({"ok": true, "duplicate": true})))
+                .into_response();
+        }
+        Err(e) => return storage_unavailable(e),
+    }
+
+    let Some((purchase, plan_state, plan_name, tier)) = transition else {
+        info!(action, "marketplace_purchase acknowledged without state change");
+        return (StatusCode::OK, Json(json!({"ok": true, "ignored": reason})))
+            .into_response();
+    };
+
+    info!(
+        account = %purchase.account.login,
+        plan = %plan_name,
+        tier = tier.as_str(),
+        state = plan_state,
+        "marketplace plan recorded"
+    );
+    // Every plan transition lands in the audit trail (issue #12). Audit is
+    // observability, not entitlement state — failure logs but never 5xxs a
+    // delivery whose transition is already durable.
+    if let Err(e) = state
+        .store
+        .record_api_read(
+            "billing:marketplace",
+            &format!("account:{}", purchase.account.id),
+            action,
+            &format!("tier:{},state:{plan_state}", tier.as_str()),
+        )
+        .await
+    {
+        error!("billing audit write failed: {e:#}");
+    }
+
+    (StatusCode::OK, Json(json!({"ok": true, "plan": tier.as_str(), "state": plan_state})))
+        .into_response()
 }
 
 /// The durable store could not record the delivery: answer 5xx so GitHub
@@ -1176,6 +1352,7 @@ mod tests {
                 gardener: coven_github_config::GardenerConfig::default(),
                 api: coven_github_config::ApiConfig::default(),
                 installations: vec![],
+                billing: Default::default(),
             }),
             store: Store::open_in_memory().expect("in-memory store"),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -2816,5 +2993,243 @@ mod metering_route_tests {
                 .any(|(c, s, a, r)| c == "tenant:1" && s == "installation:1" && a == "usage" && r == "ok:1"),
             "usage reads must be audited: {audit:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod billing_route_tests {
+    //! Marketplace plan intake: entitlement recording, plan-derived limits,
+    //! and the `require_plan` monetization gate.
+    use super::tests::app_state;
+    use super::*;
+    use axum::extract::State;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256 as HmacSha;
+    use std::sync::Arc;
+
+    fn signed(event: &str, delivery_id: &str, body: &str) -> HeaderMap {
+        let mut mac = Hmac::<HmacSha>::new_from_slice(b"secret").expect("hmac");
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", event.parse().expect("header"));
+        headers.insert("x-hub-signature-256", sig.parse().expect("header"));
+        headers.insert("x-github-delivery", delivery_id.parse().expect("header"));
+        headers
+    }
+
+    async fn deliver(
+        state: &AppState,
+        event: &str,
+        delivery_id: &str,
+        body: &str,
+    ) -> serde_json::Value {
+        let response = handle_webhook(
+            State(state.clone()),
+            signed(event, delivery_id, body),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    fn purchase(action: &str, account_id: u64, plan: &str, on_free_trial: bool) -> String {
+        serde_json::json!({
+            "action": action,
+            "marketplace_purchase": {
+                "account": { "id": account_id, "login": "acme", "type": "Organization" },
+                "plan": { "name": plan },
+                "on_free_trial": on_free_trial
+            }
+        })
+        .to_string()
+    }
+
+    fn installation_created(installation: u64, account_id: u64) -> String {
+        serde_json::json!({
+            "action": "created",
+            "installation": {
+                "id": installation,
+                "account": { "id": account_id, "login": "acme" }
+            }
+        })
+        .to_string()
+    }
+
+    fn assigned(installation: u64, issue: u64) -> String {
+        serde_json::json!({
+            "action": "assigned",
+            "issue": { "number": issue, "title": "t", "body": "b" },
+            "assignee": { "login": "coven-cody[bot]" },
+            "repository": { "name": "demo", "owner": { "login": "OpenCoven" } },
+            "installation": { "id": installation }
+        })
+        .to_string()
+    }
+
+    fn require_plan_state() -> AppState {
+        let base = app_state();
+        let mut config = (*base.config).clone();
+        config.billing.require_plan = true;
+        AppState {
+            config: Arc::new(config),
+            ..base
+        }
+    }
+
+    #[tokio::test]
+    async fn purchase_records_the_plan_and_resolves_through_installations() {
+        let state = app_state();
+        let body = purchase("purchased", 42, "Hosted Team", false);
+        let response = deliver(&state, "marketplace_purchase", "mp-1", &body).await;
+        assert_eq!(response["plan"], "team");
+        assert_eq!(response["state"], "active");
+
+        deliver(
+            &state,
+            "installation",
+            "in-1",
+            &installation_created(7, 42),
+        )
+        .await;
+        let plan = state
+            .store
+            .plan_for_installation(7)
+            .await
+            .unwrap()
+            .expect("plan resolved");
+        assert_eq!(plan.tier, "team");
+        assert!(plan.entitled());
+    }
+
+    #[tokio::test]
+    async fn duplicate_purchase_deliveries_do_not_reapply() {
+        let state = app_state();
+        let body = purchase("purchased", 42, "Hosted Team", false);
+        deliver(&state, "marketplace_purchase", "mp-1", &body).await;
+        let dup = deliver(&state, "marketplace_purchase", "mp-1", &body).await;
+        assert_eq!(dup["duplicate"], true);
+    }
+
+    #[tokio::test]
+    async fn require_plan_gates_intake_until_a_purchase_lands() {
+        let state = require_plan_state();
+        deliver(
+            &state,
+            "installation",
+            "in-1",
+            &installation_created(7, 42),
+        )
+        .await;
+
+        // No plan → the delivery is acknowledged but ignored, and audited.
+        let refused = deliver(&state, "issues", "dl-1", &assigned(7, 1)).await;
+        assert_eq!(refused["ignored"], "no_plan");
+        assert_eq!(
+            state.store.delivery_routing("dl-1").await.unwrap().as_deref(),
+            Some("ignored:no_plan")
+        );
+
+        // Trial purchase → the same trigger now produces a task.
+        deliver(
+            &state,
+            "marketplace_purchase",
+            "mp-1",
+            &purchase("purchased", 42, "Hosted Starter", true),
+        )
+        .await;
+        let accepted = deliver(&state, "issues", "dl-2", &assigned(7, 2)).await;
+        assert!(accepted.get("ignored").is_none());
+        assert_eq!(state.store.task_states().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_revokes_entitlement() {
+        let state = require_plan_state();
+        deliver(
+            &state,
+            "installation",
+            "in-1",
+            &installation_created(7, 42),
+        )
+        .await;
+        deliver(
+            &state,
+            "marketplace_purchase",
+            "mp-1",
+            &purchase("purchased", 42, "Hosted Team", false),
+        )
+        .await;
+        deliver(
+            &state,
+            "marketplace_purchase",
+            "mp-2",
+            &purchase("cancelled", 42, "Hosted Team", false),
+        )
+        .await;
+
+        let refused = deliver(&state, "issues", "dl-1", &assigned(7, 1)).await;
+        assert_eq!(refused["ignored"], "no_plan");
+    }
+
+    #[tokio::test]
+    async fn pending_changes_do_not_alter_the_plan() {
+        let state = app_state();
+        deliver(
+            &state,
+            "marketplace_purchase",
+            "mp-1",
+            &purchase("purchased", 42, "Hosted Team", false),
+        )
+        .await;
+        deliver(
+            &state,
+            "marketplace_purchase",
+            "mp-2",
+            &purchase("pending_change", 42, "Hosted Starter", false),
+        )
+        .await;
+        deliver(
+            &state,
+            "installation",
+            "in-1",
+            &installation_created(7, 42),
+        )
+        .await;
+        let plan = state.store.plan_for_installation(7).await.unwrap().unwrap();
+        assert_eq!(plan.tier, "team");
+    }
+
+    #[tokio::test]
+    async fn uninstall_forgets_the_account_mapping() {
+        let state = app_state();
+        deliver(
+            &state,
+            "marketplace_purchase",
+            "mp-1",
+            &purchase("purchased", 42, "Hosted Team", false),
+        )
+        .await;
+        deliver(
+            &state,
+            "installation",
+            "in-1",
+            &installation_created(7, 42),
+        )
+        .await;
+        assert!(state.store.plan_for_installation(7).await.unwrap().is_some());
+
+        let body = serde_json::json!({
+            "action": "deleted",
+            "installation": { "id": 7, "account": { "id": 42, "login": "acme" } }
+        })
+        .to_string();
+        deliver(&state, "installation", "in-2", &body).await;
+        assert!(state.store.plan_for_installation(7).await.unwrap().is_none());
     }
 }

@@ -31,11 +31,37 @@ pub struct WebhookPayload {
     #[serde(default)]
     pub commits: Vec<PushCommit>,
     pub sender: Option<User>,
+    /// `marketplace_purchase` events: the purchase that changed.
+    pub marketplace_purchase: Option<MarketplacePurchase>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Installation {
     pub id: u64,
+    /// Present on `installation` lifecycle events; absent on the slim
+    /// `installation` object other events carry.
+    pub account: Option<Account>,
+}
+
+/// A GitHub account (user or organization) — the unit Marketplace bills.
+#[derive(Debug, Deserialize)]
+pub struct Account {
+    pub id: u64,
+    pub login: String,
+}
+
+/// `marketplace_purchase` payload: the purchase that changed (billing).
+#[derive(Debug, Deserialize)]
+pub struct MarketplacePurchase {
+    pub account: Account,
+    pub plan: Option<MarketplacePlan>,
+    #[serde(default)]
+    pub on_free_trial: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarketplacePlan {
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]

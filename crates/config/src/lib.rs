@@ -33,6 +33,106 @@ pub struct Config {
     /// fails closed for installations not listed.
     #[serde(default)]
     pub installations: Vec<InstallationConfig>,
+    /// Hosted billing entitlement policy (docs/pricing.md). Absent section =
+    /// billing off: no plan is required and TOML limits are the only limits.
+    #[serde(default)]
+    pub billing: BillingConfig,
+}
+
+/// Hosted billing entitlement policy: how purchased plans gate intake.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct BillingConfig {
+    /// When true, deliveries from installations that have neither an
+    /// entitled purchased plan (active or on trial) nor an explicit
+    /// `[[installations]]` entry are recorded `ignored:no_plan` — the hosted
+    /// monetization gate. Default false: self-hosted deployments never
+    /// require a plan.
+    #[serde(default)]
+    pub require_plan: bool,
+}
+
+/// A hosted pricing tier (docs/pricing.md). Purchased plans map to the same
+/// enforcement knobs as `[installations.limits]`; explicit TOML values always
+/// win so operators can customize (e.g. Dedicated contracts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanTier {
+    Starter,
+    Team,
+    /// Custom limits by contract — the tier itself imposes none; the
+    /// operator sets them per installation in TOML.
+    Dedicated,
+    /// A plan name we could not classify (e.g. a renamed Marketplace
+    /// listing). Treated as Starter — the most conservative paid tier — so
+    /// a rename never grants unlimited service or locks a paying customer
+    /// out.
+    Unknown,
+}
+
+impl PlanTier {
+    /// Classify a marketplace plan name, e.g. "Hosted Team" → `Team`.
+    pub fn parse(name: &str) -> Self {
+        let name = name.to_ascii_lowercase();
+        if name.contains("starter") {
+            Self::Starter
+        } else if name.contains("team") {
+            Self::Team
+        } else if name.contains("dedicated") {
+            Self::Dedicated
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Stable identifier for storage and audit records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Starter => "starter",
+            Self::Team => "team",
+            Self::Dedicated => "dedicated",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The tier's default limits (docs/pricing.md tier matrix).
+    pub fn limits(&self) -> InstallationLimits {
+        match self {
+            Self::Starter | Self::Unknown => InstallationLimits {
+                max_concurrent: Some(1),
+                max_tasks_per_day: Some(25),
+            },
+            Self::Team => InstallationLimits {
+                max_concurrent: Some(4),
+                max_tasks_per_day: Some(150),
+            },
+            Self::Dedicated => InstallationLimits::default(),
+        }
+    }
+}
+
+impl std::str::FromStr for PlanTier {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "starter" => Self::Starter,
+            "team" => Self::Team,
+            "dedicated" => Self::Dedicated,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+/// Effective limits for one installation: explicit TOML values win per field
+/// (operator override, Dedicated contracts); a purchased plan supplies tier
+/// defaults for the rest; neither = unlimited (the self-hosted default).
+pub fn effective_limits(
+    explicit: InstallationLimits,
+    plan: Option<PlanTier>,
+) -> InstallationLimits {
+    let tier = plan.map(|p| p.limits()).unwrap_or_default();
+    InstallationLimits {
+        max_concurrent: explicit.max_concurrent.or(tier.max_concurrent),
+        max_tasks_per_day: explicit.max_tasks_per_day.or(tier.max_tasks_per_day),
+    }
 }
 
 /// Routing and trigger policy for one GitHub App installation (issue #7).
@@ -735,6 +835,12 @@ impl Config {
             .find(|i| i.id == installation_id)
             .map(|i| i.limits)
             .unwrap_or_default()
+    }
+
+    /// Whether an installation has an explicit `[[installations]]` entry —
+    /// an operator-vouched tenant, exempt from `billing.require_plan`.
+    pub fn installation_listed(&self, installation_id: u64) -> bool {
+        self.installations.iter().any(|i| i.id == installation_id)
     }
 
     /// `installation id → max_concurrent` for every configured cap — the
@@ -1488,6 +1594,7 @@ mod tests {
             gardener: GardenerConfig::default(),
             api: ApiConfig::default(),
             installations: vec![],
+            billing: BillingConfig::default(),
         }
     }
 
@@ -2404,5 +2511,68 @@ mod tests {
         let errs = errors(&diags);
         assert!(errs.contains(&"familiars[].id"));
         assert!(errs.contains(&"familiars[].bot_username"));
+    }
+}
+
+#[cfg(test)]
+mod plan_tier_tests {
+    //! Plan → limits mapping and precedence (docs/pricing.md).
+    use super::*;
+
+    #[test]
+    fn marketplace_plan_names_classify_to_tiers() {
+        assert_eq!(PlanTier::parse("Hosted Starter"), PlanTier::Starter);
+        assert_eq!(PlanTier::parse("Hosted Team"), PlanTier::Team);
+        assert_eq!(PlanTier::parse("Hosted Dedicated"), PlanTier::Dedicated);
+        assert_eq!(PlanTier::parse("TEAM (annual)"), PlanTier::Team);
+        assert_eq!(PlanTier::parse("Mystery Plan"), PlanTier::Unknown);
+    }
+
+    #[test]
+    fn tier_limits_match_the_pricing_matrix() {
+        let starter = PlanTier::Starter.limits();
+        assert_eq!(starter.max_concurrent, Some(1));
+        assert_eq!(starter.max_tasks_per_day, Some(25));
+
+        let team = PlanTier::Team.limits();
+        assert_eq!(team.max_concurrent, Some(4));
+        assert_eq!(team.max_tasks_per_day, Some(150));
+
+        // Dedicated is custom-by-contract: the tier imposes nothing.
+        let dedicated = PlanTier::Dedicated.limits();
+        assert_eq!(dedicated.max_concurrent, None);
+        assert_eq!(dedicated.max_tasks_per_day, None);
+    }
+
+    #[test]
+    fn unknown_plan_names_fail_safe_to_starter_limits() {
+        assert_eq!(PlanTier::Unknown.limits().max_tasks_per_day, Some(25));
+    }
+
+    #[test]
+    fn explicit_toml_limits_override_plan_defaults_per_field() {
+        let explicit = InstallationLimits {
+            max_concurrent: Some(8),
+            max_tasks_per_day: None,
+        };
+        let effective = effective_limits(explicit, Some(PlanTier::Starter));
+        // Operator's concurrency wins; the tier still supplies the daily cap.
+        assert_eq!(effective.max_concurrent, Some(8));
+        assert_eq!(effective.max_tasks_per_day, Some(25));
+    }
+
+    #[test]
+    fn no_plan_and_no_toml_means_unlimited() {
+        let effective = effective_limits(InstallationLimits::default(), None);
+        assert_eq!(effective.max_concurrent, None);
+        assert_eq!(effective.max_tasks_per_day, None);
+    }
+
+    #[test]
+    fn tier_ids_round_trip_through_storage_strings() {
+        for tier in [PlanTier::Starter, PlanTier::Team, PlanTier::Dedicated] {
+            assert_eq!(tier.as_str().parse::<PlanTier>().unwrap(), tier);
+        }
+        assert_eq!("bogus".parse::<PlanTier>().unwrap(), PlanTier::Unknown);
     }
 }
