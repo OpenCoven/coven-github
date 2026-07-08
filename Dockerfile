@@ -23,8 +23,9 @@ RUN cargo build --release --locked -p coven-github
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates: TLS to api.github.com. git: clone target repos.
+# curl: container healthchecks against /healthz (deploy/hosted/compose.yaml).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user. Secrets are mounted read-only at runtime, never

@@ -88,6 +88,11 @@ Hosted beta should wait for:
 5. Usage metering by installation, repo, familiar, and task.
 6. Cave oversight dashboard for task history and human intervention.
 
+All six code gates are shipped. The operational side — provisioning, TLS
+ingress, continuous store backup, monitoring, restore drills, upgrades — is
+the [hosted deployment runbook](docs/hosted-deploy.md) with its stack in
+[`deploy/hosted/`](deploy/hosted/).
+
 ## Landing Page Copy
 
 Headline:

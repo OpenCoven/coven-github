@@ -12,7 +12,8 @@ use tracing_subscriber::EnvFilter;
 
 use coven_github_config::Config;
 use coven_github_webhook::routes::{
-    audit, handle_webhook, list_memory, list_tasks, revoke_memory, routing, usage, AppState,
+    audit, handle_webhook, healthz, list_memory, list_tasks, revoke_memory, routing, usage,
+    AppState,
 };
 use coven_github_worker as worker;
 
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
             };
 
             let app = Router::new()
+                .route("/healthz", get(healthz))
                 .route("/webhook", post(handle_webhook))
                 .route("/api/github/tasks", get(list_tasks))
                 .route("/api/github/memory", get(list_memory))

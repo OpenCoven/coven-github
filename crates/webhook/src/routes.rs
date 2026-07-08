@@ -43,6 +43,23 @@ fn familiar_names(config: &Config) -> std::collections::HashMap<String, String> 
         .collect()
 }
 
+/// GET /healthz — liveness/readiness for ingress and uptime checks.
+/// Unauthenticated by design, so it must never expose tenant data: the body
+/// is only `ok` plus whether the durable store answers a trivial read.
+pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.delivery_routing("__healthz__").await {
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => {
+            error!("healthz store probe failed: {e:#}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /api/github/tasks — task state for CovenCave polling, behind the
 /// tenant boundary (issue #3). `token` mode fails closed; a tenant token sees
 /// only its own installation (optionally narrowed to repositories); the
@@ -2993,6 +3010,25 @@ mod metering_route_tests {
                 .any(|(c, s, a, r)| c == "tenant:1" && s == "installation:1" && a == "usage" && r == "ok:1"),
             "usage reads must be audited: {audit:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod healthz_tests {
+    use super::tests::app_state;
+    use super::*;
+    use axum::extract::State;
+
+    #[tokio::test]
+    async fn healthz_answers_ok_and_leaks_nothing() {
+        let state = app_state();
+        let response = healthz(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json, serde_json::json!({"ok": true}));
     }
 }
 
