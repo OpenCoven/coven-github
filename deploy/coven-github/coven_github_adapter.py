@@ -465,7 +465,7 @@ def verify_webhook_signature(secret, body, signature):
     if not signature or not str(signature).startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return True
+    return hmac.compare_digest(expected, str(signature))
 
 
 def route_signed_delivery(headers, body, debug, webhook_secret=None):
