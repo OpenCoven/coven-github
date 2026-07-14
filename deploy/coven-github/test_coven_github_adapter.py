@@ -41,6 +41,210 @@ class HostedAdapterTests(unittest.TestCase):
         self.assertEqual(result["status"], 500)
         self.assertIn("GITHUB_WEBHOOK_SECRET", result["error"])
 
+    def test_route_delivery_enforces_exact_trigger_policy(self):
+        adapter = load_adapter()
+        policy = {
+            "enabled_triggers": [
+                "issues.labeled",
+                "issue_comment.created",
+                "pull_request_review_comment.created",
+            ],
+            "trigger_labels": ["coven:fix"],
+            "bot_usernames": ["coven-cody[bot]"],
+            "familiar": {
+                "id": "cody",
+                "display_name": "Cody",
+                "model": "openai/gpt-5.5",
+                "skills": [],
+            },
+            "publication": {"mode": "record_only"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            adapter.DELIVERIES_DIR = state_dir / "deliveries"
+            adapter.TASKS_DIR = state_dir / "tasks"
+            adapter.repo_policy = lambda payload: ("123456", "987654321", policy)
+            ran_tasks = []
+            adapter.run_task = lambda task_id, debug: ran_tasks.append(task_id)
+
+            result = adapter.route_delivery(
+                "issues",
+                "delivery-issue-opened",
+                {
+                    "action": "opened",
+                    "installation": {"id": 123456},
+                    "repository": {
+                        "id": 987654321,
+                        "full_name": "OpenCoven/example",
+                        "clone_url": "https://github.com/OpenCoven/example.git",
+                        "default_branch": "main",
+                    },
+                    "issue": {
+                        "number": 43,
+                        "title": "Installer is slow",
+                        "body": "A diagnostic issue, not a bot task.",
+                        "labels": [],
+                        "assignees": [],
+                    },
+                },
+                lambda message: None,
+            )
+
+            self.assertEqual(result["action"], "ignored")
+            self.assertEqual(result["reason"], "trigger_not_enabled")
+            self.assertEqual(result["trigger"], "issues.opened")
+            self.assertTrue(adapter.delivery_path("delivery-issue-opened").exists())
+            self.assertFalse(adapter.task_path("delivery-issue-opened").exists())
+            self.assertEqual(ran_tasks, [])
+
+            allowed = adapter.route_delivery(
+                "issues",
+                "delivery-issue-labeled",
+                {
+                    "action": "labeled",
+                    "installation": {"id": 123456},
+                    "repository": {
+                        "id": 987654321,
+                        "full_name": "OpenCoven/example",
+                        "clone_url": "https://github.com/OpenCoven/example.git",
+                        "default_branch": "main",
+                    },
+                    "issue": {
+                        "number": 44,
+                        "title": "Fix it",
+                        "body": "Please fix it.",
+                        "labels": [{"name": "coven:fix"}],
+                    },
+                },
+                lambda message: None,
+            )
+
+            self.assertEqual(allowed["action"], "accepted")
+            self.assertTrue(adapter.task_path("delivery-issue-labeled").exists())
+            self.assertEqual(ran_tasks, ["delivery-issue-labeled"])
+
+    def test_event_trigger_key_preserves_actionless_events(self):
+        adapter = load_adapter()
+
+        self.assertEqual(adapter.event_trigger_key("push", {}), "push")
+        self.assertEqual(
+            adapter.event_trigger_key("issues", {"action": "labeled"}),
+            "issues.labeled",
+        )
+
+    def test_webhook_trigger_names_cover_all_changed_routes(self):
+        adapter = load_adapter()
+        common = {
+            "installation": {"id": 123456},
+            "repository": {
+                "id": 987654321,
+                "full_name": "OpenCoven/example",
+                "clone_url": "https://github.com/OpenCoven/example.git",
+                "default_branch": "main",
+            },
+        }
+        familiar = {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": "openai/gpt-5.5",
+            "skills": [],
+        }
+        cases = (
+            (
+                "issue_comment",
+                {
+                    **common,
+                    "action": "created",
+                    "issue": {"number": 45},
+                    "comment": {"body": "@coven-cody[bot] please help"},
+                },
+                "issue_comment.created",
+                "issue_mention",
+            ),
+            (
+                "pull_request_review_comment",
+                {
+                    **common,
+                    "action": "created",
+                    "pull_request": {"number": 46},
+                    "comment": {"body": "@coven-cody[bot] please fix this"},
+                },
+                "pull_request_review_comment.created",
+                "pr_review_comment",
+            ),
+            (
+                "issues",
+                {
+                    **common,
+                    "action": "assigned",
+                    "issue": {
+                        "number": 47,
+                        "assignee": {"login": "coven-cody[bot]"},
+                    },
+                },
+                "issues.assigned",
+                "issue_assigned",
+            ),
+        )
+
+        for event_name, payload, enabled_trigger, expected_trigger in cases:
+            with self.subTest(event_name=event_name):
+                task = adapter.build_task_from_event(
+                    event_name,
+                    "delivery-{}".format(event_name),
+                    payload,
+                    {
+                        "enabled_triggers": [enabled_trigger],
+                        "bot_usernames": ["coven-cody[bot]"],
+                        "familiar": familiar,
+                        "publication": {"mode": "record_only"},
+                    },
+                )
+
+                self.assertEqual(task["state"], "queued")
+                self.assertEqual(task["trigger"], expected_trigger)
+
+    def test_labeled_issue_uses_webhook_trigger_name_policy(self):
+        adapter = load_adapter()
+
+        task = adapter.build_task_from_event(
+            "issues",
+            "delivery-issue-labeled",
+            {
+                "action": "labeled",
+                "installation": {"id": 123456},
+                "repository": {
+                    "id": 987654321,
+                    "full_name": "OpenCoven/example",
+                    "clone_url": "https://github.com/OpenCoven/example.git",
+                    "default_branch": "main",
+                },
+                "issue": {
+                    "number": 44,
+                    "title": "Fix it",
+                    "body": "Please fix it.",
+                    "labels": [{"name": "coven:fix"}],
+                },
+            },
+            {
+                "enabled_triggers": ["issues.labeled"],
+                "trigger_labels": ["coven:fix"],
+                "bot_usernames": ["coven-cody[bot]"],
+                "familiar": {
+                    "id": "cody",
+                    "display_name": "Cody",
+                    "model": "openai/gpt-5.5",
+                    "skills": [],
+                },
+                "publication": {"mode": "record_only"},
+            },
+        )
+
+        self.assertEqual(task["state"], "queued")
+        self.assertEqual(task["trigger"], "issue_assigned")
+        self.assertEqual(task["task"]["kind"], "fix_issue")
+
     def test_prepare_review_context_rejects_stale_pr_head_evidence(self):
         adapter = load_adapter()
 

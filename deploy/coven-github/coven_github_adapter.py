@@ -290,6 +290,11 @@ def trigger_enabled(policy, trigger):
     return trigger in set(enabled or [])
 
 
+def event_trigger_key(event_name, payload):
+    action = str(payload.get("action") or "").strip()
+    return "{}.{}".format(event_name, action) if action else event_name
+
+
 def build_task_from_event(event_name, delivery_id, payload, policy):
     repository = payload.get("repository") or {}
     installation = payload.get("installation") or {}
@@ -315,10 +320,12 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
     if event_name == "issue_comment":
         issue = payload.get("issue") or {}
         comment = payload.get("comment") or {}
+        if payload.get("action") != "created":
+            return ignored(base, "unsupported_issue_comment_action")
         if not mentioned(comment.get("body"), policy):
             return ignored(base, "issue_comment_without_mention")
-        if not trigger_enabled(policy, "issue_mention"):
-            return ignored(base, "issue_mention_not_enabled")
+        if not trigger_enabled(policy, "issue_comment.created"):
+            return ignored(base, "issue_comment_not_enabled")
         if issue.get("pull_request"):
             base.update(
                 {
@@ -352,9 +359,11 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
     if event_name == "pull_request_review_comment":
         comment = payload.get("comment") or {}
         pull_request = payload.get("pull_request") or {}
+        if payload.get("action") != "created":
+            return ignored(base, "unsupported_pr_review_comment_action")
         if not mentioned(comment.get("body"), policy):
             return ignored(base, "pr_review_comment_without_mention")
-        if not trigger_enabled(policy, "pr_review_comment"):
+        if not trigger_enabled(policy, "pull_request_review_comment.created"):
             return ignored(base, "pr_review_comment_not_enabled")
         base.update(
             {
@@ -380,13 +389,13 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
         action = payload.get("action")
         if action not in ("assigned", "labeled"):
             return ignored(base, "unsupported_issue_action")
-        if action == "assigned" and not trigger_enabled(policy, "issue_assigned"):
+        if action == "assigned" and not trigger_enabled(policy, "issues.assigned"):
             return ignored(base, "issue_assigned_not_enabled")
         if action == "assigned" and not issue_assigned_to_bot(issue, policy):
             return ignored(base, "issue_assigned_to_unmanaged_user")
         if action == "labeled" and not labels_include_trigger(issue.get("labels"), policy):
             return ignored(base, "issue_label_not_enabled")
-        if action == "labeled" and not trigger_enabled(policy, "issue_label"):
+        if action == "labeled" and not trigger_enabled(policy, "issues.labeled"):
             return ignored(base, "issue_label_not_enabled")
         base.update(
             {
@@ -530,6 +539,21 @@ def route_delivery(event_name, delivery_id, payload, debug):
             "action": "ignored",
             "delivery_id": delivery_id,
             "reason": "no_policy_for_installation_repo",
+        }
+
+    trigger = event_trigger_key(event_name, payload)
+    if not trigger_enabled(policy, trigger):
+        delivery["state"] = "ignored"
+        delivery["routing_result"] = "trigger_not_enabled"
+        delivery["installation_id"] = installation_id or delivery.get("installation_id")
+        delivery["repository_id"] = repo_id or delivery.get("repository_id")
+        write_json_atomic(delivery_file, delivery)
+        return {
+            "ok": True,
+            "action": "ignored",
+            "delivery_id": delivery_id,
+            "reason": "trigger_not_enabled",
+            "trigger": trigger,
         }
 
     task = build_task_from_event(event_name, delivery_id, payload, policy)
