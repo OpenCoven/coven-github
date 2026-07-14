@@ -26,7 +26,7 @@ lives in [marketplace-listing.md](marketplace-listing.md).
 
 | | **Community** | **Hosted Starter** | **Hosted Team** | **Hosted Dedicated** |
 |---|---|---|---|---|
-| **Price (launch proposal)** | Free (self-host) | **$99/mo** | **$399/mo** | **from $2,000/mo** (annual) |
+| **Price (launch proposal)** | Free (self-host) | **$99/mo** | **$399/mo** | **Contact us** (annual) |
 | Buyer | OSS maintainers, evaluators, local-first users | A small team with a backlog | Product/platform teams | Security-sensitive orgs |
 | Familiars | Unlimited (you run it) | 1 | Up to 4, per-repo routing | Custom roster |
 | Tasks / day | Unlimited (your hardware) | 25 | 150 | Custom |
@@ -47,10 +47,9 @@ lives in [marketplace-listing.md](marketplace-listing.md).
 - **$399 Team** is priced against the alternative — a fraction of the cost
   of the engineer-hours the familiar absorbs, and in line with per-seat dev
   tooling for a ~10-person team without per-seat accounting overhead.
-- **Dedicated from $2,000** covers a dedicated worker pool's real cost with
-  margin and filters for organizations that genuinely need isolation,
-  retention contracts, and an SLA. Annual only: this tier carries
-  onboarding cost.
+- **Dedicated is custom-priced** based on worker capacity, isolation,
+  retention, and SLA requirements. Contact us to discuss an annual plan
+  tailored to your organization.
 - Caps are deliberately **daily task counts**, not compute: they're legible
   to the buyer, already enforced at intake, and honest about what drives
   our cost (sessions started).
@@ -82,8 +81,7 @@ lives in [marketplace-listing.md](marketplace-listing.md).
 
 ## Open decisions for launch
 
-1. Final dollar figures (the ratios matter more than the absolutes; 1 : 4 :
-   20 is the proposal).
+1. Final Starter and Team dollar figures; Dedicated remains custom-priced.
 2. Trial policy: 14-day Starter trial vs. a permanently free "5 tasks/day"
    hosted sandbox. Proposal: **14-day trial**, no free hosted tier.
 3. Whether Team includes the review `request_changes` blocking mode by
