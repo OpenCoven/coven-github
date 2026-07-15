@@ -4,3 +4,4 @@ export function describeLiveProbe(value) {
     value,
     status: "ready",
   };
+}
